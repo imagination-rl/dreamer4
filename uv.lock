@@ -214,7 +214,7 @@ wheels = [
 
 [[package]]
 name = "dreamer4"
-version = "0.11.7"
+version = "0.14.4"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
@@ -258,7 +258,7 @@ requires-dist = [
     { name = "ema-pytorch" },
     { name = "h-net-dynamic-chunking", specifier = ">=0.5.12" },
     { name = "hl-gauss-pytorch" },
-    { name = "pope-pytorch", specifier = ">=0.1.1" },
+    { name = "pope-pytorch", specifier = ">=0.2.1" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "pytest-shard", marker = "extra == 'test'" },
     { name = "torch", specifier = ">=2.4" },
@@ -296,6 +296,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/84/96/df2cfa7418b175dddcf30a88711d01b79a32c3ac4d64b379ed89a3de2c08/einx-0.4.3.tar.gz", hash = "sha256:be7d81ea1908b9f00e4a467840998fc483c33aa32aaaaa3ada6c8386f693edf9", size = 120087, upload-time = "2026-04-01T09:50:41.473Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d0/28/6768d342b2b888f9facdddbd430daf015cab936e2598281ab436b1be1b4a/einx-0.4.3-py3-none-any.whl", hash = "sha256:47ce54a0144f6dffcfacdd8fe2cc9e2e5e6485dda2471330ab75ee747dd22f39", size = 163766, upload-time = "2026-04-01T09:50:40.165Z" },
+]
+
+[package.optional-dependencies]
+torch = [
+    { name = "torch" },
 ]
 
 [[package]]
@@ -1088,16 +1093,17 @@ wheels = [
 
 [[package]]
 name = "pope-pytorch"
-version = "0.1.4"
+version = "0.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
+    { name = "einx", extra = ["torch"] },
     { name = "torch" },
     { name = "torch-einops-utils" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c4/a7/26d4971ead96e6ae33c80fcd6aad2e0059bed3bc945adeb44a27909a3db0/pope_pytorch-0.1.4.tar.gz", hash = "sha256:e6d2da92d3ac0913d999a47c24d53392fc8ee5cc2bc5a0c2e6cd0a7bbd383ff9", size = 15748, upload-time = "2026-03-25T18:45:15.679Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9d/30/2a8f6b7e94fee71cf135052d8ab5588d2fd67a8f744d16b4324f282c836c/pope_pytorch-0.2.1.tar.gz", hash = "sha256:5655aa25aa72523b49ed03f9c5ce26e0faa082017abfa641529445edbd26f823", size = 17256, upload-time = "2026-06-21T16:44:19.309Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/69/62/10eaf6964dbe0cc4b779535c00d7ea35f48bf96fa5a4acab226292f63e1d/pope_pytorch-0.1.4-py3-none-any.whl", hash = "sha256:0654765275b852af7ccfe59b868f04a10e6dc2de61b0695c35b98847a327824b", size = 18108, upload-time = "2026-03-25T18:45:14.466Z" },
+    { url = "https://files.pythonhosted.org/packages/26/72/e61cf723799a3d02a6cda894f0f9f50069691d344413fd37168a3aaee3d0/pope_pytorch-0.2.1-py3-none-any.whl", hash = "sha256:b9dc493c190aa80d1ee9a4ff7343d9f9b5cbdfaace3bbf3c8b10b22d2c5c9e1f", size = 19461, upload-time = "2026-06-21T16:44:18.31Z" },
 ]
 
 [[package]]

@@ -6,7 +6,8 @@
 #     "dreamer4",
 #     "fire",
 #     "gymnasium[mujoco]",
-#     "tensorboard"
+#     "tensorboard",
+#     "PyYAML"
 # ]
 # [tool.uv.sources]
 # dreamer4 = { path = "." }
@@ -16,17 +17,19 @@ from __future__ import annotations
 
 import random
 import shutil
+import inspect
 from copy import deepcopy
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Mapping
 from math import sqrt
 
 import fire
 import gymnasium as gym
 import numpy as np
 import torch
+import yaml
 from einops import rearrange
 from adam_atan2_pytorch import MuonAdamAtan2
 from torch import Tensor, nn
@@ -215,6 +218,21 @@ def log_scalars(writer: SummaryWriter | None, scalars: dict[str, float], step: i
         if value is None:
             continue
         writer.add_scalar(key, float(value), step)
+
+
+def log_hyperparameters_text(writer: SummaryWriter | None, hyperparameters: Mapping[str, Any]):
+    if not exists(writer):
+        return
+
+    rendered = yaml.safe_dump(dict(sorted(hyperparameters.items())), sort_keys = False)
+    writer.add_text("hyperparameters", f"```yaml\n{rendered}```", 0)
+
+
+def log_text_field(writer: SummaryWriter | None, name: str, value: str | None):
+    if not exists(writer) or not exists(value):
+        return
+
+    writer.add_text(name, f"```\n{value}\n```", 0)
 
 
 def get_episode_count(env) -> int:
@@ -1073,8 +1091,11 @@ def load_optimizer_state_if_compatible(optimizer: Optimizer, state_dict, name: s
         return False
 
 
-def resolve_log_dir(log_dir: str, checkpoint_path: str | None):
+def resolve_log_dir(log_dir: str, checkpoint_path: str | None, run_name: str | None = None):
     log_root = Path(log_dir)
+
+    if exists(run_name):
+        return log_root / run_name
 
     if exists(checkpoint_path):
         return log_root / f"resume_{Path(checkpoint_path).stem}"
@@ -1083,7 +1104,150 @@ def resolve_log_dir(log_dir: str, checkpoint_path: str | None):
     return log_root / timestamp
 
 
-def main(
+def resolve_checkpoint_dir(checkpoint_folder: str | None, run_log_dir: Path):
+    if not exists(checkpoint_folder) or checkpoint_folder == "checkpoints_halfcheetah_imagination":
+        return run_log_dir / "checkpoints"
+
+    return Path(checkpoint_folder)
+
+
+def load_config(config_path: str | Path | None):
+    if not exists(config_path):
+        return {}
+
+    path = Path(config_path)
+    with path.open("r") as file:
+        config = yaml.safe_load(file) or {}
+
+    if not isinstance(config, Mapping):
+        raise ValueError(f"{path} must contain a YAML mapping of config keys to values")
+
+    return dict(config)
+
+
+def validate_config(config: Mapping[str, Any], *, valid_keys: set[str]):
+    unknown_keys = sorted(set(config) - valid_keys)
+
+    if unknown_keys:
+        raise ValueError(f"unknown config key(s): {', '.join(unknown_keys)}")
+
+
+def is_int_value(value):
+    return type(value) is int
+
+
+def is_number_value(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def is_positive_power_of_two(value: int):
+    return is_int_value(value) and value > 0 and value & (value - 1) == 0
+
+
+def validate_hyperparameters(params: Mapping[str, Any]):
+    positive_int_keys = (
+        "num_envs",
+        "max_timesteps",
+        "replay_size",
+        "rollouts_per_loop",
+        "obs_dim",
+        "num_latent_tokens",
+        "dim_latent",
+        "model_dim",
+        "depth",
+        "time_block_every",
+        "world_model_batch_size",
+        "imagination_batch_size",
+        "imagination_horizon",
+        "imagination_generate_steps",
+        "tokenizer_batch_size",
+        "tokenizer_eval_batch_size",
+    )
+    non_negative_int_keys = (
+        "num_loops",
+        "world_model_train_steps",
+        "world_model_early_pretrain_steps",
+        "imagination_train_steps",
+        "pretrain_tokenizer_steps",
+        "pretrain_tokenizer_observations",
+        "tokenizer_eval_every",
+        "checkpoint_every",
+    )
+    positive_float_keys = (
+        "world_model_learning_rate",
+        "agent_learning_rate",
+        "tokenizer_learning_rate",
+        "max_grad_norm",
+    )
+
+    for key in positive_int_keys:
+        if not is_int_value(params[key]) or params[key] <= 0:
+            raise ValueError(f"{key} must be an integer > 0")
+
+    for key in non_negative_int_keys:
+        if not is_int_value(params[key]) or params[key] < 0:
+            raise ValueError(f"{key} must be an integer >= 0")
+
+    for key in positive_float_keys:
+        if not is_number_value(params[key]) or params[key] <= 0:
+            raise ValueError(f"{key} must be > 0")
+
+    if exists(params["world_model_train_sequence_length"]):
+        if not is_int_value(params["world_model_train_sequence_length"]) or params["world_model_train_sequence_length"] <= 0:
+            raise ValueError("world_model_train_sequence_length must be an integer > 0 or null")
+
+    if not is_number_value(params["imagination_prompt_probability"]) or not 0. <= params["imagination_prompt_probability"] <= 1.:
+        raise ValueError("imagination_prompt_probability must be between 0 and 1")
+
+    if not is_number_value(params["optimizer_weight_decay"]) or params["optimizer_weight_decay"] < 0.:
+        raise ValueError("optimizer_weight_decay must be >= 0")
+
+    if not is_number_value(params["pmpo_pos_to_neg_weight"]) or not 0. <= params["pmpo_pos_to_neg_weight"] <= 1.:
+        raise ValueError("pmpo_pos_to_neg_weight must be between 0 and 1")
+
+    if not is_number_value(params["pmpo_kl_div_loss_weight"]) or params["pmpo_kl_div_loss_weight"] < 0.:
+        raise ValueError("pmpo_kl_div_loss_weight must be >= 0")
+
+    if not is_number_value(params["agent_state_pred_loss_weight"]) or params["agent_state_pred_loss_weight"] < 0.:
+        raise ValueError("agent_state_pred_loss_weight must be >= 0")
+
+    if params["objective"] not in {"ppo", "pmpo", "spo"}:
+        raise ValueError("objective must be one of: ppo, pmpo, spo")
+
+    if params["reward_encoder_type"] not in {"symexp_two_hot", "hl_gauss"}:
+        raise ValueError("reward_encoder_type must be one of: symexp_two_hot, hl_gauss")
+
+    if not is_positive_power_of_two(params["imagination_generate_steps"]):
+        raise ValueError("imagination_generate_steps must be a positive power of 2")
+
+    if params["imagination_generate_steps"] > 64:
+        raise ValueError("imagination_generate_steps must be <= world model max_steps of 64")
+
+    if exists(params["run_name"]):
+        run_name = params["run_name"].strip()
+
+        if len(run_name) == 0:
+            raise ValueError("run_name must not be empty")
+
+        if Path(run_name).name != run_name or run_name in {".", ".."}:
+            raise ValueError("run_name must be a single folder name")
+
+    if exists(params["run_details"]) and len(params["run_details"].strip()) == 0:
+        raise ValueError("run_details must not be empty")
+
+
+def main(config_path: str | None = "config.yaml", **overrides):
+    train_signature = inspect.signature(train)
+    valid_keys = set(train_signature.parameters)
+
+    config = load_config(config_path)
+    validate_config(config, valid_keys = valid_keys)
+    validate_config(overrides, valid_keys = valid_keys)
+
+    return train(**{**config, **overrides})
+
+
+def train(
     env_name = "HalfCheetah-v4",
     num_loops = 500,
     rollouts_per_loop = 1,
@@ -1102,6 +1266,7 @@ def main(
     reward_encoder_type: Literal["symexp_two_hot", "hl_gauss"] = "hl_gauss",
     world_model_batch_size = 32,
     world_model_train_steps = 13,
+    world_model_early_pretrain_steps = 0,
     world_model_train_sequence_length = 200,
     world_model_learning_rate = 3e-4,
     imagination_batch_size = 128,
@@ -1129,24 +1294,33 @@ def main(
     max_grad_norm = 0.5,
     use_tensorboard = True,
     log_dir = "runs/halfcheetah_imagination",
+    run_name: str | None = None,
+    run_details: str | None = None,
     checkpoint_folder = "checkpoints_halfcheetah_imagination",
     checkpoint_every = 25,
     checkpoint_path: str | None = None,
     clear_log_dir = False,
     unique_log_dir = True,
 ):
+    hyperparameters = dict(locals())
+    validate_hyperparameters(hyperparameters)
+
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
 
     device = torch.device("cpu" if cpu or not torch.cuda.is_available() else "cuda")
 
-    run_log_dir = resolve_log_dir(log_dir, checkpoint_path) if unique_log_dir else Path(log_dir)
+    run_log_dir = resolve_log_dir(log_dir, checkpoint_path, run_name) if unique_log_dir or exists(run_name) else Path(log_dir)
+    checkpoint_dir = resolve_checkpoint_dir(checkpoint_folder, run_log_dir)
+    hyperparameters["checkpoint_folder"] = str(checkpoint_dir)
 
     if clear_log_dir:
         shutil.rmtree(run_log_dir, ignore_errors = True)
 
     writer = SummaryWriter(str(run_log_dir)) if use_tensorboard else None
+    log_hyperparameters_text(writer, hyperparameters)
+    log_text_field(writer, "run_details", run_details)
 
     tokenizer = ObservationTokenizer(
         obs_dim = obs_dim,
@@ -1269,9 +1443,15 @@ def main(
     wm_step = 0
     imagination_step = 0
     env_step = 0
+    did_early_world_model_pretrain = exists(checkpoint_path)
 
     print(f"training {env_name} from {obs_dim} raw observations on {device}")
     print(f"tensorboard log dir: {run_log_dir.absolute()}" if use_tensorboard else "tensorboard disabled")
+    print(f"checkpoint dir: {checkpoint_dir.absolute()}")
+    if world_model_early_pretrain_steps > 0 and did_early_world_model_pretrain:
+        print("skipping early world model pretrain on checkpoint resume")
+    elif world_model_early_pretrain_steps > 0:
+        print(f"early world model pretrain steps: {world_model_early_pretrain_steps}")
     if exists(tokenizer_loss):
         print(f"tokenizer pretrain recon loss: {tokenizer_loss:.4f}")
 
@@ -1350,6 +1530,21 @@ def main(
         )
 
         world_model.train()
+        wm_metrics = {}
+        if not did_early_world_model_pretrain and world_model_early_pretrain_steps > 0:
+            wm_step, wm_metrics = train_world_model(
+                world_model,
+                world_optimizer,
+                replay,
+                steps = world_model_early_pretrain_steps,
+                batch_size = world_model_batch_size,
+                sequence_length = world_model_train_sequence_length,
+                max_grad_norm = max_grad_norm,
+                global_step = wm_step,
+                writer = writer,
+            )
+            did_early_world_model_pretrain = True
+
         wm_step, wm_metrics = train_world_model(
             world_model,
             world_optimizer,
@@ -1394,7 +1589,7 @@ def main(
 
         if checkpoint_every > 0 and divisible_by(loop + 1, checkpoint_every):
             save_checkpoint(
-                Path(checkpoint_folder) / f"loop_{loop + 1}.pt",
+                checkpoint_dir / f"loop_{loop + 1}.pt",
                 loop = loop,
                 tokenizer = tokenizer,
                 world_model = world_model,
