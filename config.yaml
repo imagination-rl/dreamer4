@@ -14,6 +14,8 @@ model_dim: 128
 depth: 3
 time_block_every: 2
 final_special_cross_attn: false
+attention_residuals_mode: "off"
+rmsnorm_dynamics_hidden_states: true
 reward_encoder_type: hl_gauss
 
 world_model_batch_size: 128

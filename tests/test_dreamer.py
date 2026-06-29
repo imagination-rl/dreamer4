@@ -1143,6 +1143,108 @@ def test_axial_mot_with_no_special_tokens():
     assert out.shape == x.shape
     assert cache.token_count == 3
 
+def test_axial_space_time_transformer_full_attention_residuals():
+    from dreamer4 import AxialSpaceTimeTransformer
+
+    model = AxialSpaceTimeTransformer(
+        dim = 32,
+        depth = 3,
+        attn_heads = 2,
+        attn_dim_head = 8,
+        time_block_every = 2,
+        num_special_tokens = 0,
+        value_residual = False,
+        use_attn_pool = False,
+        attention_residuals_mode = 'full'
+    )
+
+    x = torch.randn(2, 3, 4, 32)
+    out, cache = model(x, return_intermediates = True)
+    loss = out.square().mean()
+    loss.backward()
+
+    assert out.shape == x.shape
+    assert cache.token_count == 3
+    assert len(model.attn_residuals) == 3
+    assert exists(model.final_attn_residual.query.grad)
+
+def test_axial_space_time_transformer_block_attention_residuals_raises():
+    from dreamer4 import AxialSpaceTimeTransformer
+
+    with pytest.raises(NotImplementedError, match = 'block attention residuals'):
+        AxialSpaceTimeTransformer(
+            dim = 32,
+            depth = 2,
+            attn_heads = 2,
+            attn_dim_head = 8,
+            attention_residuals_mode = 'block'
+        )
+
+def test_dynamics_world_model_full_attention_residuals():
+    from dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 4,
+        depth = 2,
+        num_spatial_tokens = 4,
+        num_register_tokens = 1,
+        attn_dim_head = 8,
+        attn_heads = 2,
+        num_discrete_actions = 4,
+        time_block_every = 1,
+        predict_terminals = False,
+        attention_residuals_mode = 'full',
+        transformer_kwargs = dict(use_attn_pool = False)
+    )
+
+    latents = torch.randn(2, 4, 4, 16)
+    actions = torch.randint(0, 4, (2, 3, 1))
+
+    loss = dynamics(
+        latents = latents,
+        discrete_actions = actions
+    )
+
+    loss.backward()
+
+    assert loss.numel() == 1
+    assert exists(dynamics.transformer.final_attn_residual.query.grad)
+
+def test_dynamics_world_model_rmsnorm_hidden_states():
+    from dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 4,
+        depth = 2,
+        num_spatial_tokens = 4,
+        num_register_tokens = 1,
+        attn_dim_head = 8,
+        attn_heads = 2,
+        num_discrete_actions = 4,
+        time_block_every = 1,
+        predict_terminals = False,
+        rmsnorm_dynamics_hidden_states = True,
+        transformer_kwargs = dict(use_attn_pool = False)
+    )
+
+    assert isinstance(dynamics.dynamics_hidden_state_norm, torch.nn.RMSNorm)
+
+    latents = torch.randn(2, 4, 4, 16)
+    actions = torch.randint(0, 4, (2, 3, 1))
+
+    loss = dynamics(
+        latents = latents,
+        discrete_actions = actions
+    )
+
+    assert loss.numel() == 1
+
 def test_images_to_video_tokenizer():
     import torch
     from dreamer4 import VideoTokenizer, DynamicsWorldModel, AxialSpaceTimeTransformer

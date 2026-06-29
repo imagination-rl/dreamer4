@@ -264,8 +264,14 @@ def get_completed_episode_stats(env, start_episode_count: int):
 
 
 def split_world_model_and_agent_params(world_model: DynamicsWorldModel):
-    agent_params = set(world_model.policy_head_parameters()) | set(world_model.value_head_parameters())
-    world_params = [param for param in world_model.parameters() if param not in agent_params]
+    shared_head_params = set(module_parameters(getattr(world_model, "dynamics_hidden_state_norm", None)))
+    agent_exclusive_params = set(world_model.policy_head_parameters()) | set(world_model.value_head_parameters())
+    agent_params = agent_exclusive_params | shared_head_params
+    world_params = [
+        param
+        for param in world_model.parameters()
+        if param not in agent_exclusive_params or param in shared_head_params
+    ]
     return world_params, list(agent_params)
 
 
@@ -671,6 +677,7 @@ def cat_existing(tensors: tuple[Tensor | None, ...], dim: int = -1):
 class FrozenPolicyPrior(nn.Module):
     def __init__(self, world_model: DynamicsWorldModel):
         super().__init__()
+        self.dynamics_hidden_state_norm = deepcopy(world_model.dynamics_hidden_state_norm)
         self.policy_head = deepcopy(world_model.policy_head)
         self.action_embedder = deepcopy(world_model.action_embedder)
         self.requires_grad_(False)
@@ -678,6 +685,7 @@ class FrozenPolicyPrior(nn.Module):
 
     @torch.no_grad()
     def refresh_from(self, world_model: DynamicsWorldModel):
+        self.dynamics_hidden_state_norm.load_state_dict(world_model.dynamics_hidden_state_norm.state_dict())
         self.policy_head.load_state_dict(world_model.policy_head.state_dict())
         self.action_embedder.load_state_dict(world_model.action_embedder.state_dict())
         self.to(world_model.device)
@@ -686,7 +694,7 @@ class FrozenPolicyPrior(nn.Module):
 
     @torch.no_grad()
     def action_unembeds(self, agent_embeds: Tensor):
-        policy_embed = self.policy_head(agent_embeds.detach())
+        policy_embed = self.policy_head(self.dynamics_hidden_state_norm(agent_embeds.detach()))
         return self.action_embedder.unembed(policy_embed, pred_head_index = 0)
 
 
@@ -697,7 +705,7 @@ def agent_approx_kl_metrics(world_model: DynamicsWorldModel, dream: Experience):
     assert exists(dream.log_probs)
 
     agent_embeds = dream.agent_embed.detach()
-    policy_embed = world_model.policy_head(agent_embeds)
+    policy_embed = world_model.policy_head(world_model.normalize_dynamics_head_hidden_states(agent_embeds))
     policy_time = policy_embed.shape[1]
 
     def align_time(t):
@@ -747,7 +755,7 @@ def agent_prior_kl_metrics(world_model: DynamicsWorldModel, dream: Experience, p
     assert exists(dream.agent_embed)
 
     agent_embeds = dream.agent_embed.detach()
-    policy_embed = world_model.policy_head(agent_embeds)
+    policy_embed = world_model.policy_head(world_model.normalize_dynamics_head_hidden_states(agent_embeds))
     current_unembeds = world_model.action_embedder.unembed(policy_embed, pred_head_index = 0)
     prior_unembeds = policy_prior.action_unembeds(agent_embeds)
 
@@ -783,6 +791,51 @@ def agent_prior_kl_metrics(world_model: DynamicsWorldModel, dream: Experience, p
         "prior_kl_mean": kl_values.mean(),
         "prior_kl_min": kl_values.min(),
         "prior_kl_max": kl_values.max(),
+    }
+
+
+def pearson_corrcoef(x: Tensor, y: Tensor, eps: float = 1e-8):
+    x = x.float()
+    y = y.float()
+
+    if x.numel() < 2:
+        return x.new_zeros(())
+
+    x = x - x.mean()
+    y = y - y.mean()
+
+    denom = x.square().sum().sqrt() * y.square().sum().sqrt()
+
+    if denom <= eps:
+        return x.new_zeros(())
+
+    return (x * y).sum() / denom
+
+
+def ordinal_ranks(x: Tensor):
+    order = x.argsort()
+    ranks = torch.empty_like(order, dtype = torch.float32)
+    ranks[order] = torch.arange(x.numel(), device = x.device, dtype = torch.float32)
+    return ranks
+
+
+def reward_head_metrics(reward_stats):
+    if not exists(reward_stats):
+        return {}
+
+    pred_rewards, target_rewards, mask = reward_stats
+
+    if not mask.any():
+        return {}
+
+    pred_rewards = pred_rewards[mask]
+    target_rewards = target_rewards[mask]
+
+    return {
+        "reward_pred_pearson": pearson_corrcoef(pred_rewards, target_rewards).item(),
+        "reward_pred_spearman": pearson_corrcoef(ordinal_ranks(pred_rewards), ordinal_ranks(target_rewards)).item(),
+        "reward_pred_mae": (pred_rewards - target_rewards).abs().mean().item(),
+        "reward_pred_count": int(pred_rewards.numel()),
     }
 
 
@@ -899,13 +952,14 @@ def train_world_model(
     for _ in pbar:
         exp = sample_experience_batch(replay, batch_size, max_time = sequence_length).to(world_model.device)
 
-        loss, losses = world_model(
+        loss, losses, reward_stats = world_model(
             latents = exp.latents,
             rewards = exp.rewards,
             terminals = exp.terminals,
             continuous_actions = exp.actions.continuous if exists(exp.actions) else None,
             lens = exp.lens,
             return_all_losses = True,
+            return_reward_head_stats = True,
             update_loss_ema = True,
         )
 
@@ -914,6 +968,8 @@ def train_world_model(
         norm, grad_metrics = clip_grad_norm_by_group(grad_clip_groups, max_grad_norm)
         optimizer.step()
         optimizer.zero_grad()
+
+        reward_metrics = reward_head_metrics(reward_stats)
 
         last_metrics = {
             "world_model/loss": loss.item(),
@@ -924,6 +980,10 @@ def train_world_model(
             "world_model/agent_state_pred_loss": losses.agent_state_pred.item(),
             "world_model/grad_norm": float(norm),
         }
+        last_metrics.update({
+            f"world_model/{key}": value
+            for key, value in reward_metrics.items()
+        })
         last_metrics.update({
             f"world_model/{key}": value
             for key, value in grad_metrics.items()
@@ -1217,6 +1277,21 @@ def validate_hyperparameters(params: Mapping[str, Any]):
     if params["reward_encoder_type"] not in {"symexp_two_hot", "hl_gauss"}:
         raise ValueError("reward_encoder_type must be one of: symexp_two_hot, hl_gauss")
 
+    attention_residuals_mode = params["attention_residuals_mode"]
+    valid_attention_residuals_mode = (
+        isinstance(attention_residuals_mode, bool) or
+        attention_residuals_mode in {"off", "none", "full", "block"}
+    )
+
+    if not valid_attention_residuals_mode:
+        raise ValueError("attention_residuals_mode must be one of: off, none, full, block")
+
+    if not isinstance(params["rmsnorm_dynamics_hidden_states"], bool):
+        raise ValueError("rmsnorm_dynamics_hidden_states must be a boolean")
+
+    if not isinstance(params["agent_predicts_state"], bool):
+        raise ValueError("agent_predicts_state must be a boolean")
+
     if not is_positive_power_of_two(params["imagination_generate_steps"]):
         raise ValueError("imagination_generate_steps must be a positive power of 2")
 
@@ -1263,6 +1338,8 @@ def train(
     depth = 3,
     time_block_every = 2,
     final_special_cross_attn = False,
+    attention_residuals_mode: Literal["off", "none", "full", "block"] = "off",
+    rmsnorm_dynamics_hidden_states = False,
     reward_encoder_type: Literal["symexp_two_hot", "hl_gauss"] = "hl_gauss",
     world_model_batch_size = 32,
     world_model_train_steps = 13,
@@ -1408,6 +1485,8 @@ def train(
         attn_heads = 4,
         attn_dim_head = 16,
         final_special_cross_attn = final_special_cross_attn,
+        attention_residuals_mode = attention_residuals_mode,
+        rmsnorm_dynamics_hidden_states = rmsnorm_dynamics_hidden_states,
         policy_head_mlp_depth = 2,
         value_head_mlp_depth = 2,
     ).to(device)

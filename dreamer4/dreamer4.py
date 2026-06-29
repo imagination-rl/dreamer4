@@ -124,6 +124,7 @@ VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'flow_recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ortho', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net'))
 
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem', 'h_net'))
+RewardHeadStats = namedtuple('RewardHeadStats', ('pred', 'target', 'mask'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
@@ -1774,6 +1775,29 @@ class Residual(Module):
         out = out + x
         return inverse((out, *rest))
 
+class AttentionResidual(Module):
+    def __init__(
+        self,
+        dim
+    ):
+        super().__init__()
+        self.query = Parameter(zeros(dim))
+        self.norm = RMSNorm(dim)
+
+    def forward(
+        self,
+        hiddens: list[Tensor] | tuple[Tensor, ...]
+    ):
+        assert len(hiddens) > 0
+
+        values = stack(hiddens)
+        keys = self.norm(values)
+
+        logits = einsum(self.query, keys, 'd, n ... d -> n ...')
+        weights = logits.softmax(dim = 0)
+
+        return einsum(weights, values, 'n ..., n ... d -> ... d')
+
 # attention
 
 class Attention(Module):
@@ -2659,11 +2683,26 @@ class AxialSpaceTimeTransformer(Module):
         time_attention_use_pope = False,
         space_attention_use_pope = False,
         use_attn_pool = True,
+        attention_residuals_mode: Literal['off', 'none', 'full', 'block'] | bool | None = None,
         mot_temporal = False,
         h_net_layer: int | None = None,
         h_net_kwargs: dict | None = None
     ):
         super().__init__()
+
+        if isinstance(attention_residuals_mode, bool):
+            attention_residuals_mode = 'full' if attention_residuals_mode else 'none'
+
+        attention_residuals_mode = default(attention_residuals_mode, 'none')
+        assert attention_residuals_mode in ('off', 'none', 'full', 'block'), f'unknown attention_residuals_mode {attention_residuals_mode}'
+        attention_residuals_mode = 'none' if attention_residuals_mode == 'off' else attention_residuals_mode
+
+        if attention_residuals_mode == 'block':
+            raise NotImplementedError('block attention residuals are not implemented yet')
+
+        self.attention_residuals_mode = attention_residuals_mode
+        self.has_attention_residuals = attention_residuals_mode == 'full'
+
         num_special_tokens = default(num_special_spatial_tokens, num_special_tokens)
         self.full_spatial_attn = full_spatial_attn
 
@@ -2714,6 +2753,7 @@ class AxialSpaceTimeTransformer(Module):
 
         layers = []
         attn_pools = []
+        attn_residuals = []
 
         for i in range(depth):
             layer_index = i + 1
@@ -2725,13 +2765,22 @@ class AxialSpaceTimeTransformer(Module):
             rearrange_to_attend = Rearrange('b t s ... -> b s t ...') if is_time_block else Identity()
             rearrange_from_attend = Rearrange('b s t ... -> b t s ...') if is_time_block else Identity()
 
-            attn_block = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs))
-            ff_block = Residual(ReLUSquaredFeedforward(dim = dim, **ff_kwargs))
+            attn_block = Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs)
+            ff_block = ReLUSquaredFeedforward(dim = dim, **ff_kwargs)
+
+            if not self.has_attention_residuals:
+                attn_block = Residual(attn_block)
+                ff_block = Residual(ff_block)
 
             mot_block = None
             if is_time_block and self.mot_temporal:
-                special_attn_block = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, **attn_kwargs))
-                special_ff_block = Residual(ReLUSquaredFeedforward(dim = dim, **ff_kwargs))
+                special_attn_block = Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, **attn_kwargs)
+                special_ff_block = ReLUSquaredFeedforward(dim = dim, **ff_kwargs)
+
+                if not self.has_attention_residuals:
+                    special_attn_block = Residual(special_attn_block)
+                    special_ff_block = Residual(special_ff_block)
+
                 mot_block = ModuleList([special_attn_block, special_ff_block])
 
             layers.append(ModuleList([
@@ -2749,19 +2798,27 @@ class AxialSpaceTimeTransformer(Module):
 
             maybe_attn_pool = None
 
-            if use_attn_pool and not is_last:
+            if use_attn_pool and not self.has_attention_residuals and not is_last:
                 maybe_attn_pool = Residual(AttentionPool(dim, **attn_residual_kwargs))
 
             attn_pools.append(maybe_attn_pool)
 
+            if self.has_attention_residuals:
+                attn_residuals.append(ModuleList([
+                    AttentionResidual(dim),
+                    AttentionResidual(dim)
+                ]))
+
         self.layers = ModuleList(layers)
         self.rnn_layers = ModuleList(rnn_layers)
         self.attn_pools = ModuleList(attn_pools)
+        self.attn_residuals = ModuleList(attn_residuals)
 
         self.is_time = is_time
 
-        self.use_attn_pool = use_attn_pool
-        self.final_attn_pool = Residual(AttentionPool(dim, **attn_residual_kwargs)) if use_attn_pool else Identity()
+        self.use_attn_pool = use_attn_pool and not self.has_attention_residuals
+        self.final_attn_pool = Residual(AttentionPool(dim, **attn_residual_kwargs)) if self.use_attn_pool else Identity()
+        self.final_attn_residual = AttentionResidual(dim) if self.has_attention_residuals else None
 
         self.spatial_modules = spatial_modules
 
@@ -2916,6 +2973,9 @@ class AxialSpaceTimeTransformer(Module):
 
         layer_hiddens = [tokens]
         hiddens = []
+        attn_residual_hiddens = [tokens]
+
+        iter_attn_residuals = iter(self.attn_residuals)
 
         for layer_index, (
             layer_modules,
@@ -2952,6 +3012,15 @@ class AxialSpaceTimeTransformer(Module):
             # attention block
 
             tokens = pre_attn_rearrange(tokens)
+
+            layer_attn_residual = layer_ff_residual = None
+
+            if self.has_attention_residuals:
+                layer_attn_residual, layer_ff_residual = next(iter_attn_residuals)
+                tokens = layer_attn_residual([
+                    pre_attn_rearrange(hidden)
+                    for hidden in attn_residual_hiddens
+                ])
 
             attend_fn = time_attend if layer_is_time else space_attend
 
@@ -3035,6 +3104,10 @@ class AxialSpaceTimeTransformer(Module):
 
             tokens = post_attn_rearrange(tokens_out)
 
+            if self.has_attention_residuals:
+                attn_residual_hiddens.append(tokens)
+                tokens = layer_ff_residual(attn_residual_hiddens)
+
             # hierarchical temporal transformer
 
             is_h_net_layer = exists(self.h_net) and layer_index == self.h_net_layer
@@ -3056,6 +3129,9 @@ class AxialSpaceTimeTransformer(Module):
                 tokens = inverse_pack_hnet(tokens)
                 tokens = rearrange(tokens, 'b s t d -> b t s d')
 
+                if self.has_attention_residuals:
+                    attn_residual_hiddens[-1] = tokens
+
             layer_hiddens.append(tokens)
 
             # save kv cache if is time layer
@@ -3072,10 +3148,17 @@ class AxialSpaceTimeTransformer(Module):
             # feedforward block
 
             if not is_mot_layer:
-                tokens = ff(tokens)
+                tokens_out = ff(tokens)
             else:
                 main_tokens, special_tokens = unpack(tokens, mot_packed_shape, 'b t * d')
-                tokens, _ = pack((ff(main_tokens), special_ff(special_tokens)), 'b t * d')
+                tokens_out, _ = pack((ff(main_tokens), special_ff(special_tokens)), 'b t * d')
+
+            if self.has_attention_residuals:
+                tokens = tokens_out
+                attn_residual_hiddens.append(tokens)
+                tokens = self.final_attn_residual(attn_residual_hiddens)
+            else:
+                tokens = tokens_out
 
             # spatial modules (eg. MOSS)
 
@@ -3099,6 +3182,9 @@ class AxialSpaceTimeTransformer(Module):
                 spatial_tokens = rearrange(spatial_tokens, 'b t h w d -> b t (h w) d')
 
                 tokens, _ = pack((spatial_tokens, special_tokens), 'b t * d')
+
+                if self.has_attention_residuals:
+                    attn_residual_hiddens[-1] = tokens
 
             layer_hiddens.append(tokens)
 
@@ -4507,6 +4593,8 @@ class DynamicsWorldModel(Module):
         time_block_every = 4,      # every 4th block is time
         attn_kwargs: dict = dict(),
         transformer_kwargs: dict = dict(),
+        attention_residuals_mode: Literal['off', 'none', 'full', 'block'] | bool | None = None,
+        rmsnorm_dynamics_hidden_states = False,
         attn_heads = 8,
         attn_dim_head = 64,
         attn_softclamp_value = 50.,
@@ -4590,6 +4678,11 @@ class DynamicsWorldModel(Module):
         actor_nlp_kwargs = dict()
     ):
         super().__init__()
+        transformer_kwargs = dict(transformer_kwargs)
+        attention_residuals_mode = transformer_kwargs.pop('attention_residuals_mode', attention_residuals_mode)
+        attention_residuals_mode = default(attention_residuals_mode, 'none')
+        attention_residuals_mode = 'none' if attention_residuals_mode == 'off' else attention_residuals_mode
+
         self.dim = dim
         self.depth = depth
 
@@ -4933,7 +5026,8 @@ class DynamicsWorldModel(Module):
                 time_block_every = time_block_every,
                 final_norm = False,
                 rnn_time = use_time_rnn,
-                time_attention_use_pope = time_attention_use_pope
+                time_attention_use_pope = time_attention_use_pope,
+                attention_residuals_mode = attention_residuals_mode
             )
 
         self.action_pre_encoder = None
@@ -4952,7 +5046,8 @@ class DynamicsWorldModel(Module):
                 time_block_every = 1,
                 final_norm = False,
                 rnn_time = use_time_rnn,
-                time_attention_use_pope = time_attention_use_pope
+                time_attention_use_pope = time_attention_use_pope,
+                attention_residuals_mode = attention_residuals_mode
             )
 
         self.has_lapo = ssl_lapo
@@ -4999,8 +5094,11 @@ class DynamicsWorldModel(Module):
             final_norm = False,
             rnn_time = use_time_rnn,
             time_attention_use_pope = time_attention_use_pope,
+            attention_residuals_mode = attention_residuals_mode,
             **transformer_kwargs
         )
+
+        self.dynamics_hidden_state_norm = RMSNorm(dim) if rmsnorm_dynamics_hidden_states else Identity()
 
         ac_transformer_kwargs = dict(
             dim = dim,
@@ -5016,6 +5114,7 @@ class DynamicsWorldModel(Module):
             final_norm = False,
             rnn_time = use_time_rnn,
             time_attention_use_pope = time_attention_use_pope,
+            attention_residuals_mode = attention_residuals_mode,
             **transformer_kwargs
         )
 
@@ -5092,6 +5191,9 @@ class DynamicsWorldModel(Module):
     @property
     def has_image_encoder(self):
         return exists(self.video_tokenizer) or self.has_aux_image_encoder
+
+    def normalize_dynamics_head_hidden_states(self, hidden_states):
+        return self.dynamics_hidden_state_norm(hidden_states)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         action_to_agent_scale_key = prefix + 'action_to_agent_embed_scale'
@@ -5406,7 +5508,7 @@ class DynamicsWorldModel(Module):
             value = self.value_encoder.bins_to_scalar_value(value_bins)
             values = safe_cat((values, value), dim = 1)
 
-            policy_embed = self.policy_head(one_actor_agent_embed)
+            policy_embed = self.policy_head(self.normalize_dynamics_head_hidden_states(one_actor_agent_embed))
 
             if store_old_action_unembeds:
                 acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
@@ -5597,7 +5699,7 @@ class DynamicsWorldModel(Module):
                     acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
                 if exists(acc_policy_embed):
-                    policy_embed = self.policy_head(one_agent_embed)
+                    policy_embed = self.policy_head(self.normalize_dynamics_head_hidden_states(one_agent_embed))
                     acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
                 episode_lens = torch.where(need_bootstrap, episode_lens + 1, episode_lens)
@@ -5812,7 +5914,7 @@ class DynamicsWorldModel(Module):
         # ppo
 
         policy_agent_embeds = frac_gradient(agent_embeds, self.agent_policy_gradient_frac)
-        policy_embed = self.policy_head(policy_agent_embeds)
+        policy_embed = self.policy_head(self.normalize_dynamics_head_hidden_states(policy_agent_embeds))
 
         # align actions with policy embed if latents had a bootstrap state appended
 
@@ -6237,7 +6339,7 @@ class DynamicsWorldModel(Module):
                 if prompt_agent_embed.ndim == 4:
                     prompt_agent_embed = prompt_agent_embed[:, :, agent_index]
 
-                reward_logits = self.to_reward_pred.forward_one(prompt_agent_embed[:, 1:(prompt_reward_len + 1)], id = 0)
+                reward_logits = self.to_reward_pred.forward_one(self.normalize_dynamics_head_hidden_states(prompt_agent_embed[:, 1:(prompt_reward_len + 1)]), id = 0)
                 prompt_pred_rewards = self.reward_encoder.bins_to_scalar_value(reward_logits)
                 prompt_pred_rewards = prompt_pred_rewards[:, decoded_rewards.shape[1]:prompt_reward_len]
 
@@ -6420,7 +6522,7 @@ class DynamicsWorldModel(Module):
             if sample_agent_actions:
                 assert self.action_embedder.has_actions
 
-                policy_embed = self.policy_head(one_agent_embed)
+                policy_embed = self.policy_head(self.normalize_dynamics_head_hidden_states(one_agent_embed))
 
                 num_sampled_actions = decoded_action_len()
 
@@ -6478,7 +6580,7 @@ class DynamicsWorldModel(Module):
                     )
 
                 if should_decode_reward:
-                    reward_logits = self.to_reward_pred.forward_one(one_agent_embed, id = 0)
+                    reward_logits = self.to_reward_pred.forward_one(self.normalize_dynamics_head_hidden_states(one_agent_embed), id = 0)
                     pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
 
                     decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
@@ -6679,6 +6781,7 @@ class DynamicsWorldModel(Module):
         seed = None,
         agent_token_cond = None,         # (b t d) optional conditioning to be summed to agent tokens
         time_modifier_fn: Callable | None = None,
+        return_reward_head_stats = False,
         return_tem_preds = False
     ):
         # handle video or latents
@@ -7270,6 +7373,7 @@ class DynamicsWorldModel(Module):
         # now take care of the agent token losses
 
         reward_loss = torch.zeros((self.multi_token_pred_len,), device = device)
+        reward_head_stats = None
         state_terminal_loss = self.zero
 
         needs_agent_pred = exists(rewards)
@@ -7293,7 +7397,23 @@ class DynamicsWorldModel(Module):
 
             if reward_pred_time > 0:
                 reward_agent_tokens = reward_agent_tokens[:, :reward_pred_time]
-                reward_pred = self.to_reward_pred(reward_agent_tokens)
+                normed_reward_agent_tokens = self.normalize_dynamics_head_hidden_states(reward_agent_tokens)
+                reward_pred = self.to_reward_pred(normed_reward_agent_tokens)
+
+                if return_reward_head_stats:
+                    with torch.no_grad():
+                        first_reward_pred = self.reward_encoder.bins_to_scalar_value(reward_pred[0])
+                        first_reward_target = rewards[:, :reward_pred_time]
+                        first_reward_mask = create_multi_token_prediction_targets(rewards[:, :reward_pred_time], self.multi_token_pred_len)[1][..., 0]
+
+                        if is_var_len:
+                            first_reward_mask = first_reward_mask & loss_mask_without_last[:, :reward_pred_time]
+
+                        reward_head_stats = RewardHeadStats(
+                            first_reward_pred.detach(),
+                            first_reward_target.detach(),
+                            first_reward_mask.detach()
+                        )
 
                 reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
@@ -7398,7 +7518,7 @@ class DynamicsWorldModel(Module):
 
             actor_agent_tokens = default(embeds.actor, embeds.agent)
             encoded_actor_tokens = rearrange(actor_agent_tokens, 'b t 1 d -> b t d')
-            policy_embed = self.policy_head(encoded_actor_tokens[:, :num_targets])
+            policy_embed = self.policy_head(self.normalize_dynamics_head_hidden_states(encoded_actor_tokens[:, :num_targets]))
 
             # constitute multi token prediction targets
 
@@ -7583,7 +7703,7 @@ class DynamicsWorldModel(Module):
 
         losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss, h_net_loss)
 
-        if not (return_all_losses or return_intermediates):
+        if not (return_all_losses or return_intermediates or return_reward_head_stats):
             return total_loss
 
         ret = (total_loss,)
@@ -7593,6 +7713,9 @@ class DynamicsWorldModel(Module):
 
         if return_intermediates:
             ret = (*ret, intermediates)
+
+        if return_reward_head_stats:
+            ret = (*ret, reward_head_stats)
 
         if return_tem_preds:
             ret = (*ret, tem_pred_latents)
