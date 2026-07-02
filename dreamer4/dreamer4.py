@@ -1507,9 +1507,6 @@ class ActionEmbedder(Module):
         continuous_action_types = None,  # (na)
         return_sum_pooled_embeds = True
     ):
-        if self.has_actions:
-            assert exists(discrete_actions) or exists(continuous_actions), 'model was instantiated with actions, but none were passed in'
-
         discrete_embeds = continuous_embeds = None
 
         if exists(discrete_actions) and discrete_actions.shape[-1] > 0:
@@ -7550,6 +7547,10 @@ class DynamicsWorldModel(Module):
         agent_embed_reward_loss = latent_state_reward_loss = self.zero
         agent_embed_terminal_loss = latent_state_terminal_loss = self.zero
 
+        has_discrete = exists(discrete_actions) and discrete_actions.shape[-1] > 0
+        has_continuous = exists(continuous_actions) and continuous_actions.shape[-1] > 0
+        has_any_actions = has_discrete or has_continuous
+
         needs_agent_pred = exists(rewards) or exists(terminals)
 
         if needs_agent_pred:
@@ -7564,24 +7565,25 @@ class DynamicsWorldModel(Module):
 
             # mtp reward prediction with agent action conditioning
 
-            agent_action_embed = self.embed_agent_actions(agent_tokens_shifted, discrete_actions, continuous_actions, head = 'reward')
-            reward_pred = self.to_agent_embed_reward_pred(agent_action_embed)
-            reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
+            if has_any_actions:
+                agent_action_embed = self.embed_agent_actions(agent_tokens_shifted, discrete_actions, continuous_actions, head = 'reward')
+                reward_pred = self.to_agent_embed_reward_pred(agent_action_embed)
+                reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
-            # mtp targets
+                # mtp targets
 
-            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, 1:], self.multi_token_pred_len)
-            reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
+                reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, 1:], self.multi_token_pred_len)
+                reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
 
-            # ce loss
+                # ce loss
 
-            reward_losses = -(reward_targets * reward_pred.log_softmax(dim = 1)).sum(dim = 1)
-            reward_losses = reward_losses.masked_fill(~reward_loss_mask, 0.)
+                reward_losses = -(reward_targets * reward_pred.log_softmax(dim = 1)).sum(dim = 1)
+                reward_losses = reward_losses.masked_fill(~reward_loss_mask, 0.)
 
-            if is_var_len:
-                agent_embed_reward_loss = reward_losses[loss_mask_without_last].mean(dim = 0)
-            else:
-                agent_embed_reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean')
+                if is_var_len:
+                    agent_embed_reward_loss = reward_losses[loss_mask_without_last].mean(dim = 0)
+                else:
+                    agent_embed_reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean')
             # latent state reward prediction (for generation)
 
             pooled_latents = reduce(latents[:, 1:], 'b t v n d -> b t d', 'mean')
@@ -7591,7 +7593,12 @@ class DynamicsWorldModel(Module):
             latent_reward_pred = rearrange(latent_reward_pred, 'b t l -> b l t')
             latent_reward_targets = rearrange(latent_reward_targets, 'b t l -> b l t')
 
-            latent_state_reward_loss = F.cross_entropy(latent_reward_pred, latent_reward_targets)
+            latent_state_reward_loss = F.cross_entropy(latent_reward_pred, latent_reward_targets, reduction = 'none')
+
+            if is_var_len:
+                latent_state_reward_loss = latent_state_reward_loss[loss_mask_without_last]
+
+            latent_state_reward_loss = latent_state_reward_loss.mean()
         # terminal prediction loss
 
         if exists(terminals) and self.predict_terminals:
@@ -7606,23 +7613,24 @@ class DynamicsWorldModel(Module):
 
             # mtp terminal prediction with agent action conditioning
 
-            agent_action_embed = self.embed_agent_actions(agent_tokens_shifted, discrete_actions, continuous_actions, head = 'terminal')
-            terminal_pred = self.to_agent_embed_terminal_pred(agent_action_embed)
-            terminal_pred = rearrange(terminal_pred, 'mtp b t -> b t mtp')
+            if has_any_actions:
+                agent_action_embed = self.embed_agent_actions(agent_tokens_shifted, discrete_actions, continuous_actions, head = 'terminal')
+                terminal_pred = self.to_agent_embed_terminal_pred(agent_action_embed)
+                terminal_pred = rearrange(terminal_pred, 'mtp b t -> b t mtp')
 
-            # mtp targets
+                # mtp targets
 
-            terminal_targets, terminal_loss_mask = create_multi_token_prediction_targets(terminals_seq, self.multi_token_pred_len)
+                terminal_targets, terminal_loss_mask = create_multi_token_prediction_targets(terminals_seq, self.multi_token_pred_len)
 
-            # bce loss
+                # bce loss
 
-            state_terminal_losses = F.binary_cross_entropy_with_logits(terminal_pred, terminal_targets.float(), reduction = 'none')
-            state_terminal_losses = state_terminal_losses.masked_fill(~terminal_loss_mask, 0.)
+                state_terminal_losses = F.binary_cross_entropy_with_logits(terminal_pred, terminal_targets.float(), reduction = 'none')
+                state_terminal_losses = state_terminal_losses.masked_fill(~terminal_loss_mask, 0.)
 
-            if is_var_len:
-                agent_embed_terminal_loss = state_terminal_losses[loss_mask_without_last].mean(dim = 0)
-            else:
-                agent_embed_terminal_loss = reduce(state_terminal_losses, '... mtp -> mtp', 'mean')
+                if is_var_len:
+                    agent_embed_terminal_loss = state_terminal_losses[loss_mask_without_last].mean(dim = 0)
+                else:
+                    agent_embed_terminal_loss = reduce(state_terminal_losses, '... mtp -> mtp', 'mean')
 
             # latent state terminal prediction (for generation)
 
@@ -7634,7 +7642,12 @@ class DynamicsWorldModel(Module):
             eps = 1. - self.gae_discount_factor
             terminals_seq = terminals_seq.clamp(min = eps, max = 1. - eps)
 
-            latent_state_terminal_loss = F.binary_cross_entropy_with_logits(latent_terminal_pred, terminals_seq)
+            latent_state_terminal_loss = F.binary_cross_entropy_with_logits(latent_terminal_pred, terminals_seq, reduction = 'none')
+
+            if is_var_len:
+                latent_state_terminal_loss = latent_state_terminal_loss[loss_mask_without_last]
+
+            latent_state_terminal_loss = latent_state_terminal_loss.mean()
 
         # maybe autoregressive state prediction loss
 
@@ -7788,16 +7801,12 @@ class DynamicsWorldModel(Module):
             shortcut_flow_loss = self.shortcut_flow_loss_normalizer(shortcut_flow_loss, update_ema = update_loss_ema)
 
         if exists(rewards):
-            if exists(self.agent_embed_reward_loss_normalizer):
-                agent_embed_reward_loss = self.agent_embed_reward_loss_normalizer(agent_embed_reward_loss, update_ema = update_loss_ema)
-            if exists(self.latent_state_reward_loss_normalizer):
-                latent_state_reward_loss = self.latent_state_reward_loss_normalizer(latent_state_reward_loss, update_ema = update_loss_ema)
+            agent_embed_reward_loss = maybe(self.agent_embed_reward_loss_normalizer)(agent_embed_reward_loss, update_ema = update_loss_ema)
+            latent_state_reward_loss = maybe(self.latent_state_reward_loss_normalizer)(latent_state_reward_loss, update_ema = update_loss_ema)
 
         if exists(terminals):
-            if exists(self.agent_embed_terminal_loss_normalizer):
-                agent_embed_terminal_loss = self.agent_embed_terminal_loss_normalizer(agent_embed_terminal_loss, update_ema = update_loss_ema)
-            if exists(self.latent_state_terminal_loss_normalizer):
-                latent_state_terminal_loss = self.latent_state_terminal_loss_normalizer(latent_state_terminal_loss, update_ema = update_loss_ema)
+            agent_embed_terminal_loss = maybe(self.agent_embed_terminal_loss_normalizer)(agent_embed_terminal_loss, update_ema = update_loss_ema)
+            latent_state_terminal_loss = maybe(self.latent_state_terminal_loss_normalizer)(latent_state_terminal_loss, update_ema = update_loss_ema)
 
         if exists(discrete_actions) and exists(self.discrete_actions_loss_normalizer):
             discrete_action_loss = self.discrete_actions_loss_normalizer(discrete_action_loss, update_ema = update_loss_ema)
