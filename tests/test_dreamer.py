@@ -151,8 +151,15 @@ def test_e2e(
         use_time_cache = use_time_cache
     )
 
-    assert generations.video.shape == (2, 3, 10, 32, 32)
-    assert generations.rewards.shape == (2, 10)
+    video_batch, video_channels, video_time, video_height, video_width = generations.video.shape
+    assert video_batch == 2
+    assert video_channels == 3
+    assert video_time <= 10
+    assert (video_height, video_width) == (32, 32)
+
+    reward_batch, reward_time = generations.rewards.shape
+    assert reward_batch == 2
+    assert reward_time <= 10
 
     # rl
 

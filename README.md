@@ -20,6 +20,8 @@ Implementation of Danijar's [latest iteration](https://arxiv.org/abs/2509.24527v
 
 - [@CarsonBurke](https://github.com/CarsonBurke) for adding the [HL-Gauss reward encoder](https://github.com/lucidrains/dreamer4/pull/28)!
 
+- [@CarsonBurke](https://github.com/CarsonBurke) for identifying the lack of action conditioning off the reward prediction head!
+
 ## Install
 
 ```bash

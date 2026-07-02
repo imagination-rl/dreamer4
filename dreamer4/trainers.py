@@ -1208,8 +1208,10 @@ class BehaviorCloneTrainer(Module):
             total_loss = 0.
             total_flow_loss = 0.
             total_shortcut_loss = 0.
-            total_reward_loss = 0.
-            total_terminal_loss = 0.
+            total_agent_embed_reward_loss = 0.
+            total_latent_state_reward_loss = 0.
+            total_agent_embed_terminal_loss = 0.
+            total_latent_state_terminal_loss = 0.
             total_discrete_action_loss = 0.
             total_continuous_action_loss = 0.
             total_self_flow_loss = 0.
@@ -1255,8 +1257,10 @@ class BehaviorCloneTrainer(Module):
                 total_loss += loss.item()
                 total_flow_loss += (losses.flow.item() / self.grad_accum_every)
                 total_shortcut_loss += (losses.shortcut.item() / self.grad_accum_every)
-                total_reward_loss += (losses.rewards.sum().item() / self.grad_accum_every)
-                total_terminal_loss += (losses.terminals.sum().item() / self.grad_accum_every)
+                total_agent_embed_reward_loss += (losses.agent_embed_reward.sum().item() / self.grad_accum_every)
+                total_latent_state_reward_loss += (losses.latent_state_reward.sum().item() / self.grad_accum_every)
+                total_agent_embed_terminal_loss += (losses.agent_embed_terminal.sum().item() / self.grad_accum_every)
+                total_latent_state_terminal_loss += (losses.latent_state_terminal.sum().item() / self.grad_accum_every)
                 total_discrete_action_loss += (losses.discrete_actions.sum().item() / self.grad_accum_every)
                 total_continuous_action_loss += (losses.continuous_actions.sum().item() / self.grad_accum_every)
 
@@ -1273,8 +1277,10 @@ class BehaviorCloneTrainer(Module):
                 total_loss = total_loss,
                 flow_loss = total_flow_loss,
                 shortcut_loss = total_shortcut_loss,
-                reward_loss = total_reward_loss,
-                terminal_loss = total_terminal_loss,
+                agent_embed_reward_loss = total_agent_embed_reward_loss,
+                latent_state_reward_loss = total_latent_state_reward_loss,
+                agent_embed_terminal_loss = total_agent_embed_terminal_loss,
+                latent_state_terminal_loss = total_latent_state_terminal_loss,
                 discrete_action_loss = total_discrete_action_loss,
                 continuous_action_loss = total_continuous_action_loss,
             )
@@ -1298,11 +1304,17 @@ class BehaviorCloneTrainer(Module):
             if last_shortcut_loss > 0.:
                 postfix['shortcut'] = f"{last_shortcut_loss:.4f}"
 
-            if total_reward_loss > 0.:
-                postfix['reward'] = f"{total_reward_loss:.4f}"
+            if total_agent_embed_reward_loss > 0.:
+                postfix['agent_reward'] = f"{total_agent_embed_reward_loss:.4f}"
 
-            if total_terminal_loss > 0.:
-                postfix['terminal'] = f"{total_terminal_loss:.4f}"
+            if total_latent_state_reward_loss > 0.:
+                postfix['latent_reward'] = f"{total_latent_state_reward_loss:.4f}"
+
+            if total_agent_embed_terminal_loss > 0.:
+                postfix['agent_terminal'] = f"{total_agent_embed_terminal_loss:.4f}"
+
+            if total_latent_state_terminal_loss > 0.:
+                postfix['latent_terminal'] = f"{total_latent_state_terminal_loss:.4f}"
 
             if total_discrete_action_loss > 0.:
                 postfix['disc_act'] = f"{total_discrete_action_loss:.4f}"
