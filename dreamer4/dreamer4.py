@@ -113,6 +113,9 @@ except ImportError:
 LinearNoBias = partial(Linear, bias = False)
 LayerNormNoBias = partial(nn.LayerNorm, bias = False)
 
+def EmbeddingSmallInit(shape, eps = 1e-3):
+    return Parameter(randn(*shape) * eps)
+
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'flow_recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ortho', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net', 'byol'))
@@ -1223,7 +1226,7 @@ class ActionEmbedder(Module):
 
         # discrete action unembed
 
-        self.discrete_action_unembed = Parameter(randn(total_discrete_actions, num_unembed_preds, unembed_dim) * 1e-2)
+        self.discrete_action_unembed = EmbeddingSmallInit((total_discrete_actions, num_unembed_preds, unembed_dim,))
 
         if self.has_discrete_actions:
 
@@ -1241,7 +1244,7 @@ class ActionEmbedder(Module):
 
         # continuous action unembed
 
-        self.continuous_action_unembed = Parameter(randn(num_continuous_actions, num_unembed_preds, unembed_dim, 2) * 1e-2)
+        self.continuous_action_unembed = EmbeddingSmallInit((num_continuous_actions, num_unembed_preds, unembed_dim, 2,))
 
     def embed_parameters(self):
         return set([*self.discrete_action_embed.parameters(), *self.continuous_action_embed.parameters()])
@@ -2189,7 +2192,7 @@ class LearnedQueriesAttentionPool(Module):
         dim_head = 64
     ):
         super().__init__()
-        self.queries = Parameter(randn(num_queries, dim) * 1e-2)
+        self.queries = EmbeddingSmallInit((num_queries, dim,))
 
         self.attn = Attention(
             dim = dim,
@@ -2542,7 +2545,7 @@ class TEM(Module):
                 activation = get_activation(init_hiddens_mlp_activation)
             )
         else:
-            self.init_hiddens = Parameter(randn(1, 1, dim_structure) * 1e-2)
+            self.init_hiddens = EmbeddingSmallInit((1, 1, dim_structure,))
 
         # sensory encoder
 
@@ -2585,11 +2588,11 @@ class TEM(Module):
 
         # dummy tokens for shifted attention to mask diagonal
 
-        self.dummy_k1 = Parameter(randn(1, 1, dim_inner) * 1e-2)
-        self.dummy_v1 = Parameter(randn(1, 1, dim_inner) * 1e-2)
+        self.dummy_k1 = EmbeddingSmallInit((1, 1, dim_inner,))
+        self.dummy_v1 = EmbeddingSmallInit((1, 1, dim_inner,))
 
-        self.dummy_k2 = Parameter(randn(1, 1, dim_inner) * 1e-2)
-        self.dummy_v2 = Parameter(randn(1, 1, dim_inner) * 1e-2)
+        self.dummy_k2 = EmbeddingSmallInit((1, 1, dim_inner,))
+        self.dummy_v2 = EmbeddingSmallInit((1, 1, dim_inner,))
 
         self.to_out = LinearNoBias(dim_inner, dim_structure)
 
@@ -3785,11 +3788,12 @@ class StateTokenizer(Module):
         attn_heads = 8,
         attn_dim_head = 64,
         loss_fn: str | Module = 'mse',
+        mae_fraction = 0.,
     ):
         super().__init__()
 
         self.dim_state = dim_state
-        self._num_latent_tokens = num_latent_tokens
+        self.num_latent_tokens = num_latent_tokens
         self.dim_latent = dim_latent
 
         self.encoder_in = nn.Linear(dim_state, dim)
@@ -3822,6 +3826,14 @@ class StateTokenizer(Module):
             nn.Linear(dim, dim_state)
         )
 
+        # mae fraction
+
+        self.mae_fraction = mae_fraction
+        self.has_mae = mae_fraction > 0.
+
+        assert not (self.has_mae and not exists(attn_every)), 'time attention must be turned on to use mae fraction'
+        self.mask_token = EmbeddingSmallInit((dim,)) if self.has_mae else None
+
         if isinstance(loss_fn, Module):
             self.loss_fn = loss_fn
         elif loss_fn == 'mse':
@@ -3836,10 +3848,6 @@ class StateTokenizer(Module):
     def latent_disagreement(self, latents: Tensor, **kwargs) -> Tensor:
         raise NotImplementedError
 
-    @property
-    def num_latent_tokens(self) -> int:
-        return self._num_latent_tokens
-
     @torch.no_grad()
     @eval_decorator
     def tokenize(self, state: Tensor, **kwargs) -> Tensor:
@@ -3849,18 +3857,40 @@ class StateTokenizer(Module):
         self,
         state: Tensor,
         time_cache = None,
-        return_time_cache = False
+        return_time_cache = False,
+        time_lens = None
     ):
-        state, ps = pack([state], 'b * d')
+        state, inverse_pack = pack_one(state, 'b * d')
 
-        x = self.encoder_in(state)
-        x, next_time_cache = self.encoder_transformer(x, time_cache = time_cache, return_time_cache = True)
+        tokens = self.encoder_in(state)
 
-        latents = self.encoder_out(x)
-        latents = rearrange(latents, 'b t (n d) -> b t n d', n = self._num_latent_tokens)
+        batch, time, device = *tokens.shape[:2], tokens.device
+
+        if self.has_mae and time > 1 and self.training:
+            noise = torch.rand((batch, time), device = device)
+
+            if exists(time_lens):
+                num_keep = (time_lens * (1. - self.mae_fraction)).long().clamp_min(1)
+                num_masked = rearrange(time_lens - num_keep, 'b -> b 1')
+
+                time_mask = lens_to_mask(time_lens, time)
+                noise = torch.where(time_mask, noise, float('inf'))
+            else:
+                num_keep = max(1, int(time * (1. - self.mae_fraction)))
+                num_masked = time - num_keep
+
+            ranks = noise.argsort(dim = -1).argsort(dim = -1)
+            mask = ranks < num_masked
+
+            tokens = einx.where('b t, d, b t d', mask, self.mask_token, tokens)
+
+        tokens, next_time_cache = self.encoder_transformer(tokens, time_cache = time_cache, return_time_cache = True)
+
+        latents = self.encoder_out(tokens)
+        latents = rearrange(latents, 'b t (n d) -> b t n d', n = self.num_latent_tokens)
         latents = latents.tanh()
 
-        latents, = unpack(latents, ps, 'b * n d')
+        latents = inverse_pack(latents, 'b * n d')
 
         if return_time_cache:
             return latents, next_time_cache
@@ -3868,16 +3898,14 @@ class StateTokenizer(Module):
         return latents
 
     def decode(self, latents: Tensor):
-        latents, ps = pack([latents], 'b * n d')
+        latents, inverse_pack = pack_one(latents, 'b * n d')
 
         x = rearrange(latents, 'b t n d -> b t (n d)')
         x = self.decoder_in(x)
         x = self.decoder_transformer(x)
         recon = self.decoder_out(x)
 
-        recon, = unpack(recon, ps, 'b * d')
-
-        return recon
+        return inverse_pack(recon, 'b * d')
 
     def forward(
         self,
@@ -3889,7 +3917,7 @@ class StateTokenizer(Module):
         return_time_cache = False,
         time_lens = None
     ):
-        encode_kwargs = dict(time_cache = time_cache, return_time_cache = return_time_cache)
+        encode_kwargs = dict(time_cache = time_cache, return_time_cache = return_time_cache, time_lens = time_lens)
 
         encode_out = self.encode(state, **encode_kwargs)
         latents = encode_out[0] if return_time_cache else encode_out
@@ -4030,7 +4058,7 @@ class VideoTokenizer(Module):
                 logger.warning(f'number of latent tokens ({num_latent_tokens}) exceeds total spatial tokens ({num_spatial_tokens})')
 
         self.num_latent_tokens = num_latent_tokens
-        self.latent_tokens = Parameter(randn(num_latent_tokens, dim) * 1e-2)
+        self.latent_tokens = EmbeddingSmallInit((num_latent_tokens, dim,))
 
         # byol - https://arxiv.org/abs/2006.07733
 
@@ -4050,7 +4078,7 @@ class VideoTokenizer(Module):
         # mae masking - Kaiming He paper from long ago
 
         self.per_image_patch_mask_prob = per_image_patch_mask_prob
-        self.mask_token = Parameter(randn(dim) * 1e-2)
+        self.mask_token = EmbeddingSmallInit((dim,))
 
         # aug conditioning
 
@@ -4102,7 +4130,7 @@ class VideoTokenizer(Module):
 
             self.latent_init_patch_scale = patch_size // latent_init_patch_size
             self.latent_init_patch_to_tokens = patch_to_tokens_fn(latent_init_patch_size)
-            self.latent_init_mask_token = Parameter(randn(dim) * 1e-2)
+            self.latent_init_mask_token = EmbeddingSmallInit((dim,))
 
         # optional causal depthwise 3d convs
 
@@ -5087,7 +5115,7 @@ class DynamicsWorldModel(Module):
         self.num_video_views = num_video_views
 
         if self.video_has_multi_view:
-            self.view_emb = nn.Parameter(randn(num_video_views, dim) * 1e-2)
+            self.view_emb = EmbeddingSmallInit((num_video_views, dim,))
 
         # proprioception
 
@@ -5127,7 +5155,7 @@ class DynamicsWorldModel(Module):
         # register tokens
 
         self.num_register_tokens = num_register_tokens
-        self.register_tokens = Parameter(randn(num_register_tokens, dim) * 1e-2)
+        self.register_tokens = EmbeddingSmallInit((num_register_tokens, dim,))
 
         # signal and step sizes
 
@@ -5158,7 +5186,7 @@ class DynamicsWorldModel(Module):
         self.eps_latent_pred = eps_latent_pred
 
         if self.should_pred_state:
-            self.state_pred_token = nn.Parameter(randn(dim) * 1e-2)
+            self.state_pred_token = EmbeddingSmallInit((dim,))
 
             self.to_state_pred = Sequential(
                 RMSNorm(dim),
@@ -5177,10 +5205,10 @@ class DynamicsWorldModel(Module):
 
         self.num_agents = num_agents
 
-        self.agent_learned_embed = Parameter(randn(self.num_agents, dim) * 1e-2)
-        self.action_learned_embed = Parameter(randn(self.num_agents, dim) * 1e-2)
+        self.agent_learned_embed = EmbeddingSmallInit((self.num_agents, dim,))
+        self.action_learned_embed = EmbeddingSmallInit((self.num_agents, dim,))
 
-        self.reward_learned_embed = Parameter(randn(self.num_agents, dim) * 1e-2)
+        self.reward_learned_embed = EmbeddingSmallInit((self.num_agents, dim,))
 
         self.num_tasks = num_tasks
         self.task_embed = nn.Embedding(num_tasks, dim)
@@ -5189,7 +5217,7 @@ class DynamicsWorldModel(Module):
 
         self.agent_has_genes = num_latent_genes > 0
         self.num_latent_genes = num_latent_genes
-        self.latent_genes = Parameter(randn(num_latent_genes, dim) * 1e-2)
+        self.latent_genes = EmbeddingSmallInit((num_latent_genes, dim,))
 
         # policy head
 

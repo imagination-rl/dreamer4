@@ -2480,7 +2480,8 @@ def test_hallucination_metric(clip_decoded):
     assert metric.shape == (batch, time)
 
 @param('attn_every', [1, None])
-def test_state_tokenizer(attn_every):
+@param('var_len', [False, True])
+def test_state_tokenizer(attn_every, var_len):
     from dreamer4.dreamer4 import StateTokenizer
 
     tokenizer = StateTokenizer(
@@ -2491,15 +2492,22 @@ def test_state_tokenizer(attn_every):
         depth = 1,
         attn_every = attn_every,
         attn_heads = 1,
-        attn_dim_head = 8
+        attn_dim_head = 8,
+        mae_fraction = 0.5 if exists(attn_every) else 0.
     )
 
     batch = 2
     time = 4
 
     obs = torch.randn(batch, time, 17)
+    time_lens = torch.tensor([2, 4]) if var_len else None
 
-    latents = tokenizer.tokenize(obs)
+    # test training pass
+    loss = tokenizer(obs, time_lens = time_lens)
+    loss.backward()
+
+    # test tokenize
+    latents = tokenizer.tokenize(obs, time_lens = time_lens)
     assert latents.shape == (batch, time, 4, 16)
 
     # test sequential equivalence
@@ -2507,7 +2515,11 @@ def test_state_tokenizer(attn_every):
     time_cache = None
     seq_latents = []
     for t in range(time):
-        step_latents, time_cache = tokenizer.tokenize(obs[:, t:t+1], time_cache = time_cache, return_time_cache = True)
+        step_time_lens = None
+        if exists(time_lens):
+            step_time_lens = (time_lens - t).clamp(min = 0, max = 1)
+
+        step_latents, time_cache = tokenizer.tokenize(obs[:, t:t+1], time_cache = time_cache, return_time_cache = True, time_lens = step_time_lens)
         seq_latents.append(step_latents)
 
     seq_latents = torch.cat(seq_latents, dim = 1)
