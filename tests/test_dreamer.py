@@ -2478,3 +2478,37 @@ def test_hallucination_metric(clip_decoded):
     )
 
     assert metric.shape == (batch, time)
+
+@param('attn_every', [1, None])
+def test_state_tokenizer(attn_every):
+    from dreamer4.dreamer4 import StateTokenizer
+
+    tokenizer = StateTokenizer(
+        dim_state = 17,
+        num_latent_tokens = 4,
+        dim_latent = 16,
+        dim = 32,
+        depth = 1,
+        attn_every = attn_every,
+        attn_heads = 1,
+        attn_dim_head = 8
+    )
+
+    batch = 2
+    time = 4
+
+    obs = torch.randn(batch, time, 17)
+
+    latents = tokenizer.tokenize(obs)
+    assert latents.shape == (batch, time, 4, 16)
+
+    # test sequential equivalence
+
+    time_cache = None
+    seq_latents = []
+    for t in range(time):
+        step_latents, time_cache = tokenizer.tokenize(obs[:, t:t+1], time_cache = time_cache, return_time_cache = True)
+        seq_latents.append(step_latents)
+
+    seq_latents = torch.cat(seq_latents, dim = 1)
+    assert torch.allclose(latents, seq_latents, atol = 1e-5), "Sequential and parallel tokenization should yield equal latents"

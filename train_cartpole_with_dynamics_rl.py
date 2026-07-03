@@ -55,7 +55,8 @@ from dreamer4.dreamer4 import (
     exists,
     default,
     cast_to_tensor,
-    VideoTokenizer
+    VideoTokenizer,
+    StateTokenizer
 )
 
 from memmap_replay_buffer import ReplayBuffer
@@ -257,6 +258,29 @@ class TransformerPPOAgent(nn.Module):
                 predict_next_latent_mlp_activation = activation
             )
         )
+
+        if not use_image_input:
+            tokenizer = StateTokenizer(
+                dim_state = 4,
+                num_latent_tokens = num_latent_tokens,
+                dim_latent = 32,
+                dim = 128,
+                depth = 1,
+                attn_every = None,
+                attn_heads = 4,
+                attn_dim_head = 32
+            )
+
+            class TokenizerWrapper(nn.Module):
+                def __init__(self, tokenizer):
+                    super().__init__()
+                    self.tokenizer = tokenizer
+
+                def forward(self, x):
+                    return self.tokenizer(x, return_latents = True)
+
+            self.dynamics.state_to_latents = TokenizerWrapper(tokenizer)
+            self.dynamics.state_tokenizer = tokenizer
 
     @property
     def device(self):
