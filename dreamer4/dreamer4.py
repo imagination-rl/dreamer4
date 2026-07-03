@@ -5855,7 +5855,7 @@ class DynamicsWorldModel(Module):
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
             obs = next_obs
-            next_proprio = obs.get('proprio', None)
+            next_proprio = obs.get('proprio')
 
             # handle fetching new states and images
 
@@ -5899,7 +5899,7 @@ class DynamicsWorldModel(Module):
 
             if done_flag.all() and need_bootstrap.any():
                 if exists(obs_to_latents_fn):
-                    bootstrap_latents, _ = obs_to_latents_fn(obs, tokenizer_time_cache)
+                    bootstrap_latents, _ = obs_to_latents_fn(self, obs, tokenizer_time_cache)
 
                 elif exists(curr_image):
                     bootstrap_latents = None
