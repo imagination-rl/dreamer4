@@ -1000,6 +1000,12 @@ class SEM(Module):
 
 # rewards
 
+def symlog(t):
+    return t.sign() * (t.abs() + 1.).log()
+
+def symexp(t):
+    return t.sign() * (t.abs().exp() - 1.)
+
 class SymExpTwoHot(Module):
     def __init__(
         self,
@@ -1104,23 +1110,34 @@ class HLGaussRewardEncoder(Module):
         eps = 1e-10,
         clamp_to_range = True,
         min_max_value_on_bin_center = False,
+        use_symlog = False,
+        decode_symlog_expected_raw = True,
         learned_embedding = False,
         dim_embed = None,
     ):
         super().__init__()
 
         min_value, max_value = reward_range
+        transform = symlog if use_symlog else None
+        inverse_transform = symexp if use_symlog else None
+        loss_min_value = symexp(tensor(min_value)) if use_symlog else min_value
+        loss_max_value = symexp(tensor(max_value)) if use_symlog else max_value
 
         self.reward_range = reward_range
+        self.use_symlog = use_symlog
+        self.clamp_to_range = clamp_to_range
+        self.decode_symlog_expected_raw = decode_symlog_expected_raw
         self.loss = HLGaussLoss(
-            min_value,
-            max_value,
+            loss_min_value,
+            loss_max_value,
             num_bins,
             sigma = sigma,
             sigma_to_bin_ratio = sigma_to_bin_ratio,
             eps = eps,
             clamp_to_range = clamp_to_range,
             min_max_value_on_bin_center = min_max_value_on_bin_center,
+            transform = transform,
+            inverse_transform = inverse_transform,
         )
 
         self.num_bins = self.loss.num_bins
@@ -1146,6 +1163,19 @@ class HLGaussRewardEncoder(Module):
         logits,
         normalize = True
     ):
+        if self.use_symlog and self.decode_symlog_expected_raw:
+            probs = logits.softmax(dim = -1) if normalize else logits
+            support = symexp(self.loss.centers)
+
+            if self.num_bins % 2 == 1:
+                mid = self.num_bins // 2
+                left_probs, zero_probs, right_probs = probs[..., :mid], probs[..., mid:mid + 1], probs[..., mid + 1:]
+                left_support, zero_support, right_support = support[:mid], support[mid:mid + 1], support[mid + 1:]
+                paired = (left_probs * left_support).flip(-1) + right_probs * right_support
+                return (zero_probs * zero_support).sum(dim = -1) + paired.sum(dim = -1)
+
+            return einsum(probs, support, '... l, l -> ...')
+
         if normalize:
             return self.loss.transform_from_logits(logits)
 
@@ -1157,6 +1187,20 @@ class HLGaussRewardEncoder(Module):
     ):
         if values.numel() == 0:
             return values.new_empty((*values.shape, self.num_bins))
+
+        if self.use_symlog:
+            values = symlog(values)
+
+            if self.clamp_to_range:
+                min_value, max_value = self.reward_range
+                values = values.clamp(min = min_value, max = max_value)
+
+            support = self.loss.support
+            support = support.view(*((1,) * values.ndim), -1)
+            cdf_evals = torch.erf((support - values.unsqueeze(-1)) / self.loss.sigma_times_sqrt_two)
+            z = cdf_evals[..., -1] - cdf_evals[..., 0]
+            probs = cdf_evals[..., 1:] - cdf_evals[..., :-1]
+            return probs / z.clamp(min = self.loss.eps).unsqueeze(-1)
 
         return self.loss.transform_to_probs(values)
 
@@ -6863,14 +6907,23 @@ class DynamicsWorldModel(Module):
             if exists(value_support):
                 min_value, max_value = value_support[0], value_support[-1]
             else:
-                value_support = getattr(getattr(self.value_encoder, 'loss', None), 'support', None)
+                value_loss = getattr(self.value_encoder, 'loss', None)
+                value_support = getattr(value_loss, 'centers', None)
+                value_support = default(value_support, getattr(value_loss, 'support', None))
 
                 if exists(value_support):
                     min_value, max_value = value_support[0], value_support[-1]
+                    inverse_transform = getattr(value_loss, 'inverse_transform', None)
+
+                    if exists(inverse_transform):
+                        min_value, max_value = inverse_transform(min_value), inverse_transform(max_value)
                 else:
                     min_value, max_value = self.value_encoder.reward_range
                     min_value = tensor(min_value, device = returns.device)
                     max_value = tensor(max_value, device = returns.device)
+
+                    if getattr(self.value_encoder, 'use_symlog', False):
+                        min_value, max_value = symexp(min_value), symexp(max_value)
 
             diagnostics['critic/value_target_saturation_frac'] = (
                 (masked_returns < min_value) | (masked_returns > max_value)

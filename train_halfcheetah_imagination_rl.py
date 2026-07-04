@@ -1035,8 +1035,8 @@ def main(
         "this script expects the native policy target range to match the env action range [-1, 1]"
     )
 
-    reward_range = (-20., 20.)
-    value_range = tuple(bound * imagination_horizon for bound in reward_range)
+    reward_range = (-3., 3.)
+    value_range = (-9.90353755128617, 9.90353755128617)
 
     world_model = DynamicsWorldModel(
         dim = model_dim,
@@ -1053,8 +1053,8 @@ def main(
         continuous_dist_type = "beta",
         continuous_target_action_range = (-1., 1.),
         reward_encoder_type = reward_encoder_type,
-        reward_encoder_kwargs = dict(reward_range = reward_range),
-        value_encoder_kwargs = dict(reward_range = value_range),
+        reward_encoder_kwargs = dict(reward_range = reward_range, sigma_to_bin_ratio = 0.75, min_max_value_on_bin_center = True, use_symlog = True),
+        value_encoder_kwargs = dict(reward_range = value_range, num_bins = 511, sigma_to_bin_ratio = 0.75, min_max_value_on_bin_center = True, use_symlog = True),
         predict_terminals = True,
         continuous_action_loss_weight = 0.,
         discrete_action_loss_weight = 0.,
