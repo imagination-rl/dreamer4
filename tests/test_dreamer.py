@@ -350,6 +350,7 @@ def test_action_with_world_model():
         'critic/gae_return_mean',
         'critic/gae_return_min',
         'critic/gae_return_max',
+        'critic/gae_return_abs_max',
         'critic/value_mean',
         'critic/value_min',
         'critic/value_max',

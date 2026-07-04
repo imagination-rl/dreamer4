@@ -6851,6 +6851,7 @@ class DynamicsWorldModel(Module):
                 'critic/gae_return_mean': masked_returns.mean().detach(),
                 'critic/gae_return_min': masked_returns.min().detach(),
                 'critic/gae_return_max': masked_returns.max().detach(),
+                'critic/gae_return_abs_max': masked_returns.abs().max().detach(),
                 'critic/value_mean': masked_values.mean().detach(),
                 'critic/value_min': masked_values.min().detach(),
                 'critic/value_max': masked_values.max().detach(),
