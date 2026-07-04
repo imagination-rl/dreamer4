@@ -5828,6 +5828,17 @@ class DynamicsWorldModel(Module):
 
         return params
 
+    def agent_parameters(self):
+        params = [
+            *self.policy_head_parameters(),
+            *self.value_head_parameters()
+        ]
+        return params
+
+    def world_model_parameters(self):
+        agent_params = set(self.agent_parameters())
+        return [param for param in self.parameters() if param not in agent_params]
+
     def image_encoder_parameters(self):
         params = []
 
@@ -6344,7 +6355,10 @@ class DynamicsWorldModel(Module):
                         bootstrap_latents = cat((bootstrap_latents, aux_image_tokens), dim = -2) if exists(bootstrap_latents) else aux_image_tokens
 
                 elif exists(curr_state):
-                    bootstrap_latents = self.state_to_latents(curr_state)
+                    if exists(self.state_tokenizer):
+                        bootstrap_latents = self.state_tokenizer(curr_state)
+                    else:
+                        bootstrap_latents = self.state_to_latents(curr_state)
 
                 if bootstrap_latents.ndim == 3:
                     bootstrap_latents = rearrange(bootstrap_latents, 'b n d -> b 1 1 n d')

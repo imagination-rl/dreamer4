@@ -225,7 +225,6 @@ def log_scalars(writer: SummaryWriter | None, scalars: dict[str, float], step: i
             continue
         writer.add_scalar(key, float(value), step)
 
-
 def get_episode_count(env) -> int:
     return int(getattr(env, "episode_count", 0))
 
@@ -252,23 +251,8 @@ def get_completed_episode_stats(env, start_episode_count: int):
 
     return returns, lengths
 
-def split_world_model_and_agent_params(world_model: DynamicsWorldModel):
-    agent_params = set(world_model.policy_head_parameters()) | set(world_model.value_head_parameters())
-    world_params = [param for param in world_model.parameters() if param not in agent_params]
-    return world_params, list(agent_params)
-
 def unique_parameters(params):
-    seen = set()
-    out = []
-
-    for param in params:
-        if param in seen:
-            continue
-
-        seen.add(param)
-        out.append(param)
-
-    return out
+    return list(dict.fromkeys(params))
 
 def make_optimizer(
     params,
@@ -278,14 +262,14 @@ def make_optimizer(
     use_muon: bool,
     muon_params = (),
 ):
-    params = unique_parameters(params)
+    params = list(dict.fromkeys(params))
 
     if not use_muon:
         return AdamW(params, lr = lr, weight_decay = weight_decay)
 
     optimizer_param_set = set(params)
     muon_params = [
-        param for param in unique_parameters(muon_params)
+        param for param in dict.fromkeys(muon_params)
         if param in optimizer_param_set
     ]
 
@@ -1082,7 +1066,9 @@ def main(
         value_head_mlp_depth = 2,
     ).to(device)
 
-    world_params, agent_params = split_world_model_and_agent_params(world_model)
+    world_params = world_model.world_model_parameters()
+    agent_params = world_model.agent_parameters()
+
     world_optimizer = make_optimizer(
         world_params,
         lr = world_model_learning_rate,
