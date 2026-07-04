@@ -372,6 +372,13 @@ def xnor(x, y):
 def has_at_least_one(*bools):
     return sum([*map(int, bools)]) > 0
 
+def at_most_one_of(*args):
+    return sum(map(int, map(exists, args))) <= 1
+
+def narrow(start, length = 1):
+    assert start >= 0
+    return slice(start, start + length)
+
 def ensure_tuple(t):
     return (t,) if not isinstance(t, tuple) else t
 
@@ -3826,6 +3833,7 @@ class StateTokenizer(Module):
         attn_dim_head = 64,
         loss_fn: str | Module = 'mse',
         mae_fraction = 0.,
+        time_attention_use_pope = False,
     ):
         super().__init__()
 
@@ -3840,7 +3848,8 @@ class StateTokenizer(Module):
             depth = depth,
             heads = attn_heads,
             dim_head = attn_dim_head,
-            attn_every = attn_every
+            attn_every = attn_every,
+            use_pope = time_attention_use_pope
         )
 
         self.encoder_out = nn.Sequential(
@@ -3855,7 +3864,8 @@ class StateTokenizer(Module):
             depth = depth,
             heads = attn_heads,
             dim_head = attn_dim_head,
-            attn_every = attn_every
+            attn_every = attn_every,
+            use_pope = time_attention_use_pope
         )
 
         self.decoder_out = nn.Sequential(
@@ -4975,7 +4985,9 @@ class DynamicsWorldModel(Module):
         dim,
         dim_latent,
         video_tokenizer: VideoTokenizer | None = None,
+        state_tokenizer: StateTokenizer | None = None,
         copy_video_tokenizer = True,
+        copy_state_tokenizer = True,
         aux_image_encoder: Module | None = None,
         freeze_aux_image_encoder = False,
         max_steps = 64,                # K_max in paper
@@ -5090,6 +5102,17 @@ class DynamicsWorldModel(Module):
         super().__init__()
         self.dim = dim
         self.depth = depth
+
+        assert not (exists(video_tokenizer) and exists(state_tokenizer)), 'cannot have both video and state tokenizer yet'
+
+        if exists(state_tokenizer):
+            if copy_state_tokenizer:
+                state_tokenizer = deepcopy(state_tokenizer)
+                state_tokenizer.requires_grad_(False)
+
+            state_tokenizer = state_tokenizer.eval()
+
+        self.state_tokenizer = state_tokenizer
 
         self.has_latent_ar = latent_ar
 
@@ -6017,16 +6040,30 @@ class DynamicsWorldModel(Module):
 
                 if self.has_aux_image_encoder:
                     aux_image_tokens = self.encode_aux_image_tokens(curr_image)
-                    latents = cat((latents, aux_image_tokens), dim = -2) if exists(latents) else aux_image_tokens
+                    latents = safe_cat((latents, aux_image_tokens), dim = -2)
 
             elif exists(curr_state):
-                assert exists(self.state_to_latents), 'DynamicsWorldModel must have dim_state defined to automatically parse state observations'
-                latents = self.state_to_latents(curr_state)
-                latents = rearrange(latents, 'b n d -> b 1 n d') if latents.ndim == 3 else latents
+                latents = None
                 next_tokenizer_time_cache = tokenizer_time_cache
+
+                curr_state, unpack_views = pack_one(curr_state, '* d')
+
+                if exists(self.state_tokenizer):
+                    latents, next_tokenizer_time_cache = self.state_tokenizer(curr_state, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
+                elif exists(self.state_to_latents):
+                    latents = self.state_to_latents(curr_state)
+                else:
+                    raise ValueError('DynamicsWorldModel must have state_tokenizer or state_to_latents defined to parse state observations')
+
+                latents = unpack_views(latents, '* n d')
 
             else:
                 raise ValueError('Observations must contain an image or state key, or provide a custom obs_to_latents_fn')
+
+            if latents.ndim == 3:
+                latents = rearrange(latents, 'b n d -> b 1 1 n d')
+            elif latents.ndim == 4:
+                latents = rearrange(latents, 'b v n d -> b 1 v n d')
 
             tokenizer_time_cache = next_tokenizer_time_cache
             acc_latents = safe_cat((acc_latents, latents), dim=1)
@@ -6046,6 +6083,7 @@ class DynamicsWorldModel(Module):
                 proprio = past_proprio,
                 time_cache = time_cache,
                 latent_is_noised = True,
+                latent_has_view_dim = True,
                 return_pred_only = True,
                 return_intermediates = True
             )
@@ -6750,8 +6788,9 @@ class DynamicsWorldModel(Module):
         return_time_cache = False,
         store_agent_embed = True,
         store_old_action_unembeds = True,
-        prompt: Tensor | None = None, # (b c t h w) or (b c h w)
-        prompt_latents: Tensor | None = None, # (b t v n d)
+        prompt: Tensor | None = None,           # (b c t h w) or (b c h w)
+        prompt_state: Tensor | None = None,     # (b t d) or (b d)
+        prompt_latents: Tensor | None = None,   # (b t v n d)
         prompt_proprio: Tensor | None = None,
         prompt_discrete_actions: Tensor | None = None,
         prompt_continuous_actions: Tensor | None = None,
@@ -6795,7 +6834,7 @@ class DynamicsWorldModel(Module):
 
         # handle prompt or prompt_latents
 
-        assert not (exists(prompt) and exists(prompt_latents)), 'cannot pass in both prompt video and prompt latents'
+        assert at_most_one_of(prompt, prompt_state, prompt_latents), 'can only pass in one of prompt, prompt_state, or prompt_latents'
 
         if exists(prompt):
             if prompt.ndim == 4:
@@ -6808,6 +6847,21 @@ class DynamicsWorldModel(Module):
             prompt_latents = tokenizer.tokenize(prompt)
             assert self.num_video_views == 1, 'num video views > 1 not supported yet for auto-deriving prompt latents'
             prompt_latents = rearrange(prompt_latents, 'b t n d -> b t 1 n d')
+
+        elif exists(prompt_state):
+            prompt_state_packed, unpack_views = pack_one(prompt_state, '* d')
+
+            if exists(self.state_tokenizer):
+                prompt_latents = self.state_tokenizer.tokenize(prompt_state_packed)
+            else:
+                prompt_latents = self.state_to_latents(prompt_state_packed)
+
+            prompt_latents = unpack_views(prompt_latents, '* n d')
+
+            # handle missing view or time dimensions for 1 latent edge case
+
+            prompt_latents, _ = pack_one(prompt_latents, 'b * n d')
+            prompt_latents, _ = pack_one(prompt_latents, 'b * v n d')
 
         # denoising
         # teacher forcing to start with
@@ -7222,6 +7276,7 @@ class DynamicsWorldModel(Module):
         self,
         *,
         video = None,                    # (b v? c t vh vw)
+        state = None,                    # (b v? t d)
         latents = None,                  # (b t v? n d) | (b t v? d)
         aug_id = None,                   # (b)
         cfg_dropout_aug = None,
@@ -7256,13 +7311,16 @@ class DynamicsWorldModel(Module):
     ):
         # handle video or latents
 
-        assert exists(video) ^ exists(latents)
+        assert exists(video) ^ exists(latents) ^ exists(state), 'exactly one of video, state, or latents must be provided'
 
         # standardize view dimension
 
         if not self.video_has_multi_view:
             if exists(video):
                 video = rearrange(video, 'b ... -> b 1 ...')
+
+            if exists(state):
+                state = rearrange(state, 'b ... -> b 1 ...')
 
             if exists(latents) and not latent_has_view_dim:
                 latents = rearrange(latents, 'b t ... -> b t 1 ...')
@@ -7279,14 +7337,26 @@ class DynamicsWorldModel(Module):
             if exists(self.video_tokenizer):
                 latents = self.video_tokenizer.tokenize(video_packed)
                 latents = unpack_views(latents, '* t n d')
+                latents = rearrange(latents, 'b v t n d -> b t v n d')
 
             if self.has_aux_image_encoder:
                 aux_image_tokens = self.encode_aux_image_tokens(video_packed)
                 aux_image_tokens = unpack_views(aux_image_tokens, '* t n d')
-                latents = cat((latents, aux_image_tokens), dim = -2) if exists(latents) else aux_image_tokens
+                aux_image_tokens = rearrange(aux_image_tokens, 'b v t n d -> b t v n d')
+                latents = safe_cat((latents, aux_image_tokens), dim = -2)
 
-            if latents.ndim == 5:
-                latents = rearrange(latents, 'b v t n d -> b t v n d')
+        if exists(state):
+            assert state.ndim == 4, 'state should have shape (b v t d)'
+            assert exists(self.state_tokenizer) or exists(self.state_to_latents), 'state_tokenizer or state_to_latents must be provided for state input'
+
+            state_packed, unpack_views = pack_one(state, '* t d')
+            if exists(self.state_tokenizer):
+                latents = self.state_tokenizer.tokenize(state_packed)
+            else:
+                latents = self.state_to_latents(state_packed)
+
+            latents = unpack_views(latents, '* t n d')
+            latents = rearrange(latents, 'b v t n d -> b t v n d')
 
         if latents.ndim == 4:
             latents = rearrange(latents, 'b t v d -> b t v 1 d') # 1 latent edge case
@@ -7551,7 +7621,7 @@ class DynamicsWorldModel(Module):
                     latent_ar_action_embed = pad_at_dim(latent_ar_action_embed, (0, 1), value = 0., dim = 1)
 
         elif self.action_embedder.has_actions:
-            action_tokens = zeros_like(agent_tokens[:, :, 0:1])
+            action_tokens = zeros_like(agent_tokens[:, :, narrow(0)])
             next_action_tokens = action_tokens
 
         else:

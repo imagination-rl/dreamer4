@@ -114,7 +114,7 @@ class MockDictEnv(Module):
 
         self.register_buffer('_step', tensor(0))
 
-    def reset(self):
+    def reset(self, seed = None):
         self._step.zero_()
 
         image_shape = (self.num_envs, 3, *self.image_shape) if self.vectorized else (3, *self.image_shape)

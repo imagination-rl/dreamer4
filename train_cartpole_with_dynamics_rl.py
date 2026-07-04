@@ -161,6 +161,7 @@ class TransformerPPOAgent(nn.Module):
         self.use_image_input = use_image_input
 
         tokenizer = None
+        state_tokenizer = None
         aux_image_encoder = None
         num_combined_latents = num_latent_tokens
 
@@ -189,13 +190,27 @@ class TransformerPPOAgent(nn.Module):
                     decoder_flow_steps = 2,
                     lpips_loss_weight = 0.
                 )
+        else:
+            state_tokenizer = StateTokenizer(
+                dim_state = 4,
+                num_latent_tokens = num_latent_tokens,
+                dim_latent = 32,
+                dim = 128,
+                depth = 1,
+                attn_every = 1,
+                attn_heads = 4,
+                attn_dim_head = 32
+            )
 
         self.dynamics = DynamicsWorldModel(
             video_tokenizer = tokenizer,
+            state_tokenizer = state_tokenizer,
+            copy_video_tokenizer = False,
+            copy_state_tokenizer = False,
             aux_image_encoder = aux_image_encoder,
             dim = 128,
             dim_latent = 32,
-            dim_state = None if use_image_input else 4,
+            dim_state = None,
             num_latent_tokens = num_combined_latents if use_image_input else num_latent_tokens,
             num_spatial_tokens = num_combined_latents if use_image_input else num_latent_tokens,
             num_register_tokens = 1,
@@ -259,28 +274,7 @@ class TransformerPPOAgent(nn.Module):
             )
         )
 
-        if not use_image_input:
-            tokenizer = StateTokenizer(
-                dim_state = 4,
-                num_latent_tokens = num_latent_tokens,
-                dim_latent = 32,
-                dim = 128,
-                depth = 1,
-                attn_every = None,
-                attn_heads = 4,
-                attn_dim_head = 32
-            )
 
-            class TokenizerWrapper(nn.Module):
-                def __init__(self, tokenizer):
-                    super().__init__()
-                    self.tokenizer = tokenizer
-
-                def forward(self, x):
-                    return self.tokenizer(x, return_latents = True)
-
-            self.dynamics.state_to_latents = TokenizerWrapper(tokenizer)
-            self.dynamics.state_tokenizer = tokenizer
 
     @property
     def device(self):
@@ -400,17 +394,22 @@ def main(
 
     # optimizers
 
-    has_tokenizer = use_image_input and exists(agent.dynamics.video_tokenizer)
+    has_video_tokenizer = use_image_input and exists(agent.dynamics.video_tokenizer)
+    has_state_tokenizer = not use_image_input and exists(agent.dynamics.state_tokenizer)
+    has_tokenizer = has_video_tokenizer or has_state_tokenizer
     should_ssl = False
 
     if has_tokenizer and not use_conv_encoder:
-        should_ssl = agent.dynamics.video_tokenizer.has_flow and ssl_every_rl_updates > 0
+        if has_video_tokenizer:
+            should_ssl = agent.dynamics.video_tokenizer.has_flow and ssl_every_rl_updates > 0
+        else:
+            should_ssl = ssl_every_rl_updates > 0
 
-    if should_ssl:
+    if should_ssl and has_video_tokenizer:
         log(f'\nReconstruction grids will be saved directly to {results_folder.absolute()}\n')
 
     if has_tokenizer:
-        tokenizer = agent.dynamics.video_tokenizer
+        tokenizer = agent.dynamics.video_tokenizer if has_video_tokenizer else agent.dynamics.state_tokenizer
 
         tokenizer_params = set(tokenizer.parameters())
         agent_params = [p for p in agent.parameters() if p not in tokenizer_params]
@@ -513,6 +512,9 @@ def main(
             if exists(ssl_exp_batch.video):
                 ssl_video = ssl_exp_batch.video
                 ssl_lens = ssl_exp_batch.lens if exists(ssl_exp_batch.lens) else None
+            elif exists(ssl_exp_batch.critic_state):
+                ssl_video = ssl_exp_batch.critic_state
+                ssl_lens = ssl_exp_batch.lens if exists(ssl_exp_batch.lens) else None
 
         # rl update from most recent experiences
 
@@ -608,12 +610,21 @@ def main(
                     batch_video = ssl_video[batch_indices].to(device)
                     batch_lens = ssl_lens[batch_indices].to(device) if exists(ssl_lens) else None
 
-                    loss, (losses, recon_video) = tokenizer(
-                        batch_video,
-                        time_lens = batch_lens,
-                        update_loss_ema = True,
-                        return_intermediates = True
-                    )
+                    if has_video_tokenizer:
+                        loss, (losses, recon_video) = tokenizer(
+                            batch_video,
+                            time_lens = batch_lens,
+                            update_loss_ema = True,
+                            return_intermediates = True
+                        )
+                        recon_loss = losses.recon.item()
+                    else:
+                        loss_out = tokenizer(
+                            batch_video,
+                            time_lens = batch_lens
+                        )
+                        loss = loss_out[0] if isinstance(loss_out, tuple) else loss_out
+                        recon_loss = loss.item()
 
                     loss = loss / ssl_grad_accum_every
                     accelerator.backward(loss)
@@ -623,7 +634,7 @@ def main(
                         tokenizer_optim.step()
                         tokenizer_optim.zero_grad()
 
-                    epoch_recon_loss += losses.recon.item() / len(batches)
+                    epoch_recon_loss += recon_loss / len(batches)
 
                 ssl_pbar.set_postfix(recon_loss = f'{epoch_recon_loss:.4f}')
 
@@ -640,22 +651,23 @@ def main(
             if use_wandb:
                 wandb.log(dict(recon_loss = avg_recon_loss))
 
-            with torch.no_grad():
-                agent.eval()
-                sample_video = ssl_video[:1].to(device)
-                sample_lens = ssl_lens[:1].to(device) if exists(ssl_lens) else None
+            if has_video_tokenizer:
+                with torch.no_grad():
+                    agent.eval()
+                    sample_video = ssl_video[:1].to(device)
+                    sample_lens = ssl_lens[:1].to(device) if exists(ssl_lens) else None
 
-                _, (_, sample_recon) = tokenizer(
-                    sample_video,
-                    time_lens = sample_lens,
-                    mask_patches = False,
-                    return_intermediates = True
-                )
+                    _, (_, sample_recon) = tokenizer(
+                        sample_video,
+                        time_lens = sample_lens,
+                        mask_patches = False,
+                        return_intermediates = True
+                    )
 
-                orig = rearrange(sample_video[0], 'c t h w -> t c h w')[:8]
-                recon = rearrange(sample_recon[0].clamp(0., 1.), 'c t h w -> t c h w')[:8]
-                grid = torch.cat((orig, recon), dim = 0)
-                save_image(grid, str(results_folder / f'recon_ep{episode}.png'), nrow = orig.shape[0])
+                    orig = rearrange(sample_video[0], 'c t h w -> t c h w')[:8]
+                    recon = rearrange(sample_recon[0].clamp(0., 1.), 'c t h w -> t c h w')[:8]
+                    grid = torch.cat((orig, recon), dim = 0)
+                    save_image(grid, str(results_folder / f'recon_ep{episode}.png'), nrow = orig.shape[0])
 
             agent.eval()
             torch.cuda.empty_cache()

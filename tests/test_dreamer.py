@@ -2587,3 +2587,91 @@ def test_experience_combine_and_unbind():
     iter_exps = list(combined)
     assert len(iter_exps) == 2
     assert iter_exps[1].latents.shape == (1, 5, 16)
+
+@param('has_views', [False, True])
+@param('use_time_rnn', [False, True])
+def test_dynamics_model_state_sequential_parallel_cache(has_views, use_time_rnn):
+    from dreamer4.dreamer4 import StateTokenizer, DynamicsWorldModel, pack_one
+    from einops import rearrange
+
+    tokenizer = StateTokenizer(
+        dim_state = 17,
+        num_latent_tokens = 4,
+        dim_latent = 16,
+        dim = 32,
+        depth = 1,
+        attn_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8
+    )
+
+    model = DynamicsWorldModel(
+        dim = 32,
+        state_tokenizer = tokenizer,
+        num_agents = 1,
+        dim_latent = 16,
+        num_latent_genes = 2,
+        num_latent_tokens = 4,
+        depth = 2,
+        time_block_every = 1,
+        attn_heads = 2,
+        attn_dim_head = 16,
+        use_time_rnn = use_time_rnn,
+        num_video_views = 2 if has_views else 1
+    )
+    model.eval()
+
+    batch = 2
+    time = 4
+
+    state_shape = (batch, *((2,) if has_views else tuple()), time, 17)
+    state = torch.randn(*state_shape)
+
+    # parallel pass
+    _, (intermediates_parallel, _) = model(
+        state = state,
+        signal_levels = 1,
+        step_sizes = 1,
+        return_pred_only = True,
+        return_intermediates = True,
+        latent_is_noised = True
+    )
+
+    agent_embed_parallel = intermediates_parallel.agent
+
+    # sequential pass
+    tokenizer_cache = None
+    dynamics_cache = None
+    agent_embed_sequential = []
+
+    if not has_views:
+        state = rearrange(state, 'b ... -> b 1 ...')
+
+    state_packed, unpack_views = pack_one(state, '* t d')
+
+    for t in range(time):
+        step_latents_packed, tokenizer_cache = tokenizer(
+            state_packed[:, t:t+1, :],
+            return_latents = True,
+            time_cache = tokenizer_cache,
+            return_time_cache = True
+        )
+        step_latents = unpack_views(step_latents_packed, '* t n d')
+        step_latents = rearrange(step_latents, 'b v t n d -> b t v n d')
+
+        _, (intermediates_seq, dynamics_cache) = model(
+            latents = step_latents,
+            signal_levels = 1,
+            step_sizes = 1,
+            time_cache = dynamics_cache,
+            return_pred_only = True,
+            return_intermediates = True,
+            latent_is_noised = True,
+            latent_has_view_dim = True
+        )
+
+        agent_embed_sequential.append(intermediates_seq.agent)
+
+    agent_embed_sequential = torch.cat(agent_embed_sequential, dim = 1)
+
+    assert torch.allclose(agent_embed_parallel, agent_embed_sequential, atol = 1e-4), "Sequential and parallel passes through DynamicsWorldModel with StateTokenizer should yield equal agent embeds"
