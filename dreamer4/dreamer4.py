@@ -6461,6 +6461,7 @@ class DynamicsWorldModel(Module):
         use_delight_gating = None,
         delight_temperature = None,
         normalize_advantages = None,
+        return_diagnostics = False,
         eps = 1e-6
     ):
         use_delight_gating = default(use_delight_gating, self.use_delight_gating)
@@ -6835,6 +6836,45 @@ class DynamicsWorldModel(Module):
             returns = returns[:, :-1]
             old_values = old_values[:, :-1]
 
+        diagnostics = None
+
+        if return_diagnostics:
+            value_mask = mask
+
+            if value_mask.shape[1] != returns.shape[1]:
+                value_mask = value_mask[:, :returns.shape[1]]
+
+            masked_returns = returns[value_mask]
+            masked_values = values[value_mask]
+
+            diagnostics = {
+                'critic/gae_return_mean': masked_returns.mean().detach(),
+                'critic/gae_return_min': masked_returns.min().detach(),
+                'critic/gae_return_max': masked_returns.max().detach(),
+                'critic/value_mean': masked_values.mean().detach(),
+                'critic/value_min': masked_values.min().detach(),
+                'critic/value_max': masked_values.max().detach(),
+                'critic/value_abs_error': (masked_values - masked_returns).abs().mean().detach()
+            }
+
+            value_support = getattr(self.value_encoder, 'bin_values', None)
+
+            if exists(value_support):
+                min_value, max_value = value_support[0], value_support[-1]
+            else:
+                value_support = getattr(getattr(self.value_encoder, 'loss', None), 'support', None)
+
+                if exists(value_support):
+                    min_value, max_value = value_support[0], value_support[-1]
+                else:
+                    min_value, max_value = self.value_encoder.reward_range
+                    min_value = tensor(min_value, device = returns.device)
+                    max_value = tensor(max_value, device = returns.device)
+
+            diagnostics['critic/value_target_saturation_frac'] = (
+                (masked_returns < min_value) | (masked_returns > max_value)
+            ).float().mean().detach()
+
         return_bins = self.value_encoder(returns)
 
         value_bins, return_bins = tuple(rearrange(t, 'b t l -> b l t') for t in (value_bins, return_bins))
@@ -6862,6 +6902,9 @@ class DynamicsWorldModel(Module):
 
             value_optim.step()
             value_optim.zero_grad()
+
+        if return_diagnostics:
+            return total_policy_loss, value_loss, diagnostics
 
         return total_policy_loss, value_loss
 

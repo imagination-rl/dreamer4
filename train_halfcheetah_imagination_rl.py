@@ -823,11 +823,12 @@ def train_agent_in_imagination(
             if objective == "pmpo" and exists(policy_prior):
                 dream = attach_policy_prior_unembeds(dream, policy_prior)
 
-        policy_loss, value_loss = world_model.learn_from_experience(
+        policy_loss, value_loss, value_diagnostics = world_model.learn_from_experience(
             dream,
             only_learn_policy_value_heads = True,
             objective = objective,
             use_delight_gating = use_delight_gating,
+            return_diagnostics = True,
         )
 
         loss = policy_loss + value_loss
@@ -841,7 +842,7 @@ def train_agent_in_imagination(
         if objective == "pmpo" and exists(policy_prior):
             agent_metrics.update(agent_prior_kl_metrics(world_model, dream, policy_prior))
 
-        dream_return = dream.episode_return.mean().item() if exists(dream.episode_return) else 0.
+        raw_reward_sum_mean = dream.episode_return.mean().item() if exists(dream.episode_return) else 0.
         dream_len = dream.lens.float().mean().item() if exists(dream.lens) else horizon
         action_std = dream.actions.continuous.std().item() if exists(dream.actions) and exists(dream.actions.continuous) else 0.
 
@@ -849,7 +850,7 @@ def train_agent_in_imagination(
             "imagination/loss": loss.item(),
             "imagination/policy_loss": policy_loss.item(),
             "imagination/value_loss": value_loss.item(),
-            "imagination/dream_return": dream_return,
+            "imagination/raw_reward_sum_mean": raw_reward_sum_mean,
             "imagination/dream_length": dream_len,
             "imagination/action_std": action_std,
             "imagination/prompt_length": prompt_length if exists(prompts) else 0,
@@ -862,12 +863,16 @@ def train_agent_in_imagination(
             "imagination/prior_kl_max": agent_metrics.get("prior_kl_max", torch.tensor(0.)).item(),
         }
         last_metrics.update({
+            key: value.item()
+            for key, value in value_diagnostics.items()
+        })
+        last_metrics.update({
             f"imagination/{key}": value
             for key, value in grad_metrics.items()
         })
 
         log_scalars(writer, last_metrics, global_step)
-        pbar.set_postfix(return_ = f"{dream_return:.1f}", loss = f"{loss.item():.3f}")
+        pbar.set_postfix(raw_reward = f"{raw_reward_sum_mean:.1f}", loss = f"{loss.item():.3f}")
         global_step += 1
 
     return global_step, last_metrics
@@ -1239,7 +1244,7 @@ def main(
         if wm_metrics:
             postfix["wm"] = f"{wm_metrics['world_model/loss']:.2f}"
         if imagination_metrics:
-            postfix["dream"] = f"{imagination_metrics['imagination/dream_return']:.1f}"
+            postfix["dream"] = f"{imagination_metrics['imagination/raw_reward_sum_mean']:.1f}"
         pbar.set_postfix(postfix)
 
         if checkpoint_every > 0 and divisible_by(loop + 1, checkpoint_every):

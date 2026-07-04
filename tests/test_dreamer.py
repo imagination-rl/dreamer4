@@ -344,7 +344,18 @@ def test_action_with_world_model():
 
     # take a reinforcement learning step
 
-    actor_loss, critic_loss = dynamics.learn_from_experience(gen)
+    actor_loss, critic_loss, diagnostics = dynamics.learn_from_experience(gen, return_diagnostics = True)
+
+    assert {
+        'critic/gae_return_mean',
+        'critic/gae_return_min',
+        'critic/gae_return_max',
+        'critic/value_mean',
+        'critic/value_min',
+        'critic/value_max',
+        'critic/value_abs_error',
+        'critic/value_target_saturation_frac'
+    } <= diagnostics.keys()
 
     actor_loss.backward(retain_graph = True)
     critic_loss.backward()
