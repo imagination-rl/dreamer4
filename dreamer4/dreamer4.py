@@ -104,13 +104,14 @@ class ReLUSquared(Module):
 # may also end up crafting own custom flash attention kernel for this work
 
 flex_attention = None
+flex_flash_attention = None
 
 try:
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask
     if torch.cuda.is_available():
         import torch._dynamo
         torch._dynamo.config.cache_size_limit = 256
-        flex_attention = torch.compile(flex_attention)
+        flex_attention = torch.compile(_flex_attention)
 except ImportError:
     pass
 
@@ -134,7 +135,7 @@ DynamicsIntermediates = namedtuple('DynamicsIntermediates', ('main', 'actor', 'c
 
 Predictions = namedtuple('Predictions', ['flow', 'proprioception', 'state'])
 
-Embeds = namedtuple('Embeds', ['agent', 'state_pred', 'actor', 'critic'], defaults=(None, None))
+Embeds = namedtuple('Embeds', ['agent', 'state_pred', 'actor', 'critic', 'policy_input'], defaults=(None, None, None))
 
 Actions = namedtuple('Actions', ['discrete', 'continuous'])
 
@@ -147,6 +148,7 @@ class Experience:
     proprio: MaybeTensor = None
     critic_state: MaybeTensor = None
     agent_embed: MaybeTensor = None
+    policy_input: MaybeTensor = None
     rewards: Tensor | None = None
     terminals: Tensor | None = None
     actions: Actions | None = None
@@ -1720,6 +1722,7 @@ def get_attend_fn(
     use_flex,
     seq_len,
     k_seq_len,
+    use_flex_flash_backend = False,
     causal = False,
     causal_block_size = 1,
     softclamp_value = 50.,
@@ -1728,6 +1731,8 @@ def get_attend_fn(
     special_attend_only_itself = False, # by default, modality only attends to itself while special sees everything, but if turned True, will be the inverse - special can only attend to itself but modality can attend everything
     device = None
 ):
+    global flex_flash_attention
+
     block_size_per_special = default(block_size_per_special, k_seq_len)
 
     if use_flex:
@@ -1742,7 +1747,15 @@ def get_attend_fn(
         block_mask = create_block_mask(block_mask_fn, B = None, H = None, Q_LEN = seq_len, KV_LEN = k_seq_len)
 
         score_mod = score_mod_softclamp(softclamp_value)
-        attend_fn = partial(flex_attention, block_mask = block_mask, score_mod = score_mod, enable_gqa = True)
+        flex_attend = flex_flash_attention if use_flex_flash_backend else flex_attention
+        if use_flex_flash_backend and not exists(flex_attend):
+            flex_flash_attention = torch.compile(
+                partial(_flex_attention, kernel_options = {"BACKEND": "FLASH"}),
+                dynamic = False
+            )
+            flex_attend = flex_flash_attention
+
+        attend_fn = partial(flex_attend, block_mask = block_mask, score_mod = score_mod, enable_gqa = True)
     else:
         # naive pathway
 
@@ -2682,6 +2695,7 @@ class AxialSpaceTimeTransformer(Module):
         rnn_time = False,
         time_attention_use_pope = False,
         space_attention_use_pope = False,
+        flex_attention_flash_backend = False,
         use_attn_pool = True,
         attention_residuals_mode: Literal['off', 'none', 'full', 'block'] | bool | None = None,
         mot_temporal = False,
@@ -2722,6 +2736,7 @@ class AxialSpaceTimeTransformer(Module):
         self.time_rotary = PoPE(attn_dim_head, heads = query_heads) if time_attention_use_pope else Rotary1D(attn_dim_head)
 
         self.space_attention_use_pope = space_attention_use_pope
+        self.flex_attention_flash_backend = flex_attention_flash_backend
 
         self.space_rotary = None
         if space_attention_use_pope:
@@ -2904,9 +2919,9 @@ class AxialSpaceTimeTransformer(Module):
 
         num_spatial_special = 0 if self.full_spatial_attn else self.num_special_tokens
 
-        space_attend = get_attend_fn(**attend_kwargs, causal = False, seq_len = space_seq_len, k_seq_len = space_seq_len, num_special_tokens = num_spatial_special, use_flex = use_flex and not self.full_spatial_attn)
+        space_attend = get_attend_fn(**attend_kwargs, causal = False, seq_len = space_seq_len, k_seq_len = space_seq_len, num_special_tokens = num_spatial_special, use_flex = use_flex and not self.full_spatial_attn, use_flex_flash_backend = self.flex_attention_flash_backend)
 
-        time_attend = get_attend_fn(**attend_kwargs, causal = True, seq_len = time, k_seq_len = time + token_count, use_flex = use_flex)
+        time_attend = get_attend_fn(**attend_kwargs, causal = True, seq_len = time, k_seq_len = time + token_count, use_flex = use_flex, use_flex_flash_backend = self.flex_attention_flash_backend)
 
         # prepare cache
 
@@ -4606,6 +4621,7 @@ class DynamicsWorldModel(Module):
         add_reward_embed_to_agent_token = False,
         add_reward_embed_dropout = 0.1,
         add_action_embed_to_agent_token = False,
+        policy_head_accepts_all_tokens = False,
         add_state_pred_head = False,
         state_pred_loss_weight = 0.1,
         state_entropy_bonus_weight = 0.05,
@@ -4652,6 +4668,7 @@ class DynamicsWorldModel(Module):
         gae_use_accelerated = False,
         use_loss_normalization = False,
         time_attention_use_pope = False,
+        flex_attention_flash_backend = False,
         latent_ar_layer: int | tuple[int, int] | None = None,
         latent_ar = False,
         latent_ar_action_conditioned = False,
@@ -4707,6 +4724,7 @@ class DynamicsWorldModel(Module):
         # spatial
 
         self.num_latent_tokens = num_latent_tokens
+        self.num_spatial_tokens = num_spatial_tokens
         self.dim_latent = dim_latent
         self.latent_shape = (num_latent_tokens, dim_latent)
 
@@ -4843,10 +4861,26 @@ class DynamicsWorldModel(Module):
         self.num_latent_genes = num_latent_genes
         self.latent_genes = Parameter(randn(num_latent_genes, dim) * 1e-2)
 
+        has_discrete_actions_for_policy = any(num_actions > 0 for num_actions in ensure_tuple(num_discrete_actions))
+        has_actions_for_policy = has_discrete_actions_for_policy or num_continuous_actions > 0
+
+        self.policy_head_accepts_all_tokens = policy_head_accepts_all_tokens
+        if self.policy_head_accepts_all_tokens:
+            assert num_agents == 1, 'policy_head_accepts_all_tokens only supports the single agent case for now'
+
+        self.num_policy_input_tokens = (
+            1 +
+            int(self.policy_head_accepts_all_tokens) * (
+                num_spatial_tokens * num_video_views +
+                num_register_tokens +
+                int(has_actions_for_policy)
+            )
+        )
+
         # policy head
 
         self.policy_head = create_mlp(
-            dim_in = dim,
+            dim_in = dim * self.num_policy_input_tokens,
             dim = dim * 4,
             dim_out = dim * 4,
             depth = policy_head_mlp_depth,
@@ -5027,6 +5061,7 @@ class DynamicsWorldModel(Module):
                 final_norm = False,
                 rnn_time = use_time_rnn,
                 time_attention_use_pope = time_attention_use_pope,
+                flex_attention_flash_backend = flex_attention_flash_backend,
                 attention_residuals_mode = attention_residuals_mode
             )
 
@@ -5047,6 +5082,7 @@ class DynamicsWorldModel(Module):
                 final_norm = False,
                 rnn_time = use_time_rnn,
                 time_attention_use_pope = time_attention_use_pope,
+                flex_attention_flash_backend = flex_attention_flash_backend,
                 attention_residuals_mode = attention_residuals_mode
             )
 
@@ -5094,6 +5130,7 @@ class DynamicsWorldModel(Module):
             final_norm = False,
             rnn_time = use_time_rnn,
             time_attention_use_pope = time_attention_use_pope,
+            flex_attention_flash_backend = flex_attention_flash_backend,
             attention_residuals_mode = attention_residuals_mode,
             **transformer_kwargs
         )
@@ -5114,6 +5151,7 @@ class DynamicsWorldModel(Module):
             final_norm = False,
             rnn_time = use_time_rnn,
             time_attention_use_pope = time_attention_use_pope,
+            flex_attention_flash_backend = flex_attention_flash_backend,
             attention_residuals_mode = attention_residuals_mode,
             **transformer_kwargs
         )
@@ -5134,6 +5172,7 @@ class DynamicsWorldModel(Module):
         self.value_clip = value_clip
         self.clip_values = clip_values
         self.policy_entropy_weight = policy_entropy_weight
+        self.normalize_advantages = normalize_advantages
 
         self.agent_policy_gradient_frac = agent_policy_gradient_frac
         self.agent_value_gradient_frac = agent_value_gradient_frac
@@ -5194,6 +5233,44 @@ class DynamicsWorldModel(Module):
 
     def normalize_dynamics_head_hidden_states(self, hidden_states):
         return self.dynamics_hidden_state_norm(hidden_states)
+
+    def normalize_policy_input(self, policy_input):
+        if not self.policy_head_accepts_all_tokens:
+            return self.normalize_dynamics_head_hidden_states(policy_input)
+
+        policy_input = rearrange(policy_input, '... (n d) -> ... n d', n = self.num_policy_input_tokens, d = self.dim)
+        policy_input = self.normalize_dynamics_head_hidden_states(policy_input)
+        return rearrange(policy_input, '... n d -> ... (n d)')
+
+    def policy_embed_from_input(self, policy_input):
+        return self.policy_head(self.normalize_policy_input(policy_input))
+
+    def policy_input_from_tokens(
+        self,
+        agent_tokens,
+        *,
+        space_tokens = None,
+        register_tokens = None,
+        action_tokens = None,
+        agent_index = 0
+    ):
+        agent_token = agent_tokens[..., agent_index, :] if agent_tokens.ndim == 4 else agent_tokens
+
+        if not self.policy_head_accepts_all_tokens:
+            return agent_token
+
+        assert exists(space_tokens), 'space_tokens must be passed when policy_head_accepts_all_tokens is enabled'
+        assert exists(register_tokens), 'register_tokens must be passed when policy_head_accepts_all_tokens is enabled'
+
+        policy_tokens = [rearrange(agent_token, 'b t d -> b t 1 d'), space_tokens, register_tokens]
+
+        if self.action_embedder.has_actions:
+            assert exists(action_tokens), 'action_tokens must be passed when policy_head_accepts_all_tokens is enabled with actions'
+            action_tokens = rearrange(action_tokens, 'b t d -> b t 1 d') if action_tokens.ndim == 3 else action_tokens
+            policy_tokens.append(action_tokens)
+
+        policy_input = cat(policy_tokens, dim = -2)
+        return rearrange(policy_input, 'b t n d -> b t (n d)')
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         action_to_agent_scale_key = prefix + 'action_to_agent_embed_scale'
@@ -5357,7 +5434,8 @@ class DynamicsWorldModel(Module):
         use_time_cache = True,
         store_agent_embed = True,
         store_old_action_unembeds = True,
-        obs_to_latents_fn = None
+        obs_to_latents_fn = None,
+        return_rollout_metrics = False
     ):
         device = self.device
 
@@ -5412,9 +5490,11 @@ class DynamicsWorldModel(Module):
         discrete_log_probs = None
         continuous_log_probs = None
         values = None
+        rollout_reward_preds = None
 
         acc_latents = None
         acc_agent_embed = None
+        acc_policy_input = None
         acc_policy_embed = None
 
         is_terminated = full((batch,), False, device = device)
@@ -5492,8 +5572,12 @@ class DynamicsWorldModel(Module):
             agent_embed = embeds.agent
             one_agent_embed = agent_embed[..., -1:, agent_index, :]
 
-            actor_agent_embed = default(embeds.actor, agent_embed)
-            one_actor_agent_embed = actor_agent_embed[..., -1:, agent_index, :]
+            one_policy_input = embeds.policy_input[:, -1:]
+
+            if exists(rewards):
+                reward_logits = self.to_reward_pred.forward_one(self.normalize_dynamics_head_hidden_states(one_agent_embed), id = 0)
+                reward_pred = self.reward_encoder.bins_to_scalar_value(reward_logits)
+                rollout_reward_preds = safe_cat((rollout_reward_preds, reward_pred), dim = 1)
 
             critic_agent_embed = default(embeds.critic, agent_embed)
             one_critic_agent_embed = critic_agent_embed[..., -1:, agent_index, :]
@@ -5508,7 +5592,7 @@ class DynamicsWorldModel(Module):
             value = self.value_encoder.bins_to_scalar_value(value_bins)
             values = safe_cat((values, value), dim = 1)
 
-            policy_embed = self.policy_head(self.normalize_dynamics_head_hidden_states(one_actor_agent_embed))
+            policy_embed = self.policy_embed_from_input(one_policy_input)
 
             if store_old_action_unembeds:
                 acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
@@ -5594,6 +5678,7 @@ class DynamicsWorldModel(Module):
             rewards = safe_cat((rewards, reward), dim = 1)
 
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+            acc_policy_input = safe_cat((acc_policy_input, one_policy_input), dim = 1)
 
             obs = next_obs
             next_proprio = obs.get('proprio', None)
@@ -5673,6 +5758,13 @@ class DynamicsWorldModel(Module):
                 # evaluate the bootstrap state
 
                 one_agent_embed = embeds.agent[..., -1:, agent_index, :]
+                one_policy_input = embeds.policy_input[:, -1:]
+
+                if exists(rewards):
+                    reward_logits = self.to_reward_pred.forward_one(self.normalize_dynamics_head_hidden_states(one_agent_embed), id = 0)
+                    reward_pred = self.reward_encoder.bins_to_scalar_value(reward_logits)
+                    rollout_reward_preds = safe_cat((rollout_reward_preds, reward_pred), dim = 1)
+
                 value_embed = one_agent_embed
 
                 if exists(self.critic_state_embedder) and exists(state_frame):
@@ -5698,8 +5790,11 @@ class DynamicsWorldModel(Module):
                 if exists(acc_agent_embed):
                     acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
+                if exists(acc_policy_input):
+                    acc_policy_input = safe_cat((acc_policy_input, one_policy_input), dim = 1)
+
                 if exists(acc_policy_embed):
-                    policy_embed = self.policy_head(self.normalize_dynamics_head_hidden_states(one_agent_embed))
+                    policy_embed = self.policy_embed_from_input(one_policy_input)
                     acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
                 episode_lens = torch.where(need_bootstrap, episode_lens + 1, episode_lens)
@@ -5726,6 +5821,7 @@ class DynamicsWorldModel(Module):
             values = values,
             old_action_unembeds = self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0) if exists(acc_policy_embed) and store_old_action_unembeds else None,
             agent_embed = acc_agent_embed if store_agent_embed else None,
+            policy_input = acc_policy_input if store_agent_embed else None,
             step_size = step_size,
             agent_index = agent_index,
             is_truncated = is_truncated,
@@ -5734,6 +5830,30 @@ class DynamicsWorldModel(Module):
             is_from_world_model = False,
             episode_return = episode_return
         )
+
+        rollout_metrics = {}
+
+        if exists(rollout_reward_preds):
+            reward_pred_time = min(rollout_reward_preds.shape[1], rewards.shape[1])
+            reward_preds_for_mae = rollout_reward_preds[:, :reward_pred_time]
+            reward_targets_for_mae = rewards[:, :reward_pred_time]
+            reward_lens = episode_lens.clamp(min = 0, max = reward_pred_time)
+
+            if exists(is_truncated):
+                reward_lens = (reward_lens - is_truncated.long()).clamp(min = 0, max = reward_pred_time)
+
+            reward_mask = lens_to_mask(reward_lens, reward_pred_time)
+
+            if reward_mask.any():
+                reward_abs_error = (reward_preds_for_mae - reward_targets_for_mae).abs()[reward_mask]
+                rollout_metrics.update(
+                    reward_mae = reward_abs_error.mean().item(),
+                    reward_abs_error_sum = reward_abs_error.sum().item(),
+                    reward_abs_error_count = int(reward_abs_error.numel())
+                )
+
+        if return_rollout_metrics:
+            return one_experience, rollout_metrics
 
         return one_experience
 
@@ -5748,7 +5868,6 @@ class DynamicsWorldModel(Module):
         objective: Literal['ppo', 'pmpo', 'spo'] = 'ppo',
         use_delight_gating = None,
         delight_temperature = None,
-        normalize_advantages = None,
         eps = 1e-6
     ):
         use_delight_gating = default(use_delight_gating, False if objective == 'pmpo' else self.use_delight_gating)
@@ -5776,6 +5895,7 @@ class DynamicsWorldModel(Module):
         old_values = experience.values
         rewards = experience.rewards
         agent_embeds = experience.agent_embed
+        policy_inputs = experience.policy_input
         old_action_unembeds = experience.old_action_unembeds
 
         step_size = experience.step_size
@@ -5867,7 +5987,7 @@ class DynamicsWorldModel(Module):
 
         # if using pmpo, do not normalize advantages, but can be overridden
 
-        normalize_advantages = default(normalize_advantages, objective != 'pmpo')
+        normalize_advantages = default(self.normalize_advantages, objective != 'pmpo')
 
         if normalize_advantages:
             advantage = z_score(advantage, mask = mask, eps = eps)
@@ -5887,7 +6007,8 @@ class DynamicsWorldModel(Module):
 
         if (
             not only_learn_policy_value_heads or
-            not exists(agent_embeds)
+            not exists(agent_embeds) or
+            (self.policy_head_accepts_all_tokens and not exists(policy_inputs))
         ):
 
             with world_model_forward_context():
@@ -5905,16 +6026,20 @@ class DynamicsWorldModel(Module):
                 )
 
             agent_embeds = embeds.agent[..., agent_index, :]
+            policy_inputs = embeds.policy_input
 
         # maybe detach agent embed
 
         if only_learn_policy_value_heads:
             agent_embeds = agent_embeds.detach()
+            if exists(policy_inputs):
+                policy_inputs = policy_inputs.detach()
 
         # ppo
 
-        policy_agent_embeds = frac_gradient(agent_embeds, self.agent_policy_gradient_frac)
-        policy_embed = self.policy_head(self.normalize_dynamics_head_hidden_states(policy_agent_embeds))
+        policy_inputs = default(policy_inputs, agent_embeds)
+        policy_inputs = frac_gradient(policy_inputs, self.agent_policy_gradient_frac)
+        policy_embed = self.policy_embed_from_input(policy_inputs)
 
         # align actions with policy embed if latents had a bootstrap state appended
 
@@ -6291,6 +6416,7 @@ class DynamicsWorldModel(Module):
         # maybe store agent embed
 
         acc_agent_embed = None
+        acc_policy_input = None
 
         # maybe store old actions for kl
 
@@ -6494,6 +6620,7 @@ class DynamicsWorldModel(Module):
 
             if needs_agent_embed:
                 one_agent_embed = embeds.agent[:, -1:, agent_index]
+                one_policy_input = embeds.policy_input[:, -1:]
 
             # maybe predict terminals
 
@@ -6516,13 +6643,14 @@ class DynamicsWorldModel(Module):
 
             if store_agent_embed and not sample_agent_actions:
                 acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+                acc_policy_input = safe_cat((acc_policy_input, one_policy_input), dim = 1)
 
             # decode the agent actions if needed
 
             if sample_agent_actions:
                 assert self.action_embedder.has_actions
 
-                policy_embed = self.policy_head(self.normalize_dynamics_head_hidden_states(one_agent_embed))
+                policy_embed = self.policy_embed_from_input(one_policy_input)
 
                 num_sampled_actions = decoded_action_len()
 
@@ -6548,6 +6676,7 @@ class DynamicsWorldModel(Module):
 
                     if store_agent_embed:
                         acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+                        acc_policy_input = safe_cat((acc_policy_input, one_policy_input), dim = 1)
 
                     if return_log_probs_and_values:
                         discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
@@ -6646,6 +6775,9 @@ class DynamicsWorldModel(Module):
         if exists(acc_agent_embed):
             acc_agent_embed = acc_agent_embed[:, :public_time_steps]
 
+        if exists(acc_policy_input):
+            acc_policy_input = acc_policy_input[:, :public_time_steps]
+
         # returning video
 
         has_tokenizer = exists(self.video_tokenizer)
@@ -6706,6 +6838,7 @@ class DynamicsWorldModel(Module):
             video = video,
             proprio = proprio if has_proprio else None,
             agent_embed = acc_agent_embed if store_agent_embed else None,
+            policy_input = acc_policy_input if store_agent_embed else None,
             old_action_unembeds = self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0) if exists(acc_policy_embed) and store_old_action_unembeds else None,
             step_size = step_size,
             agent_index = agent_index,
@@ -6782,7 +6915,8 @@ class DynamicsWorldModel(Module):
         agent_token_cond = None,         # (b t d) optional conditioning to be summed to agent tokens
         time_modifier_fn: Callable | None = None,
         return_reward_head_stats = False,
-        return_tem_preds = False
+        return_tem_preds = False,
+        disable_shortcut_train = False
     ):
         # handle video or latents
 
@@ -6890,7 +7024,7 @@ class DynamicsWorldModel(Module):
 
         if not is_inference:
 
-            shortcut_train = _sample_prob(self.prob_shortcut_train)
+            shortcut_train = False if disable_shortcut_train else _sample_prob(self.prob_shortcut_train)
 
             if shortcut_train:
 
@@ -7181,8 +7315,25 @@ class DynamicsWorldModel(Module):
 
             flow_token, space_tokens, proprio_token, state_pred_token, register_tokens, action_tokens, reward_tokens, maybe_aug_token, agent_tokens = unpack(tokens, packed_tokens_shape, 'b t * d')
 
-            actor_agent_tokens = unpack(actor_tokens, packed_tokens_shape, 'b t * d')[-1] if self.has_actor_transformer else agent_tokens
-            critic_agent_tokens = unpack(critic_tokens, packed_tokens_shape, 'b t * d')[-1] if self.has_critic_transformer else agent_tokens
+            actor_unpacked_tokens = unpack(actor_tokens, packed_tokens_shape, 'b t * d') if self.has_actor_transformer else None
+            critic_unpacked_tokens = unpack(critic_tokens, packed_tokens_shape, 'b t * d') if self.has_critic_transformer else None
+
+            actor_agent_tokens = actor_unpacked_tokens[-1] if self.has_actor_transformer else agent_tokens
+            critic_agent_tokens = critic_unpacked_tokens[-1] if self.has_critic_transformer else agent_tokens
+
+            if self.has_actor_transformer:
+                _, actor_space_tokens, _, _, actor_register_tokens, actor_action_tokens, *_ = actor_unpacked_tokens
+            else:
+                actor_space_tokens = space_tokens
+                actor_register_tokens = register_tokens
+                actor_action_tokens = action_tokens
+
+            policy_input = self.policy_input_from_tokens(
+                actor_agent_tokens,
+                space_tokens = actor_space_tokens,
+                register_tokens = actor_register_tokens,
+                action_tokens = actor_action_tokens
+            )
 
             # pooling
 
@@ -7208,7 +7359,7 @@ class DynamicsWorldModel(Module):
 
             predictions = Predictions(pred, pred_proprio, pred_state)
 
-            embeds = Embeds(agent_tokens, state_pred_token, actor_agent_tokens, critic_agent_tokens)
+            embeds = Embeds(agent_tokens, state_pred_token, actor_agent_tokens, critic_agent_tokens, policy_input)
 
             if not return_agent_tokens:
                 return predictions
@@ -7516,9 +7667,7 @@ class DynamicsWorldModel(Module):
 
             num_targets = pred_len - 1 if shift_action_tokens else pred_len
 
-            actor_agent_tokens = default(embeds.actor, embeds.agent)
-            encoded_actor_tokens = rearrange(actor_agent_tokens, 'b t 1 d -> b t d')
-            policy_embed = self.policy_head(self.normalize_dynamics_head_hidden_states(encoded_actor_tokens[:, :num_targets]))
+            policy_embed = self.policy_embed_from_input(embeds.policy_input[:, :num_targets])
 
             # constitute multi token prediction targets
 

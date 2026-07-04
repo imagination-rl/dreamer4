@@ -21,6 +21,7 @@ import inspect
 from copy import deepcopy
 from collections import deque
 from datetime import datetime
+from time import perf_counter
 from pathlib import Path
 from typing import Any, Literal, Mapping
 from math import sqrt
@@ -43,6 +44,7 @@ from dreamer4.dreamer4 import (
     Actions,
     DynamicsWorldModel,
     Experience,
+    calc_gae,
     combine_experiences,
     divisible_by,
     exists,
@@ -220,6 +222,13 @@ def log_scalars(writer: SummaryWriter | None, scalars: dict[str, float], step: i
         writer.add_scalar(key, float(value), step)
 
 
+def time_per_step(elapsed_seconds: float, num_steps: int):
+    if num_steps <= 0:
+        return None
+
+    return elapsed_seconds / num_steps
+
+
 def log_hyperparameters_text(writer: SummaryWriter | None, hyperparameters: Mapping[str, Any]):
     if not exists(writer):
         return
@@ -331,6 +340,100 @@ def module_parameters(module: nn.Module | None):
     return [] if not exists(module) else list(module.parameters())
 
 
+def parameter_count(params, *, trainable_only = False):
+    params = unique_parameters(list(params))
+
+    if trainable_only:
+        params = [param for param in params if param.requires_grad]
+
+    return sum(param.numel() for param in params)
+
+
+def model_size_rows(
+    *,
+    tokenizer: ObservationTokenizer,
+    world_model: DynamicsWorldModel,
+    world_params = None,
+    agent_params = None,
+    policy_prior: nn.Module | None = None,
+):
+    rows = [
+        ("model/tokenizer", list(tokenizer.parameters())),
+        ("model/world_model", list(world_model.parameters())),
+    ]
+
+    if exists(policy_prior):
+        rows.append(("model/policy_prior", list(policy_prior.parameters())))
+
+    if exists(world_params):
+        rows.append(("optimizer/world_model", list(world_params)))
+
+    if exists(agent_params):
+        rows.append(("optimizer/agent", list(agent_params)))
+
+    head_rows = [
+        ("head/latent_pred", module_parameters(getattr(world_model, "to_latent_pred", None))),
+        ("head/reward", module_parameters(getattr(world_model, "to_reward_pred", None))),
+        ("head/action_embedder", module_parameters(getattr(world_model, "action_embedder", None))),
+        ("head/action_unembed", list(world_model.action_embedder.unembed_parameters())),
+        ("head/terminal", module_parameters(getattr(world_model, "to_state_terminal_pred", None))),
+        ("head/state", module_parameters(getattr(world_model, "to_state_pred", None))),
+        ("head/agent_state", module_parameters(getattr(world_model, "to_agent_state_pred", None))),
+        ("head/latent_ar", module_parameters(getattr(world_model, "latent_ar", None))),
+        ("head/policy", module_parameters(getattr(world_model, "policy_head", None))),
+        ("head/policy_trainable_group", list(world_model.policy_head_parameters())),
+        ("head/value", module_parameters(getattr(world_model, "value_head", None))),
+        ("head/value_trainable_group", list(world_model.value_head_parameters())),
+        ("head/critic_state_embedder", module_parameters(getattr(world_model, "critic_state_embedder", None))),
+    ]
+
+    rows.extend(head_rows)
+    return rows
+
+
+def print_model_size_report(
+    *,
+    tokenizer: ObservationTokenizer,
+    world_model: DynamicsWorldModel,
+    world_params = None,
+    agent_params = None,
+    policy_prior: nn.Module | None = None,
+):
+    rows = model_size_rows(
+        tokenizer = tokenizer,
+        world_model = world_model,
+        world_params = world_params,
+        agent_params = agent_params,
+        policy_prior = policy_prior,
+    )
+
+    name_width = max(len(name) for name, _ in rows)
+
+    print("parameter sizes:")
+    print(f"{'name':<{name_width}}  {'total':>14}  {'trainable':>14}")
+    for name, params in rows:
+        print(f"{name:<{name_width}}  {parameter_count(params):>14,}  {parameter_count(params, trainable_only = True):>14,}")
+
+
+@torch.no_grad()
+def init_categorical_head_to_value(head: nn.Module, value_encoder: nn.Module, init_value: float):
+    final_linear = head.layers[-1][0]
+
+    if not isinstance(final_linear, nn.Linear):
+        raise TypeError("categorical scalar head final layer must be nn.Linear")
+
+    device = final_linear.weight.device
+    dtype = final_linear.weight.dtype
+
+    init_value_tensor = torch.tensor([init_value], device = device, dtype = dtype)
+    probs = value_encoder(init_value_tensor).to(device = device, dtype = dtype)
+    logits = probs.clamp_min(1e-8).log()
+    logits = logits - logits.mean(dim = -1, keepdim = True)
+
+    final_linear.weight.zero_()
+    final_linear.bias.copy_(logits.squeeze(0))
+
+
 def optimizer_parameters(optimizer: Optimizer):
     return [param for group in optimizer.param_groups for param in group["params"]]
 
@@ -438,6 +541,7 @@ def slice_experience(exp: Experience, idx: Tensor):
         proprio = slice_maybe(exp.proprio),
         critic_state = slice_maybe(exp.critic_state),
         agent_embed = slice_maybe(exp.agent_embed),
+        policy_input = slice_maybe(exp.policy_input),
         rewards = slice_maybe(exp.rewards),
         terminals = slice_maybe(exp.terminals),
         actions = actions,
@@ -522,6 +626,7 @@ def sample_experience_time_window(exp: Experience, max_length: int | None):
         proprio = take_window(exp.proprio),
         critic_state = take_window(exp.critic_state),
         agent_embed = take_window(exp.agent_embed),
+        policy_input = take_window(exp.policy_input),
         rewards = take_window(exp.rewards),
         terminals = take_episode_end_flag(exp.terminals),
         actions = actions,
@@ -597,6 +702,7 @@ def trim_prompt_from_dream(dream: Experience, prompt_length: int, horizon: int):
     )
     generated_tensors = (
         dream.agent_embed,
+        dream.policy_input,
         dream.values,
         dream.log_probs.discrete if exists(dream.log_probs) else None,
         dream.log_probs.continuous if exists(dream.log_probs) else None,
@@ -653,6 +759,7 @@ def trim_prompt_from_dream(dream: Experience, prompt_length: int, horizon: int):
         proprio = trim_prompted(dream.proprio),
         critic_state = trim_prompted(dream.critic_state),
         agent_embed = trim_generated(dream.agent_embed),
+        policy_input = trim_generated(dream.policy_input),
         rewards = rewards,
         terminals = dream.terminals,
         actions = actions,
@@ -677,6 +784,9 @@ def cat_existing(tensors: tuple[Tensor | None, ...], dim: int = -1):
 class FrozenPolicyPrior(nn.Module):
     def __init__(self, world_model: DynamicsWorldModel):
         super().__init__()
+        self.dim = world_model.dim
+        self.num_policy_input_tokens = world_model.num_policy_input_tokens
+        self.policy_head_accepts_all_tokens = world_model.policy_head_accepts_all_tokens
         self.dynamics_hidden_state_norm = deepcopy(world_model.dynamics_hidden_state_norm)
         self.policy_head = deepcopy(world_model.policy_head)
         self.action_embedder = deepcopy(world_model.action_embedder)
@@ -685,6 +795,9 @@ class FrozenPolicyPrior(nn.Module):
 
     @torch.no_grad()
     def refresh_from(self, world_model: DynamicsWorldModel):
+        self.dim = world_model.dim
+        self.num_policy_input_tokens = world_model.num_policy_input_tokens
+        self.policy_head_accepts_all_tokens = world_model.policy_head_accepts_all_tokens
         self.dynamics_hidden_state_norm.load_state_dict(world_model.dynamics_hidden_state_norm.state_dict())
         self.policy_head.load_state_dict(world_model.policy_head.state_dict())
         self.action_embedder.load_state_dict(world_model.action_embedder.state_dict())
@@ -692,20 +805,30 @@ class FrozenPolicyPrior(nn.Module):
         self.requires_grad_(False)
         self.eval()
 
+    def normalize_policy_input(self, policy_input: Tensor):
+        if not self.policy_head_accepts_all_tokens:
+            return self.dynamics_hidden_state_norm(policy_input)
+
+        policy_input = rearrange(policy_input, "... (n d) -> ... n d", n = self.num_policy_input_tokens, d = self.dim)
+        policy_input = self.dynamics_hidden_state_norm(policy_input)
+        return rearrange(policy_input, "... n d -> ... (n d)")
+
     @torch.no_grad()
-    def action_unembeds(self, agent_embeds: Tensor):
-        policy_embed = self.policy_head(self.dynamics_hidden_state_norm(agent_embeds.detach()))
+    def action_unembeds(self, policy_input: Tensor):
+        policy_embed = self.policy_head(self.normalize_policy_input(policy_input.detach()))
         return self.action_embedder.unembed(policy_embed, pred_head_index = 0)
 
 
 @torch.no_grad()
 def agent_approx_kl_metrics(world_model: DynamicsWorldModel, dream: Experience):
-    assert exists(dream.agent_embed)
     assert exists(dream.actions)
     assert exists(dream.log_probs)
 
-    agent_embeds = dream.agent_embed.detach()
-    policy_embed = world_model.policy_head(world_model.normalize_dynamics_head_hidden_states(agent_embeds))
+    policy_input = dream.policy_input if exists(dream.policy_input) else dream.agent_embed
+    assert exists(policy_input)
+
+    policy_input = policy_input.detach()
+    policy_embed = world_model.policy_embed_from_input(policy_input)
     policy_time = policy_embed.shape[1]
 
     def align_time(t):
@@ -752,12 +875,13 @@ def agent_approx_kl_metrics(world_model: DynamicsWorldModel, dream: Experience):
 
 @torch.no_grad()
 def agent_prior_kl_metrics(world_model: DynamicsWorldModel, dream: Experience, policy_prior: FrozenPolicyPrior):
-    assert exists(dream.agent_embed)
+    policy_input = dream.policy_input if exists(dream.policy_input) else dream.agent_embed
+    assert exists(policy_input)
 
-    agent_embeds = dream.agent_embed.detach()
-    policy_embed = world_model.policy_head(world_model.normalize_dynamics_head_hidden_states(agent_embeds))
+    policy_input = policy_input.detach()
+    policy_embed = world_model.policy_embed_from_input(policy_input)
     current_unembeds = world_model.action_embedder.unembed(policy_embed, pred_head_index = 0)
-    prior_unembeds = policy_prior.action_unembeds(agent_embeds)
+    prior_unembeds = policy_prior.action_unembeds(policy_input)
 
     if world_model.pmpo_reverse_kl:
         current_unembeds, prior_unembeds = prior_unembeds, current_unembeds
@@ -785,7 +909,7 @@ def agent_prior_kl_metrics(world_model: DynamicsWorldModel, dream: Experience, p
         kl_values = kl_values.reshape(-1)
 
     if kl_values.numel() == 0:
-        kl_values = agent_embeds.new_zeros((1,))
+        kl_values = policy_input.new_zeros((1,))
 
     return {
         "prior_kl_mean": kl_values.mean(),
@@ -839,9 +963,170 @@ def reward_head_metrics(reward_stats):
     }
 
 
+def encoder_prediction_bounds(encoder) -> tuple[float, float]:
+    support = getattr(encoder, "bin_values", None)
+
+    if not exists(support):
+        loss = getattr(encoder, "loss", None)
+        support = getattr(loss, "support", None)
+
+    if exists(support):
+        support = support.detach()
+        return float(support.min().item()), float(support.max().item())
+
+    reward_range = getattr(encoder, "reward_range")
+    lower, upper = reward_range
+    return float(lower), float(upper)
+
+
+def valid_experience_rewards(exp: Experience):
+    rewards = exp.rewards.detach().cpu().float()
+    time = rewards.shape[1]
+
+    if not exists(exp.lens):
+        return rewards.flatten()
+
+    lens = exp.lens.detach().cpu().long().clamp(min = 0, max = time)
+
+    if exists(exp.is_truncated):
+        lens = (lens - exp.is_truncated.detach().cpu().long()).clamp(min = 0, max = time)
+
+    mask = torch.arange(time)[None, :] < lens[:, None]
+    return rewards[mask]
+
+
+def as_event_values(values):
+    if not exists(values):
+        return torch.empty(0, dtype = torch.float32)
+
+    if torch.is_tensor(values):
+        values = values.detach().cpu().float()
+    else:
+        values = torch.as_tensor(values, dtype = torch.float32)
+
+    values = values.flatten()
+    return values[torch.isfinite(values)]
+
+
+def concat_event_values(values: list[Tensor]):
+    values = [as_event_values(value) for value in values]
+    values = [value for value in values if value.numel() > 0]
+
+    if len(values) == 0:
+        return torch.empty(0, dtype = torch.float32)
+
+    return torch.cat(values, dim = 0)
+
+
+def prediction_bound_event_metrics(name: str, values, bounds: tuple[float, float]):
+    values = as_event_values(values)
+    lower, upper = bounds
+    sample_count = int(values.numel())
+
+    if sample_count == 0:
+        return {}
+
+    below = values < lower
+    above = values > upper
+    outside = below | above
+    excess = (lower - values).clamp(min = 0.) + (values - upper).clamp(min = 0.)
+    event_excess = excess[outside]
+    event_count = int(outside.sum().item())
+
+    worst_out_of_bounds_value = None
+    max_excess = 0.
+
+    if event_count > 0:
+        offending_values = values[outside]
+        worst_index = event_excess.argmax()
+        worst_out_of_bounds_value = offending_values[worst_index].item()
+        max_excess = event_excess[worst_index].item()
+
+    base = f"prediction_bounds/{name}"
+    return {
+        f"{base}/event_fraction": event_count / sample_count,
+        f"{base}/max_excess": max_excess,
+        f"{base}/worst_out_of_bounds_value": worst_out_of_bounds_value,
+    }
+
+
+def sequence_mask(lens: Tensor, time: int):
+    return torch.arange(time, device = lens.device)[None, :] < lens[:, None]
+
+
+@torch.no_grad()
+def rollout_value_metrics(
+    exp: Experience,
+    *,
+    gamma: float,
+    gae_lambda: float,
+):
+    if not all(map(exists, (exp.rewards, exp.values))):
+        return {}
+
+    rewards = exp.rewards.detach().float()
+    values = exp.values.detach().float()
+    batch = rewards.shape[0]
+    time = min(rewards.shape[1], values.shape[1])
+
+    if time == 0:
+        return {}
+
+    rewards = rewards[:, :time]
+    values = values[:, :time]
+    device = rewards.device
+
+    lens = exp.lens if exists(exp.lens) else torch.full((batch,), time, device = device)
+    lens = lens.to(device = device).long().clamp(min = 0, max = time)
+
+    is_truncated = exp.is_truncated if exists(exp.is_truncated) else torch.ones((batch,), device = device, dtype = torch.bool)
+    is_truncated = is_truncated.to(device = device).bool()
+
+    mask_for_gae = sequence_mask(lens, time)
+    rewards = rewards.masked_fill(~mask_for_gae, 0.)
+    values_for_gae = values.masked_fill(~mask_for_gae, 0.)
+
+    learnable_lens = (lens - is_truncated.long()).clamp(min = 0, max = time)
+    learn_mask = sequence_mask(learnable_lens, time)
+    gae_masks = sequence_mask((lens - 1).clamp(min = 0), time)
+
+    if exists(exp.terminals):
+        terminals = exp.terminals.to(device = device).bool()
+
+        if terminals.ndim == 1:
+            terminal_indices = (lens - 1).clamp(min = 0, max = time - 1)
+            terminal_rows = torch.arange(batch, device = device)
+            valid_terminal_rows = terminals & (lens > 0)
+            gae_masks[terminal_rows[valid_terminal_rows], terminal_indices[valid_terminal_rows]] = False
+        else:
+            gae_masks.masked_fill_(terminals[:, :time], False)
+
+    if not learn_mask.any():
+        return {}
+
+    returns = calc_gae(
+        rewards,
+        values_for_gae,
+        masks = gae_masks,
+        learn_masks = learn_mask,
+        gamma = gamma,
+        lam = gae_lambda,
+        use_accelerated = False,
+    )
+
+    value_abs_error = (values - returns).abs()[learn_mask]
+
+    return {
+        "value_mae": value_abs_error.mean().item(),
+        "value_abs_error_sum": value_abs_error.sum().item(),
+        "value_abs_error_count": int(value_abs_error.numel()),
+    }
+
+
 def attach_policy_prior_unembeds(dream: Experience, policy_prior: FrozenPolicyPrior):
-    assert exists(dream.agent_embed)
-    dream.old_action_unembeds = policy_prior.action_unembeds(dream.agent_embed)
+    policy_input = dream.policy_input if exists(dream.policy_input) else dream.agent_embed
+    assert exists(policy_input)
+    dream.old_action_unembeds = policy_prior.action_unembeds(policy_input)
     return dream
 
 
@@ -941,6 +1226,7 @@ def train_world_model(
     max_grad_norm: float,
     global_step: int,
     writer: SummaryWriter | None,
+    disable_shortcut_train: bool = False,
 ):
     if len(replay) == 0 or steps <= 0:
         return global_step, {}
@@ -961,6 +1247,7 @@ def train_world_model(
             return_all_losses = True,
             return_reward_head_stats = True,
             update_loss_ema = True,
+            disable_shortcut_train = disable_shortcut_train,
         )
 
         loss.backward()
@@ -1200,8 +1487,46 @@ def is_number_value(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def is_numeric_range(value):
+    return (
+        isinstance(value, (list, tuple)) and
+        len(value) == 2 and
+        all(is_number_value(item) for item in value) and
+        value[0] < value[1]
+    )
+
+
 def is_positive_power_of_two(value: int):
     return is_int_value(value) and value > 0 and value & (value - 1) == 0
+
+
+def resolve_value_head_window(value_head_window, imagination_horizon: int, reward_range: tuple[float, float]):
+    if not exists(value_head_window):
+        value_head_window = imagination_horizon
+
+    if is_numeric_range(value_head_window):
+        return tuple(float(value) for value in value_head_window)
+
+    return tuple(bound * value_head_window for bound in reward_range)
+
+
+def value_encoder_kwargs_from_config(
+    value_head_window,
+    value_head_num_bins: int,
+    imagination_horizon: int,
+    reward_range: tuple[float, float],
+    reward_encoder_type: Literal["symexp_two_hot", "hl_gauss"],
+    value_head_sigma_to_bin_ratio: float | None,
+):
+    value_encoder_kwargs = dict(
+        reward_range = resolve_value_head_window(value_head_window, imagination_horizon, reward_range),
+        num_bins = value_head_num_bins,
+    )
+
+    if reward_encoder_type == "hl_gauss" and exists(value_head_sigma_to_bin_ratio):
+        value_encoder_kwargs["sigma_to_bin_ratio"] = value_head_sigma_to_bin_ratio
+
+    return value_encoder_kwargs
 
 
 def validate_hyperparameters(params: Mapping[str, Any]):
@@ -1212,21 +1537,26 @@ def validate_hyperparameters(params: Mapping[str, Any]):
         "rollouts_per_loop",
         "obs_dim",
         "num_latent_tokens",
+        "num_spatial_tokens",
         "dim_latent",
         "model_dim",
+        "n_heads",
+        "d_head",
         "depth",
         "time_block_every",
         "world_model_batch_size",
         "imagination_batch_size",
         "imagination_horizon",
         "imagination_generate_steps",
+        "value_head_num_bins",
         "tokenizer_batch_size",
         "tokenizer_eval_batch_size",
     )
     non_negative_int_keys = (
         "num_loops",
         "world_model_train_steps",
-        "world_model_early_pretrain_steps",
+        "world_model_early_pretrain_non_bootstrap_steps",
+        "world_model_early_pretrain_combined_steps",
         "imagination_train_steps",
         "pretrain_tokenizer_steps",
         "pretrain_tokenizer_observations",
@@ -1252,9 +1582,29 @@ def validate_hyperparameters(params: Mapping[str, Any]):
         if not is_number_value(params[key]) or params[key] <= 0:
             raise ValueError(f"{key} must be > 0")
 
+    if exists(params["agent_max_grad_norm"]):
+        if not is_number_value(params["agent_max_grad_norm"]) or params["agent_max_grad_norm"] <= 0:
+            raise ValueError("agent_max_grad_norm must be > 0 or null")
+
     if exists(params["world_model_train_sequence_length"]):
         if not is_int_value(params["world_model_train_sequence_length"]) or params["world_model_train_sequence_length"] <= 0:
             raise ValueError("world_model_train_sequence_length must be an integer > 0 or null")
+
+    if exists(params["value_head_window"]):
+        is_valid_value_window = (
+            (is_int_value(params["value_head_window"]) and params["value_head_window"] > 0) or
+            is_numeric_range(params["value_head_window"])
+        )
+
+        if not is_valid_value_window:
+            raise ValueError("value_head_window must be an integer > 0, a two-number ascending range, or null")
+
+    if exists(params["value_head_sigma_to_bin_ratio"]):
+        if not is_number_value(params["value_head_sigma_to_bin_ratio"]) or params["value_head_sigma_to_bin_ratio"] <= 0:
+            raise ValueError("value_head_sigma_to_bin_ratio must be > 0 or null")
+
+    if not is_number_value(params["value_head_init_value"]):
+        raise ValueError("value_head_init_value must be numeric")
 
     if not is_number_value(params["imagination_prompt_probability"]) or not 0. <= params["imagination_prompt_probability"] <= 1.:
         raise ValueError("imagination_prompt_probability must be between 0 and 1")
@@ -1289,8 +1639,23 @@ def validate_hyperparameters(params: Mapping[str, Any]):
     if not isinstance(params["rmsnorm_dynamics_hidden_states"], bool):
         raise ValueError("rmsnorm_dynamics_hidden_states must be a boolean")
 
+    if not isinstance(params["flex_attention_flash_backend"], bool):
+        raise ValueError("flex_attention_flash_backend must be a boolean")
+
+    if not isinstance(params["normalize_advantages"], bool):
+        raise ValueError("normalize_advantages must be a boolean")
+
+    if not isinstance(params["log_prediction_bound_events"], bool):
+        raise ValueError("log_prediction_bound_events must be a boolean")
+
+    if not isinstance(params["print_model_sizes"], bool):
+        raise ValueError("print_model_sizes must be a boolean")
+
     if not isinstance(params["agent_predicts_state"], bool):
         raise ValueError("agent_predicts_state must be a boolean")
+
+    if not isinstance(params["policy_head_accepts_all_tokens"], bool):
+        raise ValueError("policy_head_accepts_all_tokens must be a boolean")
 
     if not is_positive_power_of_two(params["imagination_generate_steps"]):
         raise ValueError("imagination_generate_steps must be a positive power of 2")
@@ -1333,21 +1698,30 @@ def train(
     cpu = False,
     obs_dim = 17,
     num_latent_tokens = 4,
+    num_spatial_tokens = 4,
     dim_latent = 32,
     model_dim = 128,
+    n_heads = 4,
+    d_head = 16,
     depth = 3,
     time_block_every = 2,
     final_special_cross_attn = False,
     attention_residuals_mode: Literal["off", "none", "full", "block"] = "off",
     rmsnorm_dynamics_hidden_states = False,
+    flex_attention_flash_backend = False,
     reward_encoder_type: Literal["symexp_two_hot", "hl_gauss"] = "hl_gauss",
     world_model_batch_size = 32,
     world_model_train_steps = 13,
-    world_model_early_pretrain_steps = 0,
+    world_model_early_pretrain_non_bootstrap_steps = 0,
+    world_model_early_pretrain_combined_steps = 0,
     world_model_train_sequence_length = 200,
     world_model_learning_rate = 3e-4,
     imagination_batch_size = 128,
     imagination_horizon = 32,
+    value_head_window = None,
+    value_head_num_bins = 255,
+    value_head_sigma_to_bin_ratio: float | None = 0.5,
+    value_head_init_value = 0.,
     imagination_prompt_length = 8,
     imagination_prompt_probability = 1.,
     imagination_train_steps = 3,
@@ -1359,7 +1733,10 @@ def train(
     pmpo_pos_to_neg_weight = 0.5,
     pmpo_kl_div_loss_weight = 0.3,
     use_delight_gating = False,
+    normalize_advantages = True,
+    log_prediction_bound_events = False,
     add_action_embed_to_agent_token = True,
+    policy_head_accepts_all_tokens = True,
     agent_predicts_state = True,
     agent_state_pred_loss_weight = 0.1,
     pretrain_tokenizer_steps = 1000,
@@ -1369,10 +1746,12 @@ def train(
     tokenizer_eval_every = 10,
     tokenizer_eval_batch_size = 2048,
     max_grad_norm = 0.5,
+    agent_max_grad_norm = None,
     use_tensorboard = True,
     log_dir = "runs/halfcheetah_imagination",
     run_name: str | None = None,
     run_details: str | None = None,
+    print_model_sizes = True,
     checkpoint_folder = "checkpoints_halfcheetah_imagination",
     checkpoint_every = 25,
     checkpoint_path: str | None = None,
@@ -1381,6 +1760,9 @@ def train(
 ):
     hyperparameters = dict(locals())
     validate_hyperparameters(hyperparameters)
+    agent_max_grad_norm = max_grad_norm if agent_max_grad_norm is None else agent_max_grad_norm
+    hyperparameters["agent_max_grad_norm"] = agent_max_grad_norm
+    hyperparameters["value_head_window"] = value_head_window
 
     torch.manual_seed(seed)
     random.seed(seed)
@@ -1450,14 +1832,21 @@ def train(
     )
 
     reward_range = (-20., 20.)
-    value_range = tuple(bound * imagination_horizon for bound in reward_range)
+    value_encoder_kwargs = value_encoder_kwargs_from_config(
+        value_head_window,
+        value_head_num_bins,
+        imagination_horizon,
+        reward_range,
+        reward_encoder_type,
+        value_head_sigma_to_bin_ratio,
+    )
 
     world_model = DynamicsWorldModel(
         dim = model_dim,
         dim_latent = dim_latent,
         max_steps = 64,
         num_latent_tokens = num_latent_tokens,
-        num_spatial_tokens = num_latent_tokens,
+        num_spatial_tokens = num_spatial_tokens,
         num_register_tokens = 1,
         dim_critic_state = obs_dim,
         depth = depth,
@@ -1468,7 +1857,7 @@ def train(
         continuous_target_action_range = (-1., 1.),
         reward_encoder_type = reward_encoder_type,
         reward_encoder_kwargs = dict(reward_range = reward_range),
-        value_encoder_kwargs = dict(reward_range = value_range),
+        value_encoder_kwargs = value_encoder_kwargs,
         predict_terminals = True,
         continuous_action_loss_weight = 0.,
         discrete_action_loss_weight = 0.,
@@ -1478,18 +1867,21 @@ def train(
         pmpo_pos_to_neg_weight = pmpo_pos_to_neg_weight,
         pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight,
         ppo_eps_clip = 0.2,
-        normalize_advantages = True,
+        normalize_advantages = normalize_advantages,
         policy_entropy_weight = 0.01,
         use_loss_normalization = False,
         add_action_embed_to_agent_token = add_action_embed_to_agent_token,
-        attn_heads = 4,
-        attn_dim_head = 16,
+        policy_head_accepts_all_tokens = policy_head_accepts_all_tokens,
+        attn_heads = n_heads,
+        attn_dim_head = d_head,
         final_special_cross_attn = final_special_cross_attn,
         attention_residuals_mode = attention_residuals_mode,
         rmsnorm_dynamics_hidden_states = rmsnorm_dynamics_hidden_states,
+        flex_attention_flash_backend = flex_attention_flash_backend,
         policy_head_mlp_depth = 2,
         value_head_mlp_depth = 2,
     ).to(device)
+    init_categorical_head_to_value(world_model.value_head, world_model.value_encoder, init_value = value_head_init_value)
 
     world_params, agent_params = split_world_model_and_agent_params(world_model)
     world_optimizer = make_optimizer(
@@ -1518,35 +1910,64 @@ def train(
 
     policy_prior = FrozenPolicyPrior(world_model).to(device) if objective == "pmpo" else None
 
+    if print_model_sizes:
+        print_model_size_report(
+            tokenizer = tokenizer,
+            world_model = world_model,
+            world_params = world_params,
+            agent_params = agent_params,
+            policy_prior = policy_prior,
+        )
+
     replay: deque[Experience] = deque(maxlen = replay_size)
     wm_step = 0
     imagination_step = 0
     env_step = 0
     did_early_world_model_pretrain = exists(checkpoint_path)
+    reward_prediction_bounds = return_prediction_bounds = None
+
+    if log_prediction_bound_events:
+        reward_prediction_bounds = encoder_prediction_bounds(world_model.reward_encoder)
+        return_prediction_bounds = encoder_prediction_bounds(world_model.value_encoder)
 
     print(f"training {env_name} from {obs_dim} raw observations on {device}")
     print(f"tensorboard log dir: {run_log_dir.absolute()}" if use_tensorboard else "tensorboard disabled")
     print(f"checkpoint dir: {checkpoint_dir.absolute()}")
-    if world_model_early_pretrain_steps > 0 and did_early_world_model_pretrain:
+    total_early_world_model_pretrain_steps = world_model_early_pretrain_non_bootstrap_steps + world_model_early_pretrain_combined_steps
+
+    if total_early_world_model_pretrain_steps > 0 and did_early_world_model_pretrain:
         print("skipping early world model pretrain on checkpoint resume")
-    elif world_model_early_pretrain_steps > 0:
-        print(f"early world model pretrain steps: {world_model_early_pretrain_steps}")
+    elif total_early_world_model_pretrain_steps > 0:
+        print(f"early world model pretrain non-bootstrap steps: {world_model_early_pretrain_non_bootstrap_steps}")
+        print(f"early world model pretrain combined steps: {world_model_early_pretrain_combined_steps}")
     if exists(tokenizer_loss):
         print(f"tokenizer pretrain recon loss: {tokenizer_loss:.4f}")
 
     pbar = tqdm(range(start_loop, num_loops), desc = "loops")
 
     for loop in pbar:
+        loop_start_time = perf_counter()
         world_model.eval()
         tokenizer_eval_loss_sum = 0.
         tokenizer_eval_sample_count = 0
         episodic_returns = []
         rollout_horizon_returns = []
+        prediction_bound_reward_values = []
+        prediction_bound_horizon_return_values = []
+        prediction_bound_episode_return_values = []
+        rollout_reward_abs_error_sum = 0.
+        rollout_reward_pred_count = 0
+        rollout_value_abs_error_sum = 0.
+        rollout_value_pred_count = 0
+        rollout_env_steps = 0
+        rollout_start_time = perf_counter()
+        wm_pretrain_time_per_step = None
+        wm_pretrain_elapsed_seconds = 0.
 
         for rollout_idx in range(rollouts_per_loop):
             start_episode_count = get_episode_count(env)
 
-            exp = world_model.interact_with_env(
+            exp, rollout_model_metrics = world_model.interact_with_env(
                 env,
                 seed = seed if loop == 0 and rollout_idx == 0 else None,
                 max_timesteps = max_timesteps,
@@ -1554,7 +1975,23 @@ def train(
                 store_agent_embed = False,
                 store_old_action_unembeds = False,
                 obs_to_latents_fn = obs_to_latents_fn(tokenizer),
+                return_rollout_metrics = True,
             )
+
+            reward_abs_error_count = rollout_model_metrics.get("reward_abs_error_count", 0)
+            if reward_abs_error_count > 0:
+                rollout_reward_abs_error_sum += rollout_model_metrics["reward_abs_error_sum"]
+                rollout_reward_pred_count += reward_abs_error_count
+
+            value_metrics = rollout_value_metrics(
+                exp,
+                gamma = world_model.gae_discount_factor,
+                gae_lambda = world_model.gae_lambda,
+            )
+            value_abs_error_count = value_metrics.get("value_abs_error_count", 0)
+            if value_abs_error_count > 0:
+                rollout_value_abs_error_sum += value_metrics["value_abs_error_sum"]
+                rollout_value_pred_count += value_abs_error_count
 
             if tokenizer_eval_every > 0 and divisible_by(loop, tokenizer_eval_every):
                 tokenizer_eval_loss = eval_tokenizer_on_experience(
@@ -1571,14 +2008,22 @@ def train(
             replay.append(exp.to("cpu"))
             rollout_horizon_returns.extend(exp.episode_return.detach().cpu().tolist())
 
+            if log_prediction_bound_events:
+                prediction_bound_reward_values.append(valid_experience_rewards(exp))
+                prediction_bound_horizon_return_values.append(exp.episode_return.detach().cpu())
+
             rollout_steps = exp.rewards.shape[1]
             has_bootstrap_padding = exists(exp.is_truncated) and exists(exp.terminals) and (exp.is_truncated & ~exp.terminals).any()
             if has_bootstrap_padding:
                 rollout_steps -= 1
 
+            rollout_env_steps += rollout_steps * exp.rewards.shape[0]
             env_step += rollout_steps * exp.rewards.shape[0]
 
             completed_returns, completed_lengths = get_completed_episode_stats(env, start_episode_count)
+
+            if log_prediction_bound_events:
+                prediction_bound_episode_return_values.append(torch.as_tensor(completed_returns, dtype = torch.float32))
 
             for episode_return, episode_length in zip(completed_returns, completed_lengths):
                 episodic_returns.append(float(episode_return))
@@ -1591,10 +2036,13 @@ def train(
                     env_step,
                 )
 
+        rollout_elapsed_seconds = perf_counter() - rollout_start_time
         avg_return = float(np.mean(episodic_returns)) if len(episodic_returns) > 0 else None
         avg_horizon_return = float(np.mean(rollout_horizon_returns)) if len(rollout_horizon_returns) > 0 else 0.
         avg_length = float(np.mean([exp.lens.float().mean().item() for exp in replay])) if len(replay) > 0 else 0.
         tokenizer_policy_recon_loss = tokenizer_eval_loss_sum / tokenizer_eval_sample_count if tokenizer_eval_sample_count > 0 else None
+        rollout_reward_mae = rollout_reward_abs_error_sum / rollout_reward_pred_count if rollout_reward_pred_count > 0 else None
+        rollout_value_mae = rollout_value_abs_error_sum / rollout_value_pred_count if rollout_value_pred_count > 0 else None
 
         log_scalars(
             writer,
@@ -1603,25 +2051,76 @@ def train(
                 "rollout/average_horizon_return": avg_horizon_return,
                 "rollout/replay_size": len(replay),
                 "rollout/average_length": avg_length,
+                "rollout/reward_mae": rollout_reward_mae,
+                "rollout/value_mae": rollout_value_mae,
+                "rollouts/reward_mae": rollout_reward_mae,
+                "rollouts/value_mae": rollout_value_mae,
                 "tokenizer/policy_recon_loss": tokenizer_policy_recon_loss,
+                "time/per_rollout_step": time_per_step(rollout_elapsed_seconds, rollout_env_steps),
             },
             loop,
         )
 
+        if log_prediction_bound_events:
+            prediction_bound_metrics = {}
+            prediction_bound_metrics.update(prediction_bound_event_metrics(
+                "reward",
+                concat_event_values(prediction_bound_reward_values),
+                reward_prediction_bounds,
+            ))
+            prediction_bound_metrics.update(prediction_bound_event_metrics(
+                "horizon_return",
+                concat_event_values(prediction_bound_horizon_return_values),
+                return_prediction_bounds,
+            ))
+            prediction_bound_metrics.update(prediction_bound_event_metrics(
+                "episode_return",
+                concat_event_values(prediction_bound_episode_return_values),
+                return_prediction_bounds,
+            ))
+            log_scalars(writer, prediction_bound_metrics, loop)
+
         world_model.train()
         wm_metrics = {}
-        if not did_early_world_model_pretrain and world_model_early_pretrain_steps > 0:
+        wm_pretrain_start_step = wm_step
+        ran_early_world_model_pretrain = False
+
+        if not did_early_world_model_pretrain and world_model_early_pretrain_non_bootstrap_steps > 0:
+            wm_pretrain_start_time = perf_counter()
             wm_step, wm_metrics = train_world_model(
                 world_model,
                 world_optimizer,
                 replay,
-                steps = world_model_early_pretrain_steps,
+                steps = world_model_early_pretrain_non_bootstrap_steps,
+                batch_size = world_model_batch_size,
+                sequence_length = world_model_train_sequence_length,
+                max_grad_norm = max_grad_norm,
+                global_step = wm_step,
+                writer = writer,
+                disable_shortcut_train = True,
+            )
+            wm_pretrain_elapsed_seconds = perf_counter() - wm_pretrain_start_time
+            wm_pretrain_time_per_step = time_per_step(wm_pretrain_elapsed_seconds, wm_step - wm_pretrain_start_step)
+            ran_early_world_model_pretrain = True
+
+        if not did_early_world_model_pretrain and world_model_early_pretrain_combined_steps > 0:
+            wm_pretrain_start_time = perf_counter()
+            wm_step, wm_metrics = train_world_model(
+                world_model,
+                world_optimizer,
+                replay,
+                steps = world_model_early_pretrain_combined_steps,
                 batch_size = world_model_batch_size,
                 sequence_length = world_model_train_sequence_length,
                 max_grad_norm = max_grad_norm,
                 global_step = wm_step,
                 writer = writer,
             )
+            wm_pretrain_elapsed_seconds += perf_counter() - wm_pretrain_start_time
+            wm_pretrain_time_per_step = time_per_step(wm_pretrain_elapsed_seconds, wm_step - wm_pretrain_start_step)
+            ran_early_world_model_pretrain = True
+
+        if ran_early_world_model_pretrain:
             did_early_world_model_pretrain = True
 
         wm_step, wm_metrics = train_world_model(
@@ -1651,7 +2150,7 @@ def train(
             prompt_length = imagination_prompt_length,
             prompt_probability = imagination_prompt_probability,
             generate_steps = imagination_generate_steps,
-            max_grad_norm = max_grad_norm,
+            max_grad_norm = agent_max_grad_norm,
             objective = objective,
             use_delight_gating = use_delight_gating,
             global_step = imagination_step,
@@ -1665,6 +2164,15 @@ def train(
         if imagination_metrics:
             postfix["dream"] = f"{imagination_metrics['imagination/dream_return']:.1f}"
         pbar.set_postfix(postfix)
+
+        log_scalars(
+            writer,
+            {
+                "time/per_world_model_pretrain_step": wm_pretrain_time_per_step,
+                "time/per_training_loop_step": perf_counter() - loop_start_time - wm_pretrain_elapsed_seconds,
+            },
+            loop,
+        )
 
         if checkpoint_every > 0 and divisible_by(loop + 1, checkpoint_every):
             save_checkpoint(

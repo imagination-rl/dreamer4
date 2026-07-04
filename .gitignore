@@ -5,6 +5,10 @@ logs_*/
 logs/
 runs/
 checkpoints_halfcheetah_imagination/
+slurm/
+safekeep/
+
+analyze_halfcheetah_imagination_runs.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

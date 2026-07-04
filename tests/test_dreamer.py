@@ -185,6 +185,77 @@ def test_symexp_two_hot():
     reward_embeds = two_hot_encoder.embed(two_hot_encoded)
     assert reward_embeds.shape == (10, 512)
 
+def test_world_model_can_disable_shortcut_training_forward_pass():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 1,
+        depth = 1,
+        num_spatial_tokens = 1,
+        attn_dim_head = 8,
+        prob_shortcut_train = 1.,
+        time_block_every = 1
+    )
+
+    latents = torch.randn(2, 4, 1, 16)
+    _, losses = dynamics(
+        latents = latents,
+        return_all_losses = True,
+        disable_shortcut_train = True
+    )
+
+    assert losses.shortcut.item() == 0.
+
+    _, losses = dynamics(
+        latents = latents,
+        return_all_losses = True
+    )
+
+    assert losses.shortcut.item() > 0.
+
+@param('policy_head_accepts_all_tokens', (False, True))
+def test_policy_head_can_accept_all_tokens(policy_head_accepts_all_tokens):
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        max_steps = 64,
+        num_latent_tokens = 2,
+        depth = 1,
+        num_spatial_tokens = 3,
+        num_register_tokens = 2,
+        num_continuous_actions = 2,
+        continuous_dist_type = 'beta',
+        continuous_target_action_range = (-1., 1.),
+        continuous_action_loss_weight = 0.,
+        discrete_action_loss_weight = 0.,
+        policy_head_accepts_all_tokens = policy_head_accepts_all_tokens,
+        attn_dim_head = 8,
+        time_block_every = 1
+    )
+
+    latents = torch.randn(2, 4, 2, 8).tanh()
+    actions = torch.rand(2, 4, 2)
+
+    _, (embeds, _) = dynamics(
+        latents = latents,
+        continuous_actions = actions,
+        signal_levels = 63,
+        step_sizes = 1,
+        latent_is_noised = True,
+        return_pred_only = True,
+        return_intermediates = True
+    )
+
+    assert embeds.policy_input.shape == (2, 4, dynamics.dim * dynamics.num_policy_input_tokens)
+
+    policy_embed = dynamics.policy_embed_from_input(embeds.policy_input)
+    assert policy_embed.shape == (2, 4, dynamics.dim * 4)
+
 def test_hl_gauss_reward_encoder():
     import torch
     from dreamer4.dreamer4 import HLGaussRewardEncoder
@@ -218,6 +289,146 @@ def test_dynamics_world_model_defaults_to_hl_gauss_reward_encoder():
     signature = inspect.signature(DynamicsWorldModel)
 
     assert signature.parameters['reward_encoder_type'].default == 'hl_gauss'
+
+def test_rollout_value_metrics_uses_lambda_return_targets():
+    from dreamer4.dreamer4 import Experience
+    from train_halfcheetah_imagination_rl import rollout_value_metrics
+
+    exp = Experience(
+        latents = torch.randn(1, 3, 1, 8),
+        rewards = torch.tensor([[1., 2., 3.]]),
+        values = torch.zeros(1, 3),
+        lens = torch.tensor([3]),
+        is_truncated = torch.tensor([False]),
+        terminals = torch.tensor([True]),
+        step_size = 1,
+    )
+
+    metrics = rollout_value_metrics(exp, gamma = 1., gae_lambda = 1.)
+
+    assert metrics["value_abs_error_count"] == 3
+    assert metrics["value_abs_error_sum"] == pytest.approx(14.)
+    assert metrics["value_mae"] == pytest.approx(14. / 3.)
+
+def test_value_head_config_validation_allows_nullable_window_and_custom_bins():
+    import inspect
+    from train_halfcheetah_imagination_rl import (
+        train,
+        resolve_value_head_window,
+        validate_hyperparameters,
+        value_encoder_kwargs_from_config,
+    )
+
+    params = {
+        name: parameter.default
+        for name, parameter in inspect.signature(train).parameters.items()
+    }
+
+    validate_hyperparameters(params)
+    assert params["value_head_num_bins"] == 255
+    assert params["value_head_init_value"] == 0.
+    assert resolve_value_head_window(params["value_head_window"], params["imagination_horizon"], (-20., 20.)) == (-640., 640.)
+
+    params["value_head_window"] = 8
+    params["value_head_num_bins"] = 127
+    validate_hyperparameters(params)
+    assert resolve_value_head_window(params["value_head_window"], params["imagination_horizon"], (-20., 20.)) == (-160., 160.)
+    assert value_encoder_kwargs_from_config(
+        params["value_head_window"],
+        params["value_head_num_bins"],
+        params["imagination_horizon"],
+        (-20., 20.),
+        params["reward_encoder_type"],
+        params["value_head_sigma_to_bin_ratio"],
+    ) == dict(reward_range = (-160., 160.), num_bins = 127, sigma_to_bin_ratio = 0.5)
+
+    params["value_head_window"] = [-1200, 1200]
+    validate_hyperparameters(params)
+    assert resolve_value_head_window(params["value_head_window"], params["imagination_horizon"], (-20., 20.)) == (-1200., 1200.)
+
+    params["value_head_window"] = 0
+
+    with pytest.raises(ValueError, match = "value_head_window"):
+        validate_hyperparameters(params)
+
+    params["value_head_window"] = [1200, -1200]
+
+    with pytest.raises(ValueError, match = "value_head_window"):
+        validate_hyperparameters(params)
+
+    params["value_head_window"] = None
+    params["value_head_num_bins"] = 0
+
+    with pytest.raises(ValueError, match = "value_head_num_bins"):
+        validate_hyperparameters(params)
+
+    params["value_head_num_bins"] = 255
+    params["value_head_init_value"] = "zero"
+
+    with pytest.raises(ValueError, match = "value_head_init_value"):
+        validate_hyperparameters(params)
+
+def test_value_head_num_bins_controls_value_network_output_width():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        max_steps = 64,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 2,
+        depth = 1,
+        time_block_every = 1,
+        num_register_tokens = 1,
+        num_continuous_actions = 1,
+        value_encoder_kwargs = dict(reward_range = (-10., 10.), num_bins = 17),
+        policy_head_mlp_depth = 1,
+        value_head_mlp_depth = 1,
+        attn_heads = 2,
+        attn_dim_head = 8,
+    )
+
+    assert model.value_encoder.num_bins == 17
+    assert model.value_head.layers[-1][0].out_features == 17
+
+
+def test_init_categorical_head_to_value_keeps_initial_value_predictions_near_zero():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+    from train_halfcheetah_imagination_rl import init_categorical_head_to_value
+
+    reward_range = (-2000., 10000.)
+
+    model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        max_steps = 64,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 2,
+        depth = 1,
+        time_block_every = 1,
+        num_register_tokens = 1,
+        num_continuous_actions = 1,
+        value_encoder_kwargs = dict(
+            reward_range = reward_range,
+            num_bins = 513,
+            sigma_to_bin_ratio = 0.5,
+        ),
+        policy_head_mlp_depth = 1,
+        value_head_mlp_depth = 1,
+        attn_heads = 2,
+        attn_dim_head = 8,
+    )
+
+    init_categorical_head_to_value(model.value_head, model.value_encoder, init_value = 0.)
+
+    hidden = torch.randn(7, 16)
+    value_logits = model.value_head(hidden)
+    decoded_values = model.value_encoder.bins_to_scalar_value(value_logits)
+
+    window_width = reward_range[1] - reward_range[0]
+    tolerance = 0.05 * window_width
+
+    assert torch.allclose(decoded_values, torch.zeros_like(decoded_values), atol = tolerance)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = 'no cuda')
 @param('causal', (False, True))
