@@ -163,6 +163,17 @@ from dreamer4 import DynamicsWorldModel
 world_model = DynamicsWorldModel.init_and_load('./checkpoints/experiment_name/dynamics.pt')
 ```
 
+## HalfCheetah
+
+For those interested in continuous control from raw observation states, there now exists a working example of `HalfCheetah-v4` using encoded observations! You can find the training script at the project root as `train_halfcheetah_imagination_rl.py`.
+
+
+Shout out to [@CarsonBurke](https://github.com/CarsonBurke) for this [contribution](https://github.com/lucidrains/dreamer4/pull/29)!
+
+```bash
+$ uv run train_halfcheetah_imagination_rl.py
+```
+
 ## Toy Snake World Model
 
 You can play the ground truth Toy Snake environment in the browser with:

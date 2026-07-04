@@ -168,7 +168,7 @@ class Experience:
 
     @property
     def payload(self):
-        return default(default(self.latents, self.video), self.critic_state)
+        return default(self.latents, self.video, self.critic_state)
 
     # memmap replay buffer
 
@@ -247,6 +247,42 @@ class Experience:
         experience_dict = {f.name: getattr(self, f.name) for f in fields(self)}
         experience_dict = tree_map_tensor(lambda t: t.to(device), experience_dict)
         return Experience(**experience_dict)
+
+    def unbind(self):
+        batch, time = self.payload.shape[:2]
+        is_meta_field = lambda name: name in self.__class__._meta_fields
+
+        experiences = []
+        for b in range(batch):
+            seq_len = int(self.lens[b].item()) if exists(self.lens) else time
+
+            def slice_field(name, v):
+                if not exists(v):
+                    return None
+
+                if not is_tensor(v) and not isinstance(v, Actions):
+                    return v
+
+                is_meta = is_meta_field(name)
+
+                def slice_tensor(t):
+                    return t[b:b+1] if is_meta else t[b:b+1, :seq_len]
+
+                if isinstance(v, Actions):
+                    return Actions(
+                        discrete = slice_tensor(v.discrete) if exists(v.discrete) else None,
+                        continuous = slice_tensor(v.continuous) if exists(v.continuous) else None
+                    )
+
+                return slice_tensor(v)
+
+            kwargs = {f.name: slice_field(f.name, getattr(self, f.name)) for f in fields(self)}
+            experiences.append(self.__class__(**kwargs))
+
+        return experiences
+
+    def __iter__(self):
+        return iter(self.unbind())
 
 def combine_experiences(
     exps: list[Experience]
@@ -3709,12 +3745,13 @@ class Transformer(Module):
             self.pos_emb = Rotary1D(dim_head)
 
         self.use_pope = use_pope
+        self.has_attn = exists(attn_every) and attn_every > 0
 
         for i in range(depth):
-            has_attn = exists(attn_every) and divisible_by(i + 1, attn_every)
+            layer_has_attn = self.has_attn and divisible_by(i + 1, attn_every)
 
             self.layers.append(nn.ModuleList([
-                Residual(Attention(dim, dim_head = dim_head, heads = heads)) if has_attn else None,
+                Residual(Attention(dim, dim_head = dim_head, heads = heads)) if layer_has_attn else None,
                 Residual(FeedForward(dim))
             ]))
 
@@ -3831,7 +3868,7 @@ class StateTokenizer(Module):
         self.mae_fraction = mae_fraction
         self.has_mae = mae_fraction > 0.
 
-        assert not (self.has_mae and not exists(attn_every)), 'time attention must be turned on to use mae fraction'
+        assert not (self.has_mae and not self.encoder_transformer.has_attn), 'time attention must be turned on to use mae fraction'
         self.mask_token = EmbeddingSmallInit((dim,)) if self.has_mae else None
 
         if isinstance(loss_fn, Module):
@@ -6741,7 +6778,7 @@ class DynamicsWorldModel(Module):
         # validation
 
         assert log2(num_steps).is_integer(), f'number of steps {num_steps} must be a power of 2'
-        assert 0 < num_steps <= self.max_steps, f'number of steps {num_steps} must be between 0 and {self.max_steps}'
+        assert 1 < num_steps <= self.max_steps, f'number of steps {num_steps} must be from 2 to {self.max_steps}'
 
         if isinstance(tasks, int):
             tasks = full((batch_size,), tasks, device = self.device)
@@ -6829,6 +6866,11 @@ class DynamicsWorldModel(Module):
         if return_rewards_per_frame:
             if exists(prompt_rewards):
                 decoded_rewards = prompt_rewards.clone()
+
+                # if prompt rewards has 1 less timestep than latents (e.g. from standard RL episodes where the first state has no reward)
+                # pad it on the left with 0 to ensure the sequence perfectly aligns with latents for the einsum step mask later
+                if decoded_rewards.shape[1] == latents.shape[1] - 1:
+                    decoded_rewards = pad_left_at_dim(decoded_rewards, 1, value = 0., dim = 1)
             else:
                 decoded_rewards = empty((batch_size, 0), device = self.device, dtype = torch.float32)
 

@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.17.4"
+version = "0.17.6"
 description = "Dreamer4 - PyTorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -27,7 +27,7 @@ classifiers = [
 
 dependencies = [
     "accelerate",
-    "adam-atan2-pytorch>=0.2.2",
+    "adam-atan2-pytorch>=0.3.6",
     "assoc-scan",
     "discrete-continuous-embed-readout>=0.2.10",
     "einx>=0.3.0",
@@ -38,13 +38,13 @@ dependencies = [
     "h-net-dynamic-chunking>=0.5.12",
     "imageio-ffmpeg",
     "loguru",
-    "memmap-replay-buffer>=0.1.8",
+    "memmap-replay-buffer>=0.1.10",
     "opencv-python",
     "Pillow",
     "PoPE_pytorch>=0.2.1",
     "rich",
     "torch>=2.4",
-    "torch-einops-utils>=0.1.5",
+    "torch-einops-utils>=0.1.6",
     "torchvision",
     "tqdm",
     "x-mlps-pytorch>=0.3.5",

@@ -2090,6 +2090,9 @@ def test_custom_activations(custom_activation):
         value_head_mlp_activation=act,
         agent_state_pred_mlp_activation=act,
         state_terminal_pred_mlp_activation=act,
+        pred_rewards_mlp_activation=act,
+        pred_terminals_mlp_activation=act,
+        pred_is_truncated_mlp_activation=act,
         ff_kwargs=ff_kwargs
     )
 
@@ -2524,3 +2527,63 @@ def test_state_tokenizer(attn_every, var_len):
 
     seq_latents = torch.cat(seq_latents, dim = 1)
     assert torch.allclose(latents, seq_latents, atol = 1e-5), "Sequential and parallel tokenization should yield equal latents"
+
+def test_experience_combine_and_unbind():
+    from dreamer4.dreamer4 import Experience, combine_experiences
+
+    # Create two individual experiences of different lengths
+    exp1 = Experience(
+        latents=torch.randn(1, 10, 16),
+        rewards=torch.randn(1, 10),
+        terminals=torch.zeros(1, dtype=torch.bool),
+        lens=torch.tensor([10]),
+        is_truncated=torch.tensor([False]),
+        episode_return=torch.tensor([5.0])
+    )
+
+    exp2 = Experience(
+        latents=torch.randn(1, 5, 16),
+        rewards=torch.randn(1, 5),
+        terminals=torch.ones(1, dtype=torch.bool),
+        lens=torch.tensor([5]),
+        is_truncated=torch.tensor([True]),
+        episode_return=torch.tensor([2.0])
+    )
+
+    # Combine them
+    combined = combine_experiences([exp1, exp2])
+
+    assert combined.latents.shape == (2, 10, 16)
+    assert combined.rewards.shape == (2, 10)
+    assert combined.terminals.shape == (2,)
+    assert combined.lens.shape == (2,)
+    assert combined.is_truncated.shape == (2,)
+    assert combined.episode_return.shape == (2,)
+
+    # Unbind them
+    unbound_exps = list(combined.unbind())
+
+    assert len(unbound_exps) == 2
+
+    # Check first experience
+    assert unbound_exps[0].latents.shape == (1, 10, 16)
+    assert unbound_exps[0].rewards.shape == (1, 10)
+    assert unbound_exps[0].terminals.shape == (1,)
+    assert unbound_exps[0].lens.shape == (1,)
+    assert unbound_exps[0].is_truncated.shape == (1,)
+    assert unbound_exps[0].episode_return.shape == (1,)
+    assert unbound_exps[0].lens.item() == 10
+
+    # Check second experience (should be properly sliced to length 5)
+    assert unbound_exps[1].latents.shape == (1, 5, 16)
+    assert unbound_exps[1].rewards.shape == (1, 5)
+    assert unbound_exps[1].terminals.shape == (1,)
+    assert unbound_exps[1].lens.shape == (1,)
+    assert unbound_exps[1].is_truncated.shape == (1,)
+    assert unbound_exps[1].episode_return.shape == (1,)
+    assert unbound_exps[1].lens.item() == 5
+
+    # Check iteration via __iter__
+    iter_exps = list(combined)
+    assert len(iter_exps) == 2
+    assert iter_exps[1].latents.shape == (1, 5, 16)
