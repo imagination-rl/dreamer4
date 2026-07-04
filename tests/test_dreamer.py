@@ -478,6 +478,21 @@ def test_action_embedder():
     assert sampled_discrete_actions.shape == (2, 3, 1)
     assert sampled_continuous_actions.shape == (2, 3, 1)
 
+    # rescale bounded continuous actions to the environment range
+
+    beta_embedder = ActionEmbedder(
+        512,
+        num_continuous_actions = 3,
+        continuous_dist_type = 'beta',
+        continuous_target_action_range = (-1., 1.),
+        can_unembed = True
+    )
+
+    native_actions = torch.tensor([0., 0.5, 1.])
+    env_actions = beta_embedder.rescale_for_env(native_actions)
+
+    assert torch.allclose(env_actions, torch.tensor([-1., 0., 1.]))
+
     # log probs
 
     assert discrete_logits.shape == (2, 3, 4)
