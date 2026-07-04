@@ -1,4 +1,5 @@
 import numpy as np
+from einops import rearrange
 
 class SnakeEnv:
     def __init__(
@@ -98,4 +99,6 @@ class SnakeEnv:
 
                 img[slice_y, slice_x, :] = 255
 
+        img = img.astype(np.float32)
+        img = rearrange(img, 'h w c -> c h w')
         return img

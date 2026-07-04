@@ -1,6 +1,7 @@
 import pytest
 param = pytest.mark.parametrize
 import torch
+from einops import rearrange
 
 def exists(v):
     return v is not None
@@ -2675,3 +2676,305 @@ def test_dynamics_model_state_sequential_parallel_cache(has_views, use_time_rnn)
     agent_embed_sequential = torch.cat(agent_embed_sequential, dim = 1)
 
     assert torch.allclose(agent_embed_parallel, agent_embed_sequential, atol = 1e-4), "Sequential and parallel passes through DynamicsWorldModel with StateTokenizer should yield equal agent embeds"
+
+@param('has_views', [False, True])
+@param('use_time_rnn', [False, True])
+def test_dynamics_model_concurrent_tokenizers_sequential_parallel_cache(has_views, use_time_rnn):
+    from dreamer4.dreamer4 import StateTokenizer, VideoTokenizer, DynamicsWorldModel, pack_one
+
+    state_tokenizer = StateTokenizer(
+        dim_state = 17,
+        num_latent_tokens = 4,
+        dim_latent = 16,
+        dim = 32,
+        depth = 1,
+        attn_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8
+    )
+
+    video_tokenizer = VideoTokenizer(
+        dim = 32,
+        dim_latent = 16,
+        patch_size = 4,
+        image_height = 16,
+        image_width = 16,
+        num_latent_tokens = 8,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        time_block_every = 1
+    )
+
+    model = DynamicsWorldModel(
+        dim = 32,
+        state_tokenizer = state_tokenizer,
+        video_tokenizer = video_tokenizer,
+        num_agents = 1,
+        dim_latent = 16,
+        num_latent_genes = 2,
+        num_latent_tokens = 12, # 8 from video + 4 from state
+        depth = 2,
+        time_block_every = 1,
+        attn_heads = 2,
+        attn_dim_head = 16,
+        use_time_rnn = use_time_rnn,
+        num_video_views = 2 if has_views else 1
+    )
+    model.eval()
+
+    batch = 2
+    time = 4
+
+    state_shape = (batch, *((2,) if has_views else tuple()), time, 17)
+    state = torch.randn(*state_shape)
+
+    video_shape = (batch, *((2,) if has_views else tuple()), 3, time, 16, 16)
+    video = torch.randn(*video_shape)
+
+    # parallel pass
+    _, (intermediates_parallel, _) = model(
+        state = state,
+        video = video,
+        signal_levels = 1,
+        step_sizes = 1,
+        return_pred_only = True,
+        return_intermediates = True,
+        latent_is_noised = True
+    )
+
+    agent_embed_parallel = intermediates_parallel.agent
+
+    video_tokenizer_cache = None
+    state_tokenizer_cache = None
+    dynamics_cache = None
+    agent_embed_sequential = []
+
+    if not has_views:
+        state = rearrange(state, 'b ... -> b 1 ...')
+        video = rearrange(video, 'b ... -> b 1 ...')
+
+    state_packed, state_unpack_views = pack_one(state, '* t d')
+    video_packed, video_unpack_views = pack_one(video, '* c t vh vw')
+
+    for t in range(time):
+        state_step = state_packed[:, t:t+1, :]
+        video_step = video_packed[:, :, t:t+1, :, :]
+
+        state_latents_packed, state_tokenizer_cache = state_tokenizer(
+            state_step,
+            return_latents = True,
+            time_cache = state_tokenizer_cache,
+            return_time_cache = True
+        )
+        state_latents = state_unpack_views(state_latents_packed, '* t n d')
+        state_latents = rearrange(state_latents, 'b v t n d -> b t v n d')
+
+        video_latents_packed, video_tokenizer_cache = video_tokenizer(
+            video_step,
+            return_latents = True,
+            time_cache = video_tokenizer_cache,
+            return_time_cache = True
+        )
+        video_latents = video_unpack_views(video_latents_packed, '* t n d')
+        video_latents = rearrange(video_latents, 'b v t n d -> b t v n d')
+
+        step_latents = torch.cat((video_latents, state_latents), dim = -2)
+
+        _, (intermediates_seq, dynamics_cache) = model(
+            latents = step_latents,
+            signal_levels = 1,
+            step_sizes = 1,
+            time_cache = dynamics_cache,
+            return_pred_only = True,
+            return_intermediates = True,
+            latent_is_noised = True
+        )
+
+        agent_embed_sequential.append(intermediates_seq.agent)
+
+    agent_embed_sequential = torch.cat(agent_embed_sequential, dim = 1)
+
+    assert torch.allclose(agent_embed_parallel, agent_embed_sequential, atol = 1e-4), "Sequential and parallel passes through DynamicsWorldModel with Concurrent Tokenizers should yield equal agent embeds"
+
+@param('use_time_rnn', [False, True])
+def test_dynamics_model_all_three_tokenizers_sequential_parallel_cache(use_time_rnn):
+    from dreamer4.dreamer4 import AudioTokenizer, StateTokenizer, VideoTokenizer, DynamicsWorldModel, pack_one
+
+    has_views = True
+
+    video_tokenizer = VideoTokenizer(
+        dim = 32,
+        dim_latent = 16,
+        image_size = 16,
+        patch_size = 4,
+        num_latent_tokens = 4,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        time_block_every = 1
+    )
+
+    state_tokenizer = StateTokenizer(
+        dim_state = 8,
+        dim_latent = 16,
+        num_latent_tokens = 1, # as requested
+        depth = 1,
+        attn_heads = 1,
+        attn_dim_head = 8
+    )
+
+    audio_tokenizer = AudioTokenizer(
+        channels = 2,
+        sample_rate = 16000,
+        n_fft = 400,
+        n_mels = 16,
+        hop_length = 160,
+        dim = 32,
+        dim_latent = 16,
+        patch_size = 4,
+        num_latent_tokens = 2,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        time_block_every = 1
+    )
+
+    model = DynamicsWorldModel(
+        dim = 32,
+        video_tokenizer = video_tokenizer,
+        state_tokenizer = state_tokenizer,
+        audio_tokenizer = audio_tokenizer,
+        num_agents = 1,
+        dim_latent = 16,
+        num_latent_genes = 2,
+        depth = 2,
+        time_block_every = 1,
+        attn_heads = 2,
+        attn_dim_head = 16,
+        use_time_rnn = use_time_rnn,
+        num_discrete_actions = 4,
+        num_video_views = 2 if has_views else 1
+    )
+    model.eval()
+
+    batch = 2
+    time = 4
+
+    # Video
+    video_shape = (batch, *((2,) if has_views else tuple()), 3, time, 16, 16)
+    video = torch.randn(*video_shape)
+
+    # State
+    state_shape = (batch, *((2,) if has_views else tuple()), time, 8)
+    state = torch.randn(*state_shape)
+
+    # Audio
+    time_frames = 16
+    samples = 2400
+    audio_shape = (batch, *((2,) if has_views else tuple()), 2, time, samples)
+    audio = torch.randn(*audio_shape)
+
+    # parallel pass
+    _, (intermediates_parallel, _) = model(
+        video = video,
+        state = state,
+        audio = audio,
+        signal_levels = 1,
+        step_sizes = 1,
+        return_pred_only = True,
+        return_intermediates = True,
+        latent_is_noised = True
+    )
+
+    agent_embed_parallel = intermediates_parallel.agent
+
+    # sequential pass
+    video_tokenizer_cache = None
+    state_tokenizer_cache = None
+    audio_tokenizer_cache = None
+    dynamics_cache = None
+    agent_embed_sequential = []
+
+    video_packed, video_unpack_views = pack_one(video, '* c t vh vw')
+    state_packed, state_unpack_views = pack_one(state, '* t d')
+    audio_packed, audio_unpack_views = pack_one(audio, '* c t s')
+
+    for t in range(time):
+        video_step = video_packed[:, :, t:t+1, :, :]
+        state_step = state_packed[:, t:t+1, :]
+        audio_step = audio_packed[:, :, t:t+1, :]
+
+        # Video latents
+        vid_latents_packed, video_tokenizer_cache = video_tokenizer(
+            video_step,
+            return_latents = True,
+            time_cache = video_tokenizer_cache,
+            return_time_cache = True
+        )
+        vid_latents = video_unpack_views(vid_latents_packed, '* t n d')
+        vid_latents = rearrange(vid_latents, 'b v t n d -> b t v n d')
+
+        # State latents
+        state_latents_packed, state_tokenizer_cache = state_tokenizer(
+            state_step,
+            return_latents = True,
+            time_cache = state_tokenizer_cache,
+            return_time_cache = True
+        )
+        state_latents = state_unpack_views(state_latents_packed, '* t n d')
+        state_latents = rearrange(state_latents, 'b v t n d -> b t v n d')
+
+        # Audio latents
+        audio_latents_packed, audio_tokenizer_cache = audio_tokenizer(
+            audio_step,
+            return_latents = True,
+            time_cache = audio_tokenizer_cache,
+            return_time_cache = True
+        )
+        audio_latents = audio_unpack_views(audio_latents_packed, '* t n d')
+        audio_latents = rearrange(audio_latents, 'b v t n d -> b t v n d')
+
+        # Concat latents
+        latents = torch.cat((vid_latents, state_latents, audio_latents), dim = -2)
+
+        _, (intermediates_seq, dynamics_cache) = model(
+            latents = latents,
+            signal_levels = 1,
+            step_sizes = 1,
+            time_cache = dynamics_cache,
+            return_pred_only = True,
+            return_intermediates = True,
+            latent_is_noised = True,
+            latent_has_view_dim = True
+        )
+
+        agent_embed_sequential.append(intermediates_seq.agent)
+
+    agent_embed_sequential = torch.cat(agent_embed_sequential, dim = 1)
+
+    assert torch.allclose(agent_embed_parallel, agent_embed_sequential, atol = 1e-4), "Sequential and parallel passes through DynamicsWorldModel with all 3 Tokenizers should yield equal agent embeds"
+
+    # test generative rl with prompts
+
+    prompt_time = 2
+    prompt_video = video[:, :, :, :prompt_time]
+    prompt_state = state[:, :, :prompt_time]
+    prompt_audio = audio[:, :, :, :prompt_time]
+
+    generated_outputs = model.generate(
+        time_steps = 4,
+        batch_size = batch,
+        num_steps = 2,
+        image_height = 16,
+        image_width = 16,
+        prompt = prompt_video,
+        prompt_state = prompt_state,
+        prompt_audio = prompt_audio,
+        return_for_policy_optimization = True
+    )
+
+    assert exists(generated_outputs)

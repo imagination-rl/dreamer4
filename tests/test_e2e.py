@@ -42,12 +42,15 @@ def test_e2e(env_type, is_continuous):
     test_dir = f'./test_e2e_buf_{env_type}_{is_continuous}'
     shutil.rmtree(test_dir, ignore_errors = True)
 
+    image_size = 64 if env_type == 'toy' else 16
+
     tokenizer = VideoTokenizer(
         dim = 16,
         dim_latent = 16,
         patch_size = 8,
-        image_height = 64,
-        image_width = 64,
+        image_height = image_size,
+        image_width = image_size,
+        lpips_loss_weight = 0.2 if image_size >= 32 else 0.,
         encoder_depth = 1,
         decoder_depth = 1,
         decoder_flow_steps = 1
@@ -90,7 +93,7 @@ def test_e2e(env_type, is_continuous):
 
     world_model.interact_with_env(wrapped_env, num_steps = 4, max_timesteps = 4)
 
-    dataset = VideoDatasetFromReplayBuffer(buffer, image_size = 64, max_num_frames = 4)
+    dataset = VideoDatasetFromReplayBuffer(buffer, image_size = image_size, max_num_frames = 4)
 
     # 2. train tokenizer
 
@@ -125,12 +128,12 @@ def test_e2e(env_type, is_continuous):
     world_env = DynamicsWorldModelWrapper(world_model, num_generation_steps = 2)
 
     obs, info = world_env.reset(batch_size = 2)
-    assert obs.shape == (2, 3, 64, 64)
+    assert obs.shape == (2, 3, image_size, image_size)
 
     action = torch.full((2, 4), 0.5, dtype = torch.float32) if is_continuous else torch.zeros((2,), dtype = torch.long)
     obs, reward, terminated, truncated, info = world_env.step(action)
 
-    assert obs.shape == (2, 3, 64, 64)
+    assert obs.shape == (2, 3, image_size, image_size)
 
     # 4. rl rollouts inside the world model
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Callable, Iterable, NamedTuple, Tuple, Literal
 
+import importlib
+from pathlib import Path
 from math import ceil, log2
 from random import random
 import numpy as np
@@ -10,7 +12,6 @@ from functools import wraps, partial
 from contextlib import nullcontext, contextmanager
 from collections import namedtuple
 from dataclasses import dataclass, asdict, fields
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -52,6 +53,7 @@ from hl_gauss_pytorch import HLGaussLoss
 import einx
 from torch_einops_utils import (
     maybe,
+    temp_eval,
     align_dims_left,
     pad_at_dim,
     pad_left_at_dim,
@@ -393,6 +395,14 @@ def sample_prob(prob):
 
 def is_power_two(num):
     return log2(num).is_integer()
+
+def is_module_available(module_name):
+    return exists(importlib.util.find_spec(module_name))
+
+def check_import(module_name, error_message = None):
+    error_message = default(error_message, f"Please install {module_name}")
+    if not is_module_available(module_name):
+        raise ImportError(error_message)
 
 def cast_to_tensor(t, device, dtype = None):
     t = t if is_tensor(t) else tensor(t)
@@ -4003,7 +4013,7 @@ class StateTokenizer(Module):
 # video tokenizer
 
 @save_load
-class VideoTokenizer(Module):
+class SpaceTimeTokenizer(Module):
     def __init__(
         self,
         dim,
@@ -4076,6 +4086,7 @@ class VideoTokenizer(Module):
         aug_cfg_dropout_prob = 0.1,
         separate_flow_decoder = False,
         flow_decoder_train_prob = 0.5,
+        flow_noise_std = 1.,
         encode_temporal_diff = False,
         has_byol = False,
         byol_loss_weight = 1.,
@@ -4194,6 +4205,7 @@ class VideoTokenizer(Module):
         self.decoder_v_space_loss = decoder_v_space_loss
 
         self.has_flow = decoder_flow_steps > 0
+        self.flow_noise_std = flow_noise_std
         self.has_separate_flow_decoder = separate_flow_decoder and self.has_flow
         self.flow_decoder_train_prob = flow_decoder_train_prob
 
@@ -4676,9 +4688,7 @@ class VideoTokenizer(Module):
         # pack space
 
         tokens, inverse_pack_space = pack_one(tokens, 'b t * d')
-
-        if self.has_latent_init_patch:
-            latent_init_tokens, _ = pack_one(latent_init_tokens, 'b t * d')
+        latent_init_tokens, _ = pack_one(latent_init_tokens, 'b t * d')
 
         # add the latent
 
@@ -4770,7 +4780,7 @@ class VideoTokenizer(Module):
             else:
                 time_indices = randint(0, self.decoder_flow_steps, (batch,), device = device)
 
-            noise = randn_like(video)
+            noise = randn_like(video) * self.flow_noise_std
 
             t = time_indices.float() / self.decoder_flow_steps
             t = pad_right_ndim_to(t, video.ndim)
@@ -4785,7 +4795,7 @@ class VideoTokenizer(Module):
                 frac = pad_right_ndim_to(frac, latents.ndim)
                 latents = frac_gradient(latents, frac)
 
-            recon_video = self.decode_step(latents, noised_video = noised_video, time_indices = time_indices, height = height, width = width, aug_id = aug_id)
+            recon_video = self.decode_step(latents, noised_video = noised_video, time_indices = time_indices, height = num_patch_height * self.patch_size, width = num_patch_width * self.patch_size, aug_id = aug_id)
 
             if self.decoder_v_space_loss:
                 target = video - noise
@@ -4794,7 +4804,7 @@ class VideoTokenizer(Module):
                 target = video
                 pred = recon_video
         else:
-            recon_video = self.decode_step(latents, height = height, width = width, aug_id = aug_id)
+            recon_video = self.decode_step(latents, height = num_patch_height * self.patch_size, width = num_patch_width * self.patch_size, aug_id = aug_id)
 
             target = video
             pred = recon_video
@@ -4923,6 +4933,69 @@ class VideoTokenizer(Module):
 
         return total_loss, out
 
+@save_load
+class VideoTokenizer(SpaceTimeTokenizer):
+    pass
+
+@save_load
+class AudioTokenizer(SpaceTimeTokenizer):
+    def __init__(
+        self,
+        channels = 1,
+        sample_rate = 16000,
+        n_fft = 400,
+        win_length = None,
+        hop_length = 160,
+        n_mels = 64,
+        **kwargs
+    ):
+        self.channels = channels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = default(win_length, n_fft)
+
+        super().__init__(channels = channels, **kwargs)
+
+        check_import('torchaudio', 'torchaudio is required')
+        from torchaudio.transforms import MelSpectrogram, InverseMelScale, GriffinLim
+
+        self.mel_spec = MelSpectrogram(
+            sample_rate = sample_rate,
+            n_fft = n_fft,
+            win_length = win_length,
+            hop_length = hop_length,
+            n_mels = n_mels
+        )
+
+        self.inverse_mel = InverseMelScale(
+            n_stft = n_fft // 2 + 1,
+            n_mels = n_mels,
+            sample_rate = sample_rate
+        )
+
+        self.griffin_lim = GriffinLim(
+            n_fft = n_fft,
+            win_length = win_length,
+            hop_length = hop_length
+        )
+
+    def _audio_to_freq_time(self, audio):
+        audio, unpack_inverse = pack_one(audio, '* samples')
+        mel = self.mel_spec(audio)
+        return unpack_inverse(mel, '* n_mels time_frames')
+
+    def _freq_time_to_audio(self, freq_time):
+        freq_time, unpack_inverse = pack_one(freq_time, '* n_mels time_frames')
+        stft = self.inverse_mel(freq_time)
+        audio = self.griffin_lim(stft)
+        return unpack_inverse(audio, '* samples')
+
+    def forward(self, audio, *args, **kwargs):
+        return super().forward(self._audio_to_freq_time(audio), *args, **kwargs)
+
+    def decode(self, latents, *args, **kwargs):
+        return self._freq_time_to_audio(super().decode(latents, *args, **kwargs))
+
 # self-flow distillation - Chefer et al. https://arxiv.org/abs/2603.06507
 
 class SelfFlow(Module):
@@ -4986,8 +5059,10 @@ class DynamicsWorldModel(Module):
         dim_latent,
         video_tokenizer: VideoTokenizer | None = None,
         state_tokenizer: StateTokenizer | None = None,
+        audio_tokenizer: AudioTokenizer | None = None,
         copy_video_tokenizer = True,
         copy_state_tokenizer = True,
+        copy_audio_tokenizer = True,
         aux_image_encoder: Module | None = None,
         freeze_aux_image_encoder = False,
         max_steps = 64,                # K_max in paper
@@ -5103,36 +5178,43 @@ class DynamicsWorldModel(Module):
         self.dim = dim
         self.depth = depth
 
-        assert not (exists(video_tokenizer) and exists(state_tokenizer)), 'cannot have both video and state tokenizer yet'
+        # tokenizers
 
         if exists(state_tokenizer):
             if copy_state_tokenizer:
                 state_tokenizer = deepcopy(state_tokenizer)
                 state_tokenizer.requires_grad_(False)
-
             state_tokenizer = state_tokenizer.eval()
 
         self.state_tokenizer = state_tokenizer
-
-        self.has_latent_ar = latent_ar
-
-        # can accept raw video if tokenizer is passed in
 
         if exists(video_tokenizer):
             if copy_video_tokenizer:
                 video_tokenizer = deepcopy(video_tokenizer)
                 video_tokenizer.requires_grad_(False)
-
             video_tokenizer = video_tokenizer.eval()
 
         self.video_tokenizer = video_tokenizer
+
+        if exists(audio_tokenizer):
+            if copy_audio_tokenizer:
+                audio_tokenizer = deepcopy(audio_tokenizer)
+                audio_tokenizer.requires_grad_(False)
+            audio_tokenizer = audio_tokenizer.eval()
+
+        self.audio_tokenizer = audio_tokenizer
+
+        # rest of init
+
+        self.has_latent_ar = latent_ar
 
         self.aux_image_encoder = aux_image_encoder
         self.has_aux_image_encoder = exists(aux_image_encoder)
         self.freeze_aux_image_encoder = freeze_aux_image_encoder
 
-        if exists(video_tokenizer):
-            num_latent_tokens = default(num_latent_tokens, video_tokenizer.num_latent_tokens)
+        if not exists(num_latent_tokens):
+            num_latent_tokens = sum([t.num_latent_tokens for t in (self.video_tokenizer, self.audio_tokenizer, self.state_tokenizer) if exists(t)])
+            num_latent_tokens = num_latent_tokens if num_latent_tokens > 0 else None
 
         assert exists(num_latent_tokens), '`num_latent_tokens` must be set'
 
@@ -6263,7 +6345,11 @@ class DynamicsWorldModel(Module):
 
                 elif exists(curr_state):
                     bootstrap_latents = self.state_to_latents(curr_state)
-                    bootstrap_latents = rearrange(bootstrap_latents, 'b n d -> b 1 n d') if bootstrap_latents.ndim == 3 else bootstrap_latents
+
+                if bootstrap_latents.ndim == 3:
+                    bootstrap_latents = rearrange(bootstrap_latents, 'b n d -> b 1 1 n d')
+                elif bootstrap_latents.ndim == 4:
+                    bootstrap_latents = rearrange(bootstrap_latents, 'b v n d -> b 1 v n d')
 
                 _, (embeds, _) = self.forward(
                     latents = bootstrap_latents,
@@ -6766,6 +6852,7 @@ class DynamicsWorldModel(Module):
         return total_policy_loss, value_loss
 
     @torch.no_grad()
+    @temp_eval
     def generate(
         self,
         time_steps,
@@ -6789,6 +6876,7 @@ class DynamicsWorldModel(Module):
         store_agent_embed = True,
         store_old_action_unembeds = True,
         prompt: Tensor | None = None,           # (b c t h w) or (b c h w)
+        prompt_audio: Tensor | None = None,     # (b c t samples) or (b c samples)
         prompt_state: Tensor | None = None,     # (b t d) or (b d)
         prompt_latents: Tensor | None = None,   # (b t v n d)
         prompt_proprio: Tensor | None = None,
@@ -6811,8 +6899,6 @@ class DynamicsWorldModel(Module):
         # more variables
 
         has_proprio = self.has_proprio
-        was_training = self.training
-        self.eval()
 
         # validation
 
@@ -6832,36 +6918,62 @@ class DynamicsWorldModel(Module):
 
         step_size = self.max_steps // num_steps
 
-        # handle prompt or prompt_latents
+        # handle prompt, prompt_audio, prompt_state, or prompt_latents
 
-        assert at_most_one_of(prompt, prompt_state, prompt_latents), 'can only pass in one of prompt, prompt_state, or prompt_latents'
+        has_raw_prompts = any([exists(i) for i in (prompt, prompt_audio, prompt_state)])
+        assert has_raw_prompts ^ exists(prompt_latents) or not (has_raw_prompts or exists(prompt_latents)), 'either raw prompts (prompt, prompt_audio, prompt_state) or prompt_latents must be provided, but not both'
 
-        if exists(prompt):
-            if prompt.ndim == 4:
-                prompt = rearrange(prompt, 'b c h w -> b c 1 h w')
+        if has_raw_prompts:
+            all_prompt_latents = tuple()
 
-            tokenizer = self.video_tokenizer
-            if prompt.shape[1] != tokenizer.channels:
-                prompt = repeat(prompt, 'b 1 t h w -> b c t h w', c = tokenizer.channels)
+            if exists(prompt):
+                if prompt.ndim == 4:
+                    prompt = rearrange(prompt, 'b c h w -> b 1 c 1 h w')
+                elif prompt.ndim == 5:
+                    prompt = rearrange(prompt, 'b c t h w -> b 1 c t h w')
 
-            prompt_latents = tokenizer.tokenize(prompt)
-            assert self.num_video_views == 1, 'num video views > 1 not supported yet for auto-deriving prompt latents'
-            prompt_latents = rearrange(prompt_latents, 'b t n d -> b t 1 n d')
+                prompt_packed, unpack_views = pack_one(prompt, '* c t h w')
 
-        elif exists(prompt_state):
-            prompt_state_packed, unpack_views = pack_one(prompt_state, '* d')
+                tokenizer = self.video_tokenizer
+                if prompt_packed.shape[1] != tokenizer.channels:
+                    prompt_packed = repeat(prompt_packed, 'b 1 t h w -> b c t h w', c = tokenizer.channels)
 
-            if exists(self.state_tokenizer):
-                prompt_latents = self.state_tokenizer.tokenize(prompt_state_packed)
-            else:
-                prompt_latents = self.state_to_latents(prompt_state_packed)
+                video_latents = tokenizer.tokenize(prompt_packed)
+                video_latents = unpack_views(video_latents, '* t n d')
+                video_latents = rearrange(video_latents, 'b v t n d -> b t v n d')
+                all_prompt_latents = (*all_prompt_latents, video_latents)
 
-            prompt_latents = unpack_views(prompt_latents, '* n d')
+            if exists(prompt_audio):
+                if prompt_audio.ndim == 3:
+                    prompt_audio = rearrange(prompt_audio, 'b c s -> b 1 c 1 s')
+                elif prompt_audio.ndim == 4:
+                    prompt_audio = rearrange(prompt_audio, 'b c t s -> b 1 c t s')
 
-            # handle missing view or time dimensions for 1 latent edge case
+                audio_packed, unpack_views = pack_one(prompt_audio, '* c t s')
 
-            prompt_latents, _ = pack_one(prompt_latents, 'b * n d')
-            prompt_latents, _ = pack_one(prompt_latents, 'b * v n d')
+                audio_latents = self.audio_tokenizer.tokenize(audio_packed)
+                audio_latents = unpack_views(audio_latents, '* t n d')
+                audio_latents = rearrange(audio_latents, 'b v t n d -> b t v n d')
+                all_prompt_latents = (*all_prompt_latents, audio_latents)
+
+            if exists(prompt_state):
+                if prompt_state.ndim == 2:
+                    prompt_state = rearrange(prompt_state, 'b d -> b 1 1 d')
+                elif prompt_state.ndim == 3:
+                    prompt_state = rearrange(prompt_state, 'b t d -> b 1 t d')
+
+                prompt_state_packed, unpack_views = pack_one(prompt_state, '* t d')
+
+                if exists(self.state_tokenizer):
+                    state_latents = self.state_tokenizer.tokenize(prompt_state_packed)
+                else:
+                    state_latents = self.state_to_latents(prompt_state_packed)
+
+                state_latents = unpack_views(state_latents, '* t n d')
+                state_latents = rearrange(state_latents, 'b v t n d -> b t v n d')
+                all_prompt_latents = (*all_prompt_latents, state_latents)
+
+            prompt_latents = safe_cat(all_prompt_latents, dim = -2)
 
         # denoising
         # teacher forcing to start with
@@ -6876,29 +6988,40 @@ class DynamicsWorldModel(Module):
 
         past_latents_context_noise = latents.clone()
 
-        # maybe internal state
+        # prompt related variables
+
+        prompt_time = latents.shape[1]
+
+        # proprio
 
         if has_proprio:
             if exists(prompt_proprio):
                 proprio = prompt_proprio.clone()
             else:
-                proprio = empty((batch_size, 0, self.dim_proprio), device = self.device)
+                proprio = zeros((batch_size, prompt_time, self.dim_proprio), device = self.device)
 
             past_proprio_context_noise = proprio.clone()
 
-        # maybe return actions
+        # actions
 
         return_agent_actions |= return_log_probs_and_values
 
-        if return_agent_actions:
-            num_discrete_action_types = self.action_embedder.num_discrete_action_types
-            decoded_discrete_actions = prompt_discrete_actions.clone() if exists(prompt_discrete_actions) else empty((batch_size, 0, num_discrete_action_types), device = self.device, dtype = torch.long) if num_discrete_action_types > 0 else None
+        decoded_discrete_actions = prompt_discrete_actions
+        decoded_continuous_actions = prompt_continuous_actions
 
-            num_continuous_action_types = self.action_embedder.num_continuous_action_types
-            decoded_continuous_actions = prompt_continuous_actions.clone() if exists(prompt_continuous_actions) else empty((batch_size, 0, num_continuous_action_types), device = self.device, dtype = torch.float) if num_continuous_action_types > 0 else None
-        else:
-            decoded_discrete_actions = prompt_discrete_actions
-            decoded_continuous_actions = prompt_continuous_actions
+        if return_agent_actions:
+            num_discrete = self.action_embedder.num_discrete_action_types
+            num_continuous = self.action_embedder.num_continuous_action_types
+
+            if exists(decoded_discrete_actions):
+                decoded_discrete_actions = decoded_discrete_actions.clone()
+            elif num_discrete > 0:
+                decoded_discrete_actions = zeros((batch_size, prompt_time, num_discrete), device = self.device, dtype = torch.long)
+
+            if exists(decoded_continuous_actions):
+                decoded_continuous_actions = decoded_continuous_actions.clone()
+            elif num_continuous > 0:
+                decoded_continuous_actions = zeros((batch_size, prompt_time, num_continuous), device = self.device, dtype = torch.float)
 
         # policy optimization related
 
@@ -6906,27 +7029,25 @@ class DynamicsWorldModel(Module):
         decoded_continuous_log_probs = None
         decoded_values = None
 
-        # maybe store agent embed
+        # agent / policy embeds
 
         acc_agent_embed = None
-
-        # maybe store old actions for kl
-
         acc_policy_embed = None
 
-        # maybe return rewards
+        # rewards
 
         decoded_rewards = None
+
         if return_rewards_per_frame:
             if exists(prompt_rewards):
                 decoded_rewards = prompt_rewards.clone()
 
                 # if prompt rewards has 1 less timestep than latents (e.g. from standard RL episodes where the first state has no reward)
                 # pad it on the left with 0 to ensure the sequence perfectly aligns with latents for the einsum step mask later
-                if decoded_rewards.shape[1] == latents.shape[1] - 1:
+                if decoded_rewards.shape[1] == prompt_time - 1:
                     decoded_rewards = pad_left_at_dim(decoded_rewards, 1, value = 0., dim = 1)
             else:
-                decoded_rewards = empty((batch_size, 0), device = self.device, dtype = torch.float32)
+                decoded_rewards = zeros((batch_size, prompt_time), device = self.device, dtype = torch.float32)
 
         # maybe return terminals
 
@@ -7168,10 +7289,6 @@ class DynamicsWorldModel(Module):
 
         latents.clamp_(-1., 1.)
 
-        # restore state
-
-        self.train(was_training)
-
         # returning video
 
         has_tokenizer = exists(self.video_tokenizer)
@@ -7276,6 +7393,7 @@ class DynamicsWorldModel(Module):
         self,
         *,
         video = None,                    # (b v? c t vh vw)
+        audio = None,                    # (b v? c t samples)
         state = None,                    # (b v? t d)
         latents = None,                  # (b t v? n d) | (b t v? d)
         aug_id = None,                   # (b)
@@ -7309,9 +7427,10 @@ class DynamicsWorldModel(Module):
         return_latent_disagreement: bool = False,
         return_latent_disagreement_clip_decoded: bool = False
     ):
-        # handle video or latents
+        # handle video, audio, state, or latents
 
-        assert exists(video) ^ exists(latents) ^ exists(state), 'exactly one of video, state, or latents must be provided'
+        has_raw_modalities = any([exists(i) for i in (video, audio, state)])
+        assert has_raw_modalities ^ exists(latents), 'either raw modalities (video, audio, state) or latents must be provided, but not both'
 
         # standardize view dimension
 
@@ -7319,44 +7438,64 @@ class DynamicsWorldModel(Module):
             if exists(video):
                 video = rearrange(video, 'b ... -> b 1 ...')
 
+            if exists(audio):
+                audio = rearrange(audio, 'b ... -> b 1 ...')
+
             if exists(state):
                 state = rearrange(state, 'b ... -> b 1 ...')
 
             if exists(latents) and not latent_has_view_dim:
                 latents = rearrange(latents, 'b t ... -> b t 1 ...')
 
-        # if raw video passed in, tokenize
+        # if raw modalities passed in, tokenize
 
-        if exists(video):
-            assert video.ndim == 6
+        if has_raw_modalities:
+            all_latents = tuple()
 
-            video_packed, unpack_views = pack_one(video, '* c t vh vw')
-            assert exists(self.video_tokenizer) or self.has_aux_image_encoder, 'video_tokenizer or aux_image_encoder must be passed in if training from raw video on dynamics model'
+            if exists(video):
+                assert video.ndim == 6
 
-            latents = None
-            if exists(self.video_tokenizer):
-                latents = self.video_tokenizer.tokenize(video_packed)
-                latents = unpack_views(latents, '* t n d')
-                latents = rearrange(latents, 'b v t n d -> b t v n d')
+                video_packed, unpack_views = pack_one(video, '* c t vh vw')
+                assert exists(self.video_tokenizer) or self.has_aux_image_encoder, 'video_tokenizer or aux_image_encoder must be passed in if training from raw video on dynamics model'
 
-            if self.has_aux_image_encoder:
-                aux_image_tokens = self.encode_aux_image_tokens(video_packed)
-                aux_image_tokens = unpack_views(aux_image_tokens, '* t n d')
-                aux_image_tokens = rearrange(aux_image_tokens, 'b v t n d -> b t v n d')
-                latents = safe_cat((latents, aux_image_tokens), dim = -2)
+                if exists(self.video_tokenizer):
+                    video_latents = self.video_tokenizer.tokenize(video_packed)
+                    video_latents = unpack_views(video_latents, '* t n d')
+                    video_latents = rearrange(video_latents, 'b v t n d -> b t v n d')
+                    all_latents = (*all_latents, video_latents)
 
-        if exists(state):
-            assert state.ndim == 4, 'state should have shape (b v t d)'
-            assert exists(self.state_tokenizer) or exists(self.state_to_latents), 'state_tokenizer or state_to_latents must be provided for state input'
+                if self.has_aux_image_encoder:
+                    aux_image_tokens = self.encode_aux_image_tokens(video_packed)
+                    aux_image_tokens = unpack_views(aux_image_tokens, '* t n d')
+                    aux_image_tokens = rearrange(aux_image_tokens, 'b v t n d -> b t v n d')
+                    all_latents = (*all_latents, aux_image_tokens)
 
-            state_packed, unpack_views = pack_one(state, '* t d')
-            if exists(self.state_tokenizer):
-                latents = self.state_tokenizer.tokenize(state_packed)
-            else:
-                latents = self.state_to_latents(state_packed)
+            if exists(audio):
+                assert audio.ndim == 5, 'audio should have shape (b v c t samples)'
 
-            latents = unpack_views(latents, '* t n d')
-            latents = rearrange(latents, 'b v t n d -> b t v n d')
+                audio_packed, unpack_views = pack_one(audio, '* c t samples')
+                assert exists(self.audio_tokenizer), 'audio_tokenizer must be passed in if training from raw audio on dynamics model'
+
+                audio_latents = self.audio_tokenizer.tokenize(audio_packed)
+                audio_latents = unpack_views(audio_latents, '* t n d')
+                audio_latents = rearrange(audio_latents, 'b v t n d -> b t v n d')
+                all_latents = (*all_latents, audio_latents)
+
+            if exists(state):
+                assert state.ndim == 4, 'state should have shape (b v t d)'
+                assert exists(self.state_tokenizer) or exists(self.state_to_latents), 'state_tokenizer or state_to_latents must be provided for state input'
+
+                state_packed, unpack_views = pack_one(state, '* t d')
+                if exists(self.state_tokenizer):
+                    state_latents = self.state_tokenizer.tokenize(state_packed)
+                else:
+                    state_latents = self.state_to_latents(state_packed)
+
+                state_latents = unpack_views(state_latents, '* t n d')
+                state_latents = rearrange(state_latents, 'b v t n d -> b t v n d')
+                all_latents = (*all_latents, state_latents)
+
+            latents = safe_cat(all_latents, dim = -2)
 
         if latents.ndim == 4:
             latents = rearrange(latents, 'b t v d -> b t v 1 d') # 1 latent edge case

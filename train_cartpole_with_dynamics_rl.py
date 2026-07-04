@@ -394,24 +394,24 @@ def main(
 
     # optimizers
 
-    has_video_tokenizer = use_image_input and exists(agent.dynamics.video_tokenizer)
-    has_state_tokenizer = not use_image_input and exists(agent.dynamics.state_tokenizer)
-    has_tokenizer = has_video_tokenizer or has_state_tokenizer
+    active_tokenizers = {name: tok for name, tok in agent.dynamics.tokenizers.items()}
+    has_tokenizer = len(active_tokenizers) > 0
     should_ssl = False
 
     if has_tokenizer and not use_conv_encoder:
-        if has_video_tokenizer:
-            should_ssl = agent.dynamics.video_tokenizer.has_flow and ssl_every_rl_updates > 0
+        if 'video' in active_tokenizers:
+            should_ssl = active_tokenizers['video'].has_flow and ssl_every_rl_updates > 0
         else:
             should_ssl = ssl_every_rl_updates > 0
 
-    if should_ssl and has_video_tokenizer:
+    if should_ssl and 'video' in active_tokenizers:
         log(f'\nReconstruction grids will be saved directly to {results_folder.absolute()}\n')
 
     if has_tokenizer:
-        tokenizer = agent.dynamics.video_tokenizer if has_video_tokenizer else agent.dynamics.state_tokenizer
+        tokenizer_params = set()
+        for tok in active_tokenizers.values():
+            tokenizer_params.update(tok.parameters())
 
-        tokenizer_params = set(tokenizer.parameters())
         agent_params = [p for p in agent.parameters() if p not in tokenizer_params]
 
         optimizer_groups = [
@@ -422,7 +422,7 @@ def main(
         optimizer = AdamW(optimizer_groups)
 
         if should_ssl:
-            tokenizer_optim = AdamW(tokenizer.parameters(), lr = tokenizer_learning_rate)
+            tokenizer_optim = AdamW(list(tokenizer_params), lr = tokenizer_learning_rate)
             tokenizer_optim = accelerator.prepare(tokenizer_optim)
 
     else:
@@ -595,48 +595,70 @@ def main(
 
         # autoencoder ssl training
 
-        if should_do_ssl_now and exists(ssl_video):
+        if should_do_ssl_now:
             agent.train()
             torch.cuda.empty_cache()
 
-            ssl_pbar = tqdm(range(ssl_max_epochs), desc = 'ssl epochs', leave = False)
-            for epoch in ssl_pbar:
-                batches = torch.randperm(ssl_video.shape[0]).split(ssl_batch_size)
+            ssl_data = {}
+            if exists(ssl_exp_batch.video):
+                ssl_data['video'] = ssl_exp_batch.video
+            if exists(ssl_exp_batch.critic_state):
+                ssl_data['state'] = ssl_exp_batch.critic_state
 
-                epoch_recon_loss = 0.
+            if len(ssl_data) > 0:
+                ssl_pbar = tqdm(range(ssl_max_epochs), desc = 'ssl epochs', leave = False)
+                for epoch in ssl_pbar:
+                    # just use the first available data for batching sizes
+                    first_data = next(iter(ssl_data.values()))
+                    batches = torch.randperm(first_data.shape[0]).split(ssl_batch_size)
 
-                for i, batch_indices in enumerate(batches):
-                    is_last_batch = (i + 1) == len(batches)
-                    batch_video = ssl_video[batch_indices].to(device)
-                    batch_lens = ssl_lens[batch_indices].to(device) if exists(ssl_lens) else None
+                    epoch_recon_loss = 0.
 
-                    if has_video_tokenizer:
-                        loss, (losses, recon_video) = tokenizer(
-                            batch_video,
-                            time_lens = batch_lens,
-                            update_loss_ema = True,
-                            return_intermediates = True
-                        )
-                        recon_loss = losses.recon.item()
-                    else:
-                        loss_out = tokenizer(
-                            batch_video,
-                            time_lens = batch_lens
-                        )
-                        loss = loss_out[0] if isinstance(loss_out, tuple) else loss_out
-                        recon_loss = loss.item()
+                    for i, batch_indices in enumerate(batches):
+                        is_last_batch = (i + 1) == len(batches)
+                        batch_lens = ssl_lens[batch_indices].to(device) if exists(ssl_lens) else None
 
-                    loss = loss / ssl_grad_accum_every
-                    accelerator.backward(loss)
+                        total_loss = 0.
+                        total_recon = 0.
 
-                    if divisible_by(i + 1, ssl_grad_accum_every) or is_last_batch:
-                        accelerator.clip_grad_norm_(tokenizer.parameters(), max_grad_norm)
-                        tokenizer_optim.step()
-                        tokenizer_optim.zero_grad()
+                        for name, tokenizer in active_tokenizers.items():
+                            if name not in ssl_data:
+                                continue
 
-                    epoch_recon_loss += recon_loss / len(batches)
+                            batch_data = ssl_data[name][batch_indices].to(device)
 
-                ssl_pbar.set_postfix(recon_loss = f'{epoch_recon_loss:.4f}')
+                            if name == 'video':
+                                loss, (losses, recon_video) = tokenizer(
+                                    batch_data,
+                                    time_lens = batch_lens,
+                                    update_loss_ema = True,
+                                    return_intermediates = True
+                                )
+                                recon_loss = losses.recon.item()
+                            else:
+                                loss_out = tokenizer(
+                                    batch_data,
+                                    time_lens = batch_lens
+                                )
+                                loss = loss_out[0] if isinstance(loss_out, tuple) else loss_out
+                                recon_loss = loss.item()
+
+                            total_loss = total_loss + loss
+                            total_recon = total_recon + recon_loss
+
+                        total_loss = total_loss / ssl_grad_accum_every
+                        accelerator.backward(total_loss)
+
+                        if divisible_by(i + 1, ssl_grad_accum_every) or is_last_batch:
+                            # clip gradients for all tokenizers
+                            for tok in active_tokenizers.values():
+                                accelerator.clip_grad_norm_(tok.parameters(), max_grad_norm)
+                            tokenizer_optim.step()
+                            tokenizer_optim.zero_grad()
+
+                        epoch_recon_loss += total_recon / len(batches)
+
+                    ssl_pbar.set_postfix(recon_loss = f'{epoch_recon_loss:.4f}')
 
                 if exists(ssl_target_recon_loss) and ssl_target_recon_loss > 0:
                     if epoch_recon_loss <= ssl_target_recon_loss:
@@ -651,13 +673,13 @@ def main(
             if use_wandb:
                 wandb.log(dict(recon_loss = avg_recon_loss))
 
-            if has_video_tokenizer:
+            if 'video' in active_tokenizers and 'video' in ssl_data:
                 with torch.no_grad():
                     agent.eval()
-                    sample_video = ssl_video[:1].to(device)
+                    sample_video = ssl_data['video'][:1].to(device)
                     sample_lens = ssl_lens[:1].to(device) if exists(ssl_lens) else None
 
-                    _, (_, sample_recon) = tokenizer(
+                    _, (_, sample_recon) = active_tokenizers['video'](
                         sample_video,
                         time_lens = sample_lens,
                         mask_patches = False,
