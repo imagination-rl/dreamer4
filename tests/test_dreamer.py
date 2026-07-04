@@ -450,6 +450,23 @@ def test_action_embedder():
     assert discrete_logits.shape == (2, 3, 8)
     assert continuous_mean_log_var.shape == (2, 3, 2, 2)
 
+    # scalar prediction-head selection should match the first unsqueezed head
+
+    multi_pred_embedder = ActionEmbedder(
+        512,
+        num_discrete_actions = (4, 4),
+        num_continuous_actions = 2,
+        can_unembed = True,
+        num_unembed_preds = 2,
+        squeeze_unembed_preds = False
+    )
+
+    all_discrete_logits, all_continuous_mean_log_var = multi_pred_embedder.unembed(action_embed)
+    head_discrete_logits, head_continuous_mean_log_var = multi_pred_embedder.unembed(action_embed, pred_head_index = 0)
+
+    assert torch.allclose(head_discrete_logits, all_discrete_logits[0], atol = 1e-6)
+    assert torch.allclose(head_continuous_mean_log_var, all_continuous_mean_log_var[0], atol = 1e-6)
+
     # test kl div
 
     discrete_logits_tgt, continuous_mean_log_var_tgt = embedder.unembed(action_embed)

@@ -366,6 +366,19 @@ def identity(t, *args, **kwargs):
 def detach(t):
     return t.detach()
 
+def masked_mean(t: Tensor, mask: Tensor, dim = None):
+    while mask.ndim < t.ndim:
+        mask = mask[..., None]
+
+    mask_float = mask.to(t.dtype)
+    masked = t.masked_fill(~mask, 0.)
+
+    if exists(dim):
+        return masked.sum(dim = dim) / mask_float.sum(dim = dim).clamp(min = 1.)
+
+    expanded_mask = mask.expand_as(t)
+    return masked.sum() / expanded_mask.sum().clamp(min = 1.).to(t.dtype)
+
 def first(arr):
     return arr[0]
 
@@ -392,6 +405,12 @@ def is_odd(n):
     return not divisible_by(n, 2)
 
 def sample_prob(prob):
+    if prob <= 0.:
+        return False
+
+    if prob >= 1.:
+        return True
+
     return rand(1).item() < prob
 
 def is_power_two(num):
@@ -1398,12 +1417,11 @@ class ActionEmbedder(Module):
 
         # handle only one prediction head during inference
 
-        if exists(pred_head_index) and isinstance(pred_head_index, int):
-            pred_head_index = tensor(pred_head_index, device = device)
+        pred_head_index_is_int = exists(pred_head_index) and isinstance(pred_head_index, int)
 
         # if pred_head_index given as a solo int, just assume we want to squeeze out the prediction head dimension
 
-        squeeze_one_pred_head = exists(pred_head_index) and pred_head_index.ndim == 0
+        squeeze_one_pred_head = pred_head_index_is_int or (exists(pred_head_index) and pred_head_index.ndim == 0)
 
         # get action types
 
@@ -1422,7 +1440,9 @@ class ActionEmbedder(Module):
 
                 discrete_action_unembed = discrete_action_unembed[discrete_action_mask]
 
-            if exists(pred_head_index):
+            if pred_head_index_is_int:
+                discrete_action_unembed = discrete_action_unembed.select(1, pred_head_index).unsqueeze(1)
+            elif exists(pred_head_index):
                 discrete_action_unembed = discrete_action_unembed.index_select(1, pred_head_index)
 
             discrete_action_logits = einsum(embeds, discrete_action_unembed, '... d, na mtp d -> mtp ... na')
@@ -1449,7 +1469,9 @@ class ActionEmbedder(Module):
             if exists(continuous_action_types):
                 continuous_action_unembed = continuous_action_unembed[continuous_action_types]
 
-            if exists(pred_head_index):
+            if pred_head_index_is_int:
+                continuous_action_unembed = continuous_action_unembed.select(1, pred_head_index).unsqueeze(1)
+            elif exists(pred_head_index):
                 continuous_action_unembed = continuous_action_unembed.index_select(1, pred_head_index)
 
             continuous_action_mean_log_var = einsum(embeds, continuous_action_unembed, '... d, na mtp d two -> mtp ... na two')
@@ -1958,7 +1980,7 @@ def get_attend_fn(
             special_block_mask = block_mask_special_tokens_right(block_size_per_special, num_special_tokens, special_attend_only_itself)
             block_mask_fn = compose_mask(block_mask_fn, special_block_mask)
 
-        block_mask = create_block_mask(block_mask_fn, B = None, H = None, Q_LEN = seq_len, KV_LEN = k_seq_len)
+        block_mask = create_block_mask(block_mask_fn, B = None, H = None, Q_LEN = seq_len, KV_LEN = k_seq_len, device = device)
 
         score_mod = score_mod_softclamp(softclamp_value)
 
@@ -6746,15 +6768,10 @@ class DynamicsWorldModel(Module):
 
             scaled_action_log_probs = maybe_gated_log_prob * advantage.tanh().abs()
 
-            pos_loss, neg_loss = 0., 0.
+            pos_loss = scaled_action_log_probs.masked_fill(~pos, 0.).sum()
+            neg_loss = scaled_action_log_probs.masked_fill(~neg, 0.).sum()
 
-            if pos.any():
-                pos_loss = scaled_action_log_probs[pos].sum()
-
-            if neg.any():
-                neg_loss = scaled_action_log_probs[neg].sum()
-
-            num_advantages = max(1., mask.sum().item() if exists(mask) else advantage.numel())
+            num_advantages = mask.sum().clamp(min = 1).to(scaled_action_log_probs.dtype) if exists(mask) else max(1, advantage.numel())
 
             α = self.pmpo_pos_to_neg_weight
             policy_loss = -α * (pos_loss - neg_loss) / num_advantages
@@ -7546,6 +7563,8 @@ class DynamicsWorldModel(Module):
 
         # standardize view dimension
 
+        latent_has_view_dim = latent_has_view_dim or (exists(latents) and latents.ndim == 5)
+
         if not self.video_has_multi_view:
             if exists(video):
                 video = rearrange(video, 'b ... -> b 1 ...')
@@ -8070,29 +8089,6 @@ class DynamicsWorldModel(Module):
             noised = noised_latents
             data = latents
 
-        # wrapper function for maybe unpacking and packing modalities for doing flow math in unison
-
-        def maybe_pack_unpack(fn):
-            @wraps(fn)
-            @torch.no_grad()
-            def inner(noised, *args, **kwargs):
-
-                noised_proprio = None
-
-                if self.has_proprio:
-                    noised, noised_proprio = unpack(noised, for_flow_loss_packed_shape, 'b t *')
-
-                pred = fn(noised, noised_proprio, *args, **kwargs)
-
-                if self.has_proprio:
-                    packed_flow, _ = pack((pred.flow, pred.proprioception), 'b t *')
-                    return packed_flow
-
-                return pred.flow
-            return inner
-
-        wrapped_get_prediction = maybe_pack_unpack(_get_prediction)
-
         # determine the targets for the standard and shortcut losses
 
         is_x_space = self.pred_orig_latent
@@ -8119,7 +8115,19 @@ class DynamicsWorldModel(Module):
             step_sizes_log2_minus_one = step_sizes_log2 - 1 # which equals d / 2
             half_step_size = 2 ** step_sizes_log2_minus_one
 
-            first_step_pred = wrapped_get_prediction(noised, signal_levels, step_sizes_log2_minus_one)
+            first_noised = noised
+            first_noised_proprio = None
+
+            if self.has_proprio:
+                first_noised, first_noised_proprio = unpack(first_noised, for_flow_loss_packed_shape, 'b t *')
+
+            with torch.no_grad():
+                first_step_pred = _get_prediction(first_noised, first_noised_proprio, signal_levels, step_sizes_log2_minus_one)
+
+            if self.has_proprio:
+                first_step_pred, _ = pack((first_step_pred.flow, first_step_pred.proprioception), 'b t *')
+            else:
+                first_step_pred = first_step_pred.flow
 
             # first derive b'
 
@@ -8139,7 +8147,19 @@ class DynamicsWorldModel(Module):
             # get second prediction for b''
 
             signal_levels_plus_half_step = signal_levels + half_step_size[:, None]
-            second_step_pred = wrapped_get_prediction(denoised, signal_levels_plus_half_step, step_sizes_log2_minus_one)
+            second_noised = denoised
+            second_noised_proprio = None
+
+            if self.has_proprio:
+                second_noised, second_noised_proprio = unpack(second_noised, for_flow_loss_packed_shape, 'b t *')
+
+            with torch.no_grad():
+                second_step_pred = _get_prediction(second_noised, second_noised_proprio, signal_levels_plus_half_step, step_sizes_log2_minus_one)
+
+            if self.has_proprio:
+                second_step_pred, _ = pack((second_step_pred.flow, second_step_pred.proprioception), 'b t *')
+            else:
+                second_step_pred = second_step_pred.flow
 
             if is_v_space_pred:
                 second_step_pred_flow = second_step_pred
@@ -8186,8 +8206,8 @@ class DynamicsWorldModel(Module):
             loss_mask = lens_to_mask(lens, time)
             loss_mask_without_last = loss_mask[:, :-1]
 
-            flow_loss = flow_losses[loss_mask].mean()
-            shortcut_flow_loss = shortcut_flow_losses[loss_mask].mean() if should_compute_shortcut else self.zero
+            flow_loss = masked_mean(flow_losses, loss_mask)
+            shortcut_flow_loss = masked_mean(shortcut_flow_losses, loss_mask) if should_compute_shortcut else self.zero
 
         else:
             flow_loss = flow_losses.mean()
@@ -8232,7 +8252,7 @@ class DynamicsWorldModel(Module):
                 reward_losses = reward_losses.masked_fill(~reward_loss_mask, 0.)
 
                 if is_var_len:
-                    agent_embed_reward_loss = reward_losses[loss_mask_without_last].mean(dim = 0)
+                    agent_embed_reward_loss = masked_mean(reward_losses, loss_mask_without_last, dim = (0, 1))
                 else:
                     agent_embed_reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean')
             # latent state reward prediction (for generation)
@@ -8247,9 +8267,9 @@ class DynamicsWorldModel(Module):
             latent_state_reward_loss = F.cross_entropy(latent_reward_pred, latent_reward_targets, reduction = 'none')
 
             if is_var_len:
-                latent_state_reward_loss = latent_state_reward_loss[loss_mask_without_last]
-
-            latent_state_reward_loss = latent_state_reward_loss.mean()
+                latent_state_reward_loss = masked_mean(latent_state_reward_loss, loss_mask_without_last)
+            else:
+                latent_state_reward_loss = latent_state_reward_loss.mean()
         # terminal prediction loss
 
         if exists(terminals) and self.predict_terminals:
@@ -8279,7 +8299,7 @@ class DynamicsWorldModel(Module):
                 state_terminal_losses = state_terminal_losses.masked_fill(~terminal_loss_mask, 0.)
 
                 if is_var_len:
-                    agent_embed_terminal_loss = state_terminal_losses[loss_mask_without_last].mean(dim = 0)
+                    agent_embed_terminal_loss = masked_mean(state_terminal_losses, loss_mask_without_last, dim = (0, 1))
                 else:
                     agent_embed_terminal_loss = reduce(state_terminal_losses, '... mtp -> mtp', 'mean')
 
@@ -8296,9 +8316,9 @@ class DynamicsWorldModel(Module):
             latent_state_terminal_loss = F.binary_cross_entropy_with_logits(latent_terminal_pred, terminals_seq, reduction = 'none')
 
             if is_var_len:
-                latent_state_terminal_loss = latent_state_terminal_loss[loss_mask_without_last]
-
-            latent_state_terminal_loss = latent_state_terminal_loss.mean()
+                latent_state_terminal_loss = masked_mean(latent_state_terminal_loss, loss_mask_without_last)
+            else:
+                latent_state_terminal_loss = latent_state_terminal_loss.mean()
 
         # maybe autoregressive state prediction loss
 
@@ -8317,7 +8337,7 @@ class DynamicsWorldModel(Module):
             state_pred_losses = -dist.log_prob(latent_to_pred)
 
             if is_var_len:
-                state_pred_loss = state_pred_losses[loss_mask_without_last].mean()
+                state_pred_loss = masked_mean(state_pred_losses, loss_mask_without_last)
             else:
                 state_pred_loss = state_pred_losses.mean()
 
@@ -8326,10 +8346,7 @@ class DynamicsWorldModel(Module):
         discrete_action_loss = self.zero
         continuous_action_loss = self.zero
 
-        has_action_loss_weight = (self.discrete_action_loss_weight.sum() + self.continuous_action_loss_weight.sum()) > 0
-
         if (
-            has_action_loss_weight and
             self.num_agents == 1 and
             add_autoregressive_action_loss and
             time > 1 and
@@ -8439,7 +8456,7 @@ class DynamicsWorldModel(Module):
             agent_state_pred_losses = -dist.log_prob(latent_to_pred)
 
             if is_var_len:
-                agent_state_pred_loss = agent_state_pred_losses[loss_mask_without_last[:, :seq_len]].mean()
+                agent_state_pred_loss = masked_mean(agent_state_pred_losses, loss_mask_without_last[:, :seq_len])
             else:
                 agent_state_pred_loss = agent_state_pred_losses.mean()
 
