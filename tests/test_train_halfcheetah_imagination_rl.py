@@ -60,3 +60,56 @@ def test_main_forwards_custom_attention_values_to_world_model():
 
     assert isinstance(kwargs["attn_dim_head"], ast.Name)
     assert kwargs["attn_dim_head"].id == "attn_dim_head"
+
+
+def test_main_uses_symlog_hl_gauss_reward_and_return_ranges():
+    main_fn = get_main_function()
+
+    reward_range_assign = next(
+        node
+        for node in ast.walk(main_fn)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "reward_range" for target in node.targets)
+    )
+
+    assert ast.literal_eval(reward_range_assign.value) == (-4.0, 4.0)
+
+    value_range_assign = next(
+        node
+        for node in ast.walk(main_fn)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "value_range" for target in node.targets)
+    )
+
+    assert ast.literal_eval(value_range_assign.value) == (-10.0, 10.0)
+
+    world_model_call = next(
+        node.value.func.value
+        for node in ast.walk(main_fn)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "world_model" for target in node.targets)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "to"
+        and isinstance(node.value.func.value, ast.Call)
+        and isinstance(node.value.func.value.func, ast.Name)
+        and node.value.func.value.func.id == "DynamicsWorldModel"
+    )
+
+    kwargs = keyword_map(world_model_call)
+    reward_kwargs = keyword_map(kwargs["reward_encoder_kwargs"])
+    value_kwargs = keyword_map(kwargs["value_encoder_kwargs"])
+
+    assert isinstance(reward_kwargs["reward_range"], ast.Name)
+    assert reward_kwargs["reward_range"].id == "reward_range"
+    assert ast.literal_eval(reward_kwargs["num_bins"]) == 51
+    assert ast.literal_eval(reward_kwargs["sigma_to_bin_ratio"]) == 0.75
+    assert ast.literal_eval(reward_kwargs["min_max_value_on_bin_center"]) is True
+    assert ast.literal_eval(reward_kwargs["use_symlog"]) is True
+
+    assert isinstance(value_kwargs["reward_range"], ast.Name)
+    assert value_kwargs["reward_range"].id == "value_range"
+    assert ast.literal_eval(value_kwargs["num_bins"]) == 51
+    assert ast.literal_eval(value_kwargs["sigma_to_bin_ratio"]) == 0.75
+    assert ast.literal_eval(value_kwargs["min_max_value_on_bin_center"]) is True
+    assert ast.literal_eval(value_kwargs["use_symlog"]) is True
