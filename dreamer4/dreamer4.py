@@ -1948,7 +1948,9 @@ def get_attend_fn(
         block_mask = create_block_mask(block_mask_fn, B = None, H = None, Q_LEN = seq_len, KV_LEN = k_seq_len)
 
         score_mod = score_mod_softclamp(softclamp_value)
-        attend_fn = partial(flex_attention, block_mask = block_mask, score_mod = score_mod, enable_gqa = True)
+
+        def attend_fn(q, k, v, causal = False):
+            return flex_attention(q, k, v, block_mask = block_mask, score_mod = score_mod, enable_gqa = True)
     else:
         # naive pathway
 
