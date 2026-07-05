@@ -712,6 +712,7 @@ def train_world_model(
             terminals = exp.terminals,
             continuous_actions = exp.actions.continuous if exists(exp.actions) else None,
             lens = exp.lens,
+            latent_has_view_dim = True,
             return_all_losses = True,
             update_loss_ema = True,
         )
