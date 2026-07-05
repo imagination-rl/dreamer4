@@ -81,7 +81,7 @@ def test_main_uses_symlog_hl_gauss_reward_and_return_ranges():
         and any(isinstance(target, ast.Name) and target.id == "value_range" for target in node.targets)
     )
 
-    assert ast.literal_eval(value_range_assign.value) == (-9.90353755128617, 9.90353755128617)
+    assert ast.literal_eval(value_range_assign.value) == (-10.0, 10.0)
 
     world_model_call = next(
         node.value.func.value
@@ -102,13 +102,14 @@ def test_main_uses_symlog_hl_gauss_reward_and_return_ranges():
 
     assert isinstance(reward_kwargs["reward_range"], ast.Name)
     assert reward_kwargs["reward_range"].id == "reward_range"
+    assert ast.literal_eval(reward_kwargs["num_bins"]) == 51
     assert ast.literal_eval(reward_kwargs["sigma_to_bin_ratio"]) == 0.75
     assert ast.literal_eval(reward_kwargs["min_max_value_on_bin_center"]) is True
     assert ast.literal_eval(reward_kwargs["use_symlog"]) is True
 
     assert isinstance(value_kwargs["reward_range"], ast.Name)
     assert value_kwargs["reward_range"].id == "value_range"
-    assert ast.literal_eval(value_kwargs["num_bins"]) == 511
+    assert ast.literal_eval(value_kwargs["num_bins"]) == 51
     assert ast.literal_eval(value_kwargs["sigma_to_bin_ratio"]) == 0.75
     assert ast.literal_eval(value_kwargs["min_max_value_on_bin_center"]) is True
     assert ast.literal_eval(value_kwargs["use_symlog"]) is True
