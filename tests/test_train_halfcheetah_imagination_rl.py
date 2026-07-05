@@ -72,7 +72,7 @@ def test_main_uses_symlog_hl_gauss_reward_and_return_ranges():
         and any(isinstance(target, ast.Name) and target.id == "reward_range" for target in node.targets)
     )
 
-    assert ast.literal_eval(reward_range_assign.value) == (-3.0, 3.0)
+    assert ast.literal_eval(reward_range_assign.value) == (-4.0, 4.0)
 
     value_range_assign = next(
         node

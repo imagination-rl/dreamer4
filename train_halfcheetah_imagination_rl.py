@@ -1036,7 +1036,7 @@ def main(
         "this script expects the native policy target range to match the env action range [-1, 1]"
     )
 
-    reward_range = (-3., 3.)
+    reward_range = (-4., 4.)
     value_range = (-10., 10.)
 
     world_model = DynamicsWorldModel(
