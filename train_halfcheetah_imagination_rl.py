@@ -71,6 +71,8 @@ def cycle(dl):
 class CallTiming:
     name: str
     compiled: bool
+    compile_mode: str | None = None
+    cuda_graphs: bool = False
     calls: int = 0
     total_seconds: float = 0.
     first_call_seconds: float | None = None
@@ -113,6 +115,30 @@ class TimedCallable:
         synchronize_if_cuda(self.device)
         self.timing.record(perf_counter() - start)
         return out
+
+
+def compile_mode_uses_cuda_graphs(mode: str | None):
+    return mode in ("reduce-overhead", "max-autotune")
+
+
+def cudagraph_mark_step_begin():
+    mark_step_begin = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+
+    if callable(mark_step_begin):
+        mark_step_begin()
+
+
+class CompiledCallable:
+    def __init__(
+        self,
+        fn: Callable,
+        timing: CallTiming,
+    ):
+        self.fn = fn
+        self.timing = timing
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
 
 
 class WorldModelTrainingLoss(nn.Module):
@@ -264,6 +290,22 @@ def synchronize_if_cuda(device: torch.device):
         torch.cuda.synchronize(device)
 
 
+def reset_torch_compile_state(device: torch.device):
+    torch.compiler.reset()
+
+    try:
+        import torch._inductor.codecache as codecache
+
+        codecache.FxGraphCache.clear()
+        codecache.PyCodeCache.cache_clear()
+        codecache.CppCodeCache.cache_clear()
+    except Exception:
+        pass
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def torch_compile_kwargs(
     *,
     backend: str,
@@ -293,20 +335,40 @@ def maybe_compile_and_time(
     compile_mode: str | None,
     compile_fullgraph: bool,
     compile_dynamic: bool | None,
+    compile_cudagraphs = True,
     wrap_timing = True,
 ):
+    uses_cuda_graphs = (
+        enabled and
+        device.type == "cuda" and
+        compile_cudagraphs and
+        compile_mode_uses_cuda_graphs(compile_mode)
+    )
+    effective_compile_mode = compile_mode
+
+    if enabled and compile_mode_uses_cuda_graphs(compile_mode) and not compile_cudagraphs:
+        # CUDA Graph capture is unsafe for these autograd loss wrappers: AOTAutograd
+        # keeps forward intermediates live for backward, and graph replay can overwrite them.
+        effective_compile_mode = "max-autotune-no-cudagraphs" if compile_mode == "max-autotune" else "default"
+
+    timing = CallTiming(
+        name = name,
+        compiled = enabled,
+        compile_mode = effective_compile_mode,
+        cuda_graphs = uses_cuda_graphs,
+    )
+
     if enabled:
         fn = torch.compile(
             fn,
             **torch_compile_kwargs(
                 backend = compile_backend,
-                mode = compile_mode,
+                mode = effective_compile_mode,
                 fullgraph = compile_fullgraph,
                 dynamic = compile_dynamic,
             )
         )
-
-    timing = CallTiming(name = name, compiled = enabled)
+        fn = CompiledCallable(fn, timing)
 
     if not enabled and not track_timing:
         return fn, timing
@@ -347,6 +409,7 @@ def build_compile_runtime(
         compile_mode = compile_mode,
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = compile_dynamic,
+        compile_cudagraphs = False,
         wrap_timing = False,
     )
     world_model_loss_timing = timing if compile_world_model or track_compile_performance else None
@@ -367,6 +430,7 @@ def build_compile_runtime(
         compile_mode = compile_mode,
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = compile_dynamic,
+        compile_cudagraphs = True,
     )
     generate_rollout_timing = timing if compile_generate or track_compile_performance else None
     timings.append(timing)
@@ -385,6 +449,7 @@ def build_compile_runtime(
         compile_mode = compile_mode,
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = compile_dynamic,
+        compile_cudagraphs = False,
         wrap_timing = False,
     )
     learn_from_dream_timing = timing if compile_learn or track_compile_performance else None
@@ -425,12 +490,14 @@ def print_compile_timing_report(timings: list[CallTiming]):
         warm_avg = timing.warm_average_seconds
         warm_avg_text = f"{warm_avg:.4f}s" if exists(warm_avg) else "n/a"
         compiled_text = "compiled" if timing.compiled else "eager"
+        mode_text = timing.compile_mode or ("compiled" if timing.compiled else "eager")
 
         print(
             f"  {timing.name} ({compiled_text}): "
             f"calls={timing.calls}, first_call={first:.4f}s, "
             f"warm_total={timing.warm_seconds:.4f}s, warm_avg={warm_avg_text}, "
-            f"total={timing.total_seconds:.4f}s"
+            f"total={timing.total_seconds:.4f}s, "
+            f"mode={mode_text}, cuda_graphs={timing.cuda_graphs}"
         )
 
 
@@ -1146,6 +1213,8 @@ def train_world_model(
             synchronize_if_cuda(world_model.device)
             world_model_step_timing.record(perf_counter() - step_start)
 
+        del exp, loss, losses, grad_metrics
+
     return global_step, last_metrics
 
 
@@ -1219,6 +1288,9 @@ def train_agent_in_imagination(
 
             has_prompt = exists(prompts)
             prompts = prompts or {}
+
+            if exists(getattr(generate_rollout_fn, "timing", None)) and generate_rollout_fn.timing.cuda_graphs:
+                cudagraph_mark_step_begin()
 
             dream = generate_rollout_fn(
                 generation_horizon,
@@ -1316,6 +1388,11 @@ def train_agent_in_imagination(
         if exists(imagination_step_timing):
             synchronize_if_cuda(world_model.device)
             imagination_step_timing.record(perf_counter() - step_start)
+
+        del dream
+        del agent_metrics, grad_metrics
+        del dream_actions, dream_log_probs, dream_old_action_unembeds
+        del policy_loss, value_loss, value_diagnostics, loss
 
     return global_step, last_metrics
 
@@ -1417,13 +1494,20 @@ def run_compile_benchmark(
 
     results = []
 
-    for name, compile_enabled in (("eager", False), ("compiled", True)):
+    for name, compile_enabled, compile_mode in (
+        ("eager", False, None),
+        ("compiled_default", True, "default"),
+        ("compiled_reduce_overhead_generate_graphs", True, "reduce-overhead"),
+    ):
+        reset_torch_compile_state(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
         run_kwargs = dict(common_kwargs)
         run_kwargs.update(
             compile = compile_enabled,
             compile_world_model = False,
             compile_generate = False,
             compile_learn = False,
+            compile_mode = compile_mode,
             log_dir = str(benchmark_root / name),
             return_compile_timings = True,
         )
@@ -1447,36 +1531,40 @@ def run_compile_benchmark(
             print(f"benchmark {name} measured warm time: {warm_seconds:.3f}s total, {warm_average_seconds:.3f}s avg")
 
     eager = next(result for result in results if result[0] == "eager")
-    compiled = next(result for result in results if result[0] == "compiled")
     _, eager_seconds, eager_hot_path, eager_first, eager_warm, eager_warm_average = eager
-    _, compiled_seconds, compiled_hot_path, compiled_first, compiled_warm, compiled_warm_average = compiled
-    warm_speedup = eager_warm / compiled_warm if compiled_warm > 0 else float("inf")
-    compile_overhead = max(compiled_first - eager_first, 0.)
-
-    break_even_calls = None
-    if (
-        exists(eager_warm_average) and
-        exists(compiled_warm_average) and
-        compiled_warm_average < eager_warm_average
-    ):
-        break_even_calls = compile_overhead / (eager_warm_average - compiled_warm_average)
 
     print("\nbenchmark summary:")
-    print(f"  steady-state warm runtime speedup: {warm_speedup:.3f}x")
     print(f"  eager warm runtime: {eager_warm:.3f}s total, {eager_warm_average:.3f}s avg")
-    print(f"  compiled warm runtime: {compiled_warm:.3f}s total, {compiled_warm_average:.3f}s avg")
-    print(f"  compiled first-call time: {compiled_first:.3f}s")
-    print(f"  estimated compile overhead vs eager first call: {compile_overhead:.3f}s")
 
-    if exists(break_even_calls):
-        print(f"  estimated break-even warm calls: {break_even_calls:.1f}")
-    else:
-        print("  estimated break-even warm calls: never (compiled warm runtime is not faster)")
+    for compiled in (result for result in results if result[0] != "eager"):
+        name, compiled_seconds, compiled_hot_path, compiled_first, compiled_warm, compiled_warm_average = compiled
+        warm_speedup = eager_warm / compiled_warm if compiled_warm > 0 else float("inf")
+        compile_overhead = max(compiled_first - eager_first, 0.)
 
-    print(f"  total eager elapsed, including setup: {eager_seconds:.3f}s")
-    print(f"  total compiled elapsed, including setup and compile: {compiled_seconds:.3f}s")
+        break_even_calls = None
+        if (
+            exists(eager_warm_average) and
+            exists(compiled_warm_average) and
+            compiled_warm_average < eager_warm_average
+        ):
+            break_even_calls = compile_overhead / (eager_warm_average - compiled_warm_average)
+
+        print(f"\n  {name}:")
+        print(f"    steady-state warm runtime speedup: {warm_speedup:.3f}x")
+        print(f"    compiled warm runtime: {compiled_warm:.3f}s total, {compiled_warm_average:.3f}s avg")
+        print(f"    compiled first-call time: {compiled_first:.3f}s")
+        print(f"    estimated compile overhead vs eager first call: {compile_overhead:.3f}s")
+
+        if exists(break_even_calls):
+            print(f"    estimated break-even warm calls: {break_even_calls:.1f}")
+        else:
+            print("    estimated break-even warm calls: never (compiled warm runtime is not faster)")
+
+        print(f"    total elapsed, including setup and compile: {compiled_seconds:.3f}s")
+        print(f"    measured hot-path elapsed, including compile: {compiled_hot_path:.3f}s")
+
+    print(f"\n  total eager elapsed, including setup: {eager_seconds:.3f}s")
     print(f"  measured hot-path elapsed, eager: {eager_hot_path:.3f}s")
-    print(f"  measured hot-path elapsed, compiled including compile: {compiled_hot_path:.3f}s")
 
 
 def main(
@@ -1538,7 +1626,7 @@ def main(
     compile_generate = False,
     compile_learn = False,
     compile_backend = "inductor",
-    compile_mode: str | None = None,
+    compile_mode: str | None = "reduce-overhead",
     compile_fullgraph = False,
     compile_dynamic: bool | None = None,
     track_compile_performance = False,
@@ -1748,6 +1836,18 @@ def main(
             if enabled
         ]
         print(f"torch.compile enabled for: {', '.join(compiled_paths)}")
+        if device.type == "cuda" and compile_mode_uses_cuda_graphs(compile_mode):
+            cuda_graph_paths = [
+                name
+                for name, enabled in (
+                    ("imagination_generate", compile_generate),
+                )
+                if enabled
+            ]
+
+            if len(cuda_graph_paths) > 0:
+                print(f"CUDA Graph capture enabled for: {', '.join(cuda_graph_paths)}")
+                print("CUDA Graph capture disabled for autograd training losses")
     if exists(tokenizer_loss):
         print(f"tokenizer pretrain recon loss: {tokenizer_loss:.4f}")
 
