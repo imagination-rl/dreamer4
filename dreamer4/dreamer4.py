@@ -1006,6 +1006,19 @@ def symlog(t):
 def symexp(t):
     return t.sign() * (t.abs().exp() - 1.)
 
+def decode_expected_scalar_from_probs(probs, support):
+    if support.shape[-1] % 2 == 1:
+        mid = support.shape[-1] // 2
+        left_probs, zero_probs, right_probs = probs[..., :mid], probs[..., mid:mid + 1], probs[..., mid + 1:]
+        left_support, zero_support, right_support = support[:mid], support[mid:mid + 1], support[mid + 1:]
+        paired = (left_probs * left_support).flip(-1) + right_probs * right_support
+        return (zero_probs * zero_support).sum(dim = -1) + paired.sum(dim = -1)
+
+    return einsum(probs, support, '... l, l -> ...')
+
+def decode_symlog_expected_raw_from_probs(probs, centers):
+    return decode_expected_scalar_from_probs(probs, symexp(centers))
+
 class SymExpTwoHot(Module):
     def __init__(
         self,
@@ -1165,16 +1178,7 @@ class HLGaussRewardEncoder(Module):
     ):
         if self.use_symlog and self.decode_symlog_expected_raw:
             probs = logits.softmax(dim = -1) if normalize else logits
-            support = symexp(self.loss.centers)
-
-            if self.num_bins % 2 == 1:
-                mid = self.num_bins // 2
-                left_probs, zero_probs, right_probs = probs[..., :mid], probs[..., mid:mid + 1], probs[..., mid + 1:]
-                left_support, zero_support, right_support = support[:mid], support[mid:mid + 1], support[mid + 1:]
-                paired = (left_probs * left_support).flip(-1) + right_probs * right_support
-                return (zero_probs * zero_support).sum(dim = -1) + paired.sum(dim = -1)
-
-            return einsum(probs, support, '... l, l -> ...')
+            return decode_symlog_expected_raw_from_probs(probs, self.loss.centers)
 
         if normalize:
             return self.loss.transform_from_logits(logits)
