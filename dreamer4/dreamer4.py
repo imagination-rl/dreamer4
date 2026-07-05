@@ -1442,7 +1442,15 @@ class ActionEmbedder(Module):
 
     def rescale_for_env(self, actions):
         """ rescale actions from native distribution range to target environment range """
-        return self.continuous_readout.rescale_from_native(actions, self.continuous_target_action_range)
+        if not exists(self.continuous_target_action_range):
+            return actions
+
+        selector = self.continuous_readout.get_selector()
+        from_range = (-1., 1.) if selector.continuous_squashed else self.continuous_readout.continuous_dist.default_range
+
+        assert exists(from_range), f'cannot rescale continuous distribution {self.continuous_dist_type} as it does not have a default range'
+
+        return rescale(actions, from_range, self.continuous_target_action_range)
 
     def log_probs(
         self,
@@ -6022,26 +6030,6 @@ class DynamicsWorldModel(Module):
     ):
         device = self.device
 
-        if self.action_embedder.has_continuous_actions and exists(self.action_embedder.continuous_target_action_range):
-            def transform_fn(action):
-                is_tuple = isinstance(action, tuple)
-                discrete, continuous = action if is_tuple else (None, action)
-
-                continuous_tensor = cast_to_tensor(continuous, device)
-                scaled_continuous = self.action_embedder.rescale_for_env(continuous_tensor)
-                scaled_continuous = scaled_continuous.cpu().numpy()
-
-                return (discrete, scaled_continuous) if is_tuple else scaled_continuous
-
-            if hasattr(env, 'wrap_innermost'):
-                from dreamer4.env import ActionTransformWrapper
-
-                env.wrap_innermost(
-                    ActionTransformWrapper,
-                    transform_fn = transform_fn,
-                    clip = self.action_embedder.continuous_target_action_range
-                )
-
         init_obs = env.reset(seed = seed)
 
         if isinstance(init_obs, tuple):
@@ -6213,6 +6201,11 @@ class DynamicsWorldModel(Module):
             # format actions for the environment, rescaling bounded distributions to target range
 
             env_continuous_actions = sampled_continuous_actions
+
+            if exists(env_continuous_actions) and exists(self.action_embedder.continuous_target_action_range):
+                env_continuous_actions = self.action_embedder.rescale_for_env(env_continuous_actions)
+                min_val, max_val = self.action_embedder.continuous_target_action_range
+                env_continuous_actions = env_continuous_actions.clamp(min_val, max_val)
 
             discrete_actions = safe_cat((discrete_actions, sampled_discrete_actions), dim = 1)
             continuous_actions = safe_cat((continuous_actions, sampled_continuous_actions), dim = 1)
