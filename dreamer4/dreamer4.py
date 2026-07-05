@@ -137,6 +137,7 @@ Embeds = namedtuple('Embeds', ['agent', 'state_pred', 'actor', 'critic'], defaul
 Actions = namedtuple('Actions', ['discrete', 'continuous'])
 
 MaybeTensor = Tensor | None
+ShortcutTrainMode = Literal['combined', 'non_bootstrap_only', 'finetune', 'bootstrap_only', 'shortcut_only']
 
 @dataclass
 class Experience:
@@ -7533,6 +7534,7 @@ class DynamicsWorldModel(Module):
         seed = None,
         agent_token_cond = None,         # (b t d) optional conditioning to be summed to agent tokens
         time_modifier_fn: Callable | None = None,
+        shortcut_train_mode: ShortcutTrainMode = 'combined',
         return_tem_preds = False,
         return_latent_disagreement: bool = False,
         return_latent_disagreement_clip_decoded: bool = False
@@ -7710,7 +7712,20 @@ class DynamicsWorldModel(Module):
 
         if not is_inference:
 
-            shortcut_train = _sample_prob(self.prob_shortcut_train)
+            assert shortcut_train_mode in (
+                'combined',
+                'non_bootstrap_only',
+                'finetune',
+                'bootstrap_only',
+                'shortcut_only'
+            ), f'unknown shortcut training mode: {shortcut_train_mode}'
+
+            if shortcut_train_mode == 'combined':
+                shortcut_train = _sample_prob(self.prob_shortcut_train)
+            elif shortcut_train_mode in ('non_bootstrap_only', 'finetune'):
+                shortcut_train = False
+            else:
+                shortcut_train = True
 
             if shortcut_train:
 
