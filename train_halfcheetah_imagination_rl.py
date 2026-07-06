@@ -313,18 +313,6 @@ class CompileRuntime:
     timings: list[CallTiming]
 
 
-@dataclass
-class BenchmarkResult:
-    name: str
-    wall_seconds: float
-    hot_path_seconds: float
-    first_call_seconds: float
-    warm_seconds: float
-    warm_average_seconds: float | None
-    peak_allocated_mib: float | None
-    peak_reserved_mib: float | None
-
-
 def synchronize_if_cuda(device: torch.device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -1480,170 +1468,6 @@ def resolve_log_dir(log_dir: str, checkpoint_path: str | None):
     return log_root / timestamp
 
 
-def run_compile_benchmark(
-    main_kwargs: dict,
-    *,
-    benchmark_num_loops: int,
-    benchmark_num_envs: int,
-    benchmark_max_timesteps: int,
-    benchmark_require_cuda: bool,
-    benchmark_preset: Literal["smoke", "perf"],
-):
-    benchmark_root = Path(main_kwargs["log_dir"]) / "compile_benchmark"
-    common_kwargs = {
-        key: value
-        for key, value in main_kwargs.items()
-        if not key.startswith("benchmark_")
-    }
-
-    smoke = benchmark_preset == "smoke"
-
-    common_kwargs.update(
-        num_loops = benchmark_num_loops,
-        rollouts_per_loop = 1,
-        num_envs = benchmark_num_envs,
-        max_timesteps = benchmark_max_timesteps,
-        replay_size = 4,
-        model_dim = min(int(main_kwargs["model_dim"]), 32) if smoke else main_kwargs["model_dim"],
-        depth = min(int(main_kwargs["depth"]), 1) if smoke else main_kwargs["depth"],
-        time_block_every = 1,
-        world_model_batch_size = 1 if smoke else main_kwargs["world_model_batch_size"],
-        world_model_train_steps = max(2, min(int(main_kwargs["world_model_train_steps"]), 2)),
-        world_model_train_sequence_length = min(int(main_kwargs["world_model_train_sequence_length"]), benchmark_max_timesteps) if smoke else main_kwargs["world_model_train_sequence_length"],
-        imagination_batch_size = 1 if smoke else main_kwargs["imagination_batch_size"],
-        imagination_horizon = min(int(main_kwargs["imagination_horizon"]), 4) if smoke else main_kwargs["imagination_horizon"],
-        imagination_prompt_length = min(int(main_kwargs["imagination_prompt_length"]), 2),
-        imagination_train_steps = max(2, min(int(main_kwargs["imagination_train_steps"]), 2)),
-        imagination_generate_steps = 2,
-        imagination_use_time_cache = False,
-        pretrain_tokenizer_steps = max(1, min(int(main_kwargs["pretrain_tokenizer_steps"]), 1)) if smoke else main_kwargs["pretrain_tokenizer_steps"],
-        pretrain_tokenizer_observations = max(32, benchmark_num_envs * benchmark_max_timesteps) if smoke else main_kwargs["pretrain_tokenizer_observations"],
-        tokenizer_batch_size = min(int(main_kwargs["tokenizer_batch_size"]), 16) if smoke else main_kwargs["tokenizer_batch_size"],
-        tokenizer_eval_every = 0,
-        use_muon_optimizer = False,
-        use_tensorboard = False,
-        checkpoint_every = 0,
-        checkpoint_path = None,
-        clear_log_dir = True,
-        unique_log_dir = False,
-        benchmark_compile = False,
-        track_compile_performance = True,
-        compile_fullgraph = main_kwargs["compile_fullgraph"],
-        compile_dynamic = False,
-        require_cuda = benchmark_require_cuda,
-        prob_shortcut_train = 1.,
-    )
-
-    results = []
-
-    for name, compile_enabled, compile_mode in (
-        ("eager", False, None),
-        ("compiled_default", True, "default"),
-        ("compiled_reduce_overhead_generated_graphs", True, "reduce-overhead"),
-        ("compiled_max_autotune_generated_graphs", True, "max-autotune"),
-    ):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        reset_torch_compile_state(device)
-
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-
-        run_kwargs = dict(common_kwargs)
-        run_kwargs.update(
-            compile = compile_enabled,
-            compile_world_model = False,
-            compile_generate = False,
-            compile_learn = False,
-            compile_mode = compile_mode,
-            log_dir = str(benchmark_root / name),
-            return_compile_timings = True,
-        )
-
-        print(f"\nbenchmark {name}:")
-        start = perf_counter()
-        timings = main(**run_kwargs)
-        synchronize_if_cuda(device)
-        wall_seconds = perf_counter() - start
-        step_timings = [timing for timing in timings if timing.name in ("world_model_step", "imagination_step")]
-        hot_path_seconds = sum(timing.total_seconds for timing in step_timings)
-        first_call_seconds = sum(timing.first_call_seconds or 0. for timing in step_timings)
-        warm_seconds = sum(timing.warm_seconds for timing in step_timings)
-        warm_calls = sum(timing.warm_calls for timing in step_timings)
-        warm_average_seconds = warm_seconds / warm_calls if warm_calls > 0 else None
-
-        peak_allocated_mib = peak_reserved_mib = None
-        if device.type == "cuda":
-            peak_allocated_mib = torch.cuda.max_memory_allocated(device) / 2 ** 20
-            peak_reserved_mib = torch.cuda.max_memory_reserved(device) / 2 ** 20
-
-        results.append(BenchmarkResult(
-            name = name,
-            wall_seconds = wall_seconds,
-            hot_path_seconds = hot_path_seconds,
-            first_call_seconds = first_call_seconds,
-            warm_seconds = warm_seconds,
-            warm_average_seconds = warm_average_seconds,
-            peak_allocated_mib = peak_allocated_mib,
-            peak_reserved_mib = peak_reserved_mib,
-        ))
-        print(f"benchmark {name} wall time: {wall_seconds:.3f}s")
-        print(f"benchmark {name} measured hot-path time: {hot_path_seconds:.3f}s")
-        print(f"benchmark {name} measured first-call time: {first_call_seconds:.3f}s")
-        if exists(warm_average_seconds):
-            print(f"benchmark {name} measured warm time: {warm_seconds:.3f}s total, {warm_average_seconds:.3f}s avg")
-        if exists(peak_allocated_mib) and exists(peak_reserved_mib):
-            print(f"benchmark {name} peak CUDA memory: {peak_allocated_mib:.1f} MiB allocated, {peak_reserved_mib:.1f} MiB reserved")
-
-    eager = next(result for result in results if result.name == "eager")
-    eager_seconds = eager.wall_seconds
-    eager_hot_path = eager.hot_path_seconds
-    eager_first = eager.first_call_seconds
-    eager_warm = eager.warm_seconds
-    eager_warm_average = eager.warm_average_seconds
-
-    print("\nbenchmark summary:")
-    print(f"  eager warm runtime: {eager_warm:.3f}s total, {eager_warm_average:.3f}s avg")
-    if exists(eager.peak_allocated_mib) and exists(eager.peak_reserved_mib):
-        print(f"  eager peak CUDA memory: {eager.peak_allocated_mib:.1f} MiB allocated, {eager.peak_reserved_mib:.1f} MiB reserved")
-
-    for compiled in (result for result in results if result.name != "eager"):
-        name = compiled.name
-        compiled_seconds = compiled.wall_seconds
-        compiled_hot_path = compiled.hot_path_seconds
-        compiled_first = compiled.first_call_seconds
-        compiled_warm = compiled.warm_seconds
-        compiled_warm_average = compiled.warm_average_seconds
-        warm_speedup = eager_warm / compiled_warm if compiled_warm > 0 else float("inf")
-        compile_overhead = max(compiled_first - eager_first, 0.)
-
-        break_even_calls = None
-        if (
-            exists(eager_warm_average) and
-            exists(compiled_warm_average) and
-            compiled_warm_average < eager_warm_average
-        ):
-            break_even_calls = compile_overhead / (eager_warm_average - compiled_warm_average)
-
-        print(f"\n  {name}:")
-        print(f"    steady-state warm runtime speedup: {warm_speedup:.3f}x")
-        print(f"    compiled warm runtime: {compiled_warm:.3f}s total, {compiled_warm_average:.3f}s avg")
-        print(f"    compiled first-call time: {compiled_first:.3f}s")
-        print(f"    estimated compile overhead vs eager first call: {compile_overhead:.3f}s")
-        if exists(compiled.peak_allocated_mib) and exists(compiled.peak_reserved_mib):
-            print(f"    peak CUDA memory: {compiled.peak_allocated_mib:.1f} MiB allocated, {compiled.peak_reserved_mib:.1f} MiB reserved")
-
-        if exists(break_even_calls):
-            print(f"    estimated break-even warm calls: {break_even_calls:.1f}")
-        else:
-            print("    estimated break-even warm calls: never (compiled warm runtime is not faster)")
-
-        print(f"    total elapsed, including setup and compile: {compiled_seconds:.3f}s")
-        print(f"    measured hot-path elapsed, including compile: {compiled_hot_path:.3f}s")
-
-    print(f"\n  total eager elapsed, including setup: {eager_seconds:.3f}s")
-    print(f"  measured hot-path elapsed, eager: {eager_hot_path:.3f}s")
-
-
 def main(
     env_name = "HalfCheetah-v4",
     num_loops = 500,
@@ -1708,26 +1532,10 @@ def main(
     compile_dynamic: bool | None = None,
     track_compile_performance = False,
     allow_tf32 = True,
-    benchmark_compile = False,
-    benchmark_num_loops = 2,
-    benchmark_num_envs = 1,
-    benchmark_max_timesteps = 8,
-    benchmark_require_cuda = True,
-    benchmark_preset: Literal["smoke", "perf"] = "smoke",
     require_cuda = False,
     return_compile_timings = False,
 ):
     compile_mode = normalize_compile_mode(compile_mode)
-
-    if benchmark_compile:
-        return run_compile_benchmark(
-            locals(),
-            benchmark_num_loops = benchmark_num_loops,
-            benchmark_num_envs = benchmark_num_envs,
-            benchmark_max_timesteps = benchmark_max_timesteps,
-            benchmark_require_cuda = benchmark_require_cuda,
-            benchmark_preset = benchmark_preset,
-        )
 
     torch.manual_seed(seed)
     random.seed(seed)
