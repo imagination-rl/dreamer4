@@ -129,19 +129,24 @@ def normalize_compile_mode(mode: str | None):
     if mode == "default":
         return "default"
 
-    if mode in ("reduce_overhead", "reduce-overhead"):
-        return "reduce_overhead"
+    if mode in ("reduce-overhead", "reduce_overhead"):
+        return "reduce-overhead"
 
-    raise ValueError("compile_mode must be one of None, 'default', or 'reduce_overhead'")
+    if mode in ("max-autotune", "max_autotune"):
+        return "max-autotune"
+
+    raise ValueError("compile_mode must be one of None, 'default', 'reduce-overhead', or 'max-autotune'")
 
 
 def torch_compile_mode(mode: str | None):
-    mode = normalize_compile_mode(mode)
-    return "reduce-overhead" if mode == "reduce_overhead" else mode
+    if mode == "max-autotune-no-cudagraphs":
+        return mode
+
+    return normalize_compile_mode(mode)
 
 
 def compile_mode_uses_cuda_graphs(mode: str | None):
-    return normalize_compile_mode(mode) == "reduce_overhead"
+    return normalize_compile_mode(mode) in ("reduce-overhead", "max-autotune")
 
 
 def cudagraph_mark_step_begin():
@@ -386,7 +391,7 @@ def maybe_compile_and_time(
     if enabled and compile_mode_uses_cuda_graphs(compile_mode) and not compile_cudagraphs:
         # CUDA Graph capture is unsafe for these autograd loss wrappers: AOTAutograd
         # keeps forward intermediates live for backward, and graph replay can overwrite them.
-        effective_compile_mode = "default"
+        effective_compile_mode = "max-autotune-no-cudagraphs" if compile_mode == "max-autotune" else "default"
 
     timing = CallTiming(
         name = name,
@@ -1534,7 +1539,8 @@ def run_compile_benchmark(
     for name, compile_enabled, compile_mode in (
         ("eager", False, None),
         ("compiled_default", True, "default"),
-        ("compiled_reduce_overhead_generated_graphs", True, "reduce_overhead"),
+        ("compiled_reduce_overhead_generated_graphs", True, "reduce-overhead"),
+        ("compiled_max_autotune_generated_graphs", True, "max-autotune"),
     ):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         reset_torch_compile_state(device)
@@ -1697,7 +1703,7 @@ def main(
     compile_generate = False,
     compile_learn = False,
     compile_backend = "inductor",
-    compile_mode: str | None = "reduce_overhead",
+    compile_mode: str | None = "reduce-overhead",
     compile_fullgraph = False,
     compile_dynamic: bool | None = None,
     track_compile_performance = False,
