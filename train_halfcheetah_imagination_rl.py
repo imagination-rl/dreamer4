@@ -285,6 +285,18 @@ class CompileRuntime:
     timings: list[CallTiming]
 
 
+@dataclass
+class BenchmarkResult:
+    name: str
+    wall_seconds: float
+    hot_path_seconds: float
+    first_call_seconds: float
+    warm_seconds: float
+    warm_average_seconds: float | None
+    peak_allocated_mib: float | None
+    peak_reserved_mib: float | None
+
+
 def synchronize_if_cuda(device: torch.device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -1486,7 +1498,7 @@ def run_compile_benchmark(
         unique_log_dir = False,
         benchmark_compile = False,
         track_compile_performance = True,
-        compile_fullgraph = True,
+        compile_fullgraph = main_kwargs["compile_fullgraph"],
         compile_dynamic = False,
         require_cuda = benchmark_require_cuda,
         prob_shortcut_train = 1.,
@@ -1498,8 +1510,13 @@ def run_compile_benchmark(
         ("eager", False, None),
         ("compiled_default", True, "default"),
         ("compiled_reduce_overhead_generate_graphs", True, "reduce-overhead"),
+        ("compiled_max_autotune_generate_graphs", True, "max-autotune"),
     ):
-        reset_torch_compile_state(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        reset_torch_compile_state(device)
+
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         run_kwargs = dict(common_kwargs)
         run_kwargs.update(
@@ -1515,6 +1532,7 @@ def run_compile_benchmark(
         print(f"\nbenchmark {name}:")
         start = perf_counter()
         timings = main(**run_kwargs)
+        synchronize_if_cuda(device)
         wall_seconds = perf_counter() - start
         step_timings = [timing for timing in timings if timing.name in ("world_model_step", "imagination_step")]
         hot_path_seconds = sum(timing.total_seconds for timing in step_timings)
@@ -1523,21 +1541,48 @@ def run_compile_benchmark(
         warm_calls = sum(timing.warm_calls for timing in step_timings)
         warm_average_seconds = warm_seconds / warm_calls if warm_calls > 0 else None
 
-        results.append((name, wall_seconds, hot_path_seconds, first_call_seconds, warm_seconds, warm_average_seconds))
+        peak_allocated_mib = peak_reserved_mib = None
+        if device.type == "cuda":
+            peak_allocated_mib = torch.cuda.max_memory_allocated(device) / 2 ** 20
+            peak_reserved_mib = torch.cuda.max_memory_reserved(device) / 2 ** 20
+
+        results.append(BenchmarkResult(
+            name = name,
+            wall_seconds = wall_seconds,
+            hot_path_seconds = hot_path_seconds,
+            first_call_seconds = first_call_seconds,
+            warm_seconds = warm_seconds,
+            warm_average_seconds = warm_average_seconds,
+            peak_allocated_mib = peak_allocated_mib,
+            peak_reserved_mib = peak_reserved_mib,
+        ))
         print(f"benchmark {name} wall time: {wall_seconds:.3f}s")
         print(f"benchmark {name} measured hot-path time: {hot_path_seconds:.3f}s")
         print(f"benchmark {name} measured first-call time: {first_call_seconds:.3f}s")
         if exists(warm_average_seconds):
             print(f"benchmark {name} measured warm time: {warm_seconds:.3f}s total, {warm_average_seconds:.3f}s avg")
+        if exists(peak_allocated_mib) and exists(peak_reserved_mib):
+            print(f"benchmark {name} peak CUDA memory: {peak_allocated_mib:.1f} MiB allocated, {peak_reserved_mib:.1f} MiB reserved")
 
-    eager = next(result for result in results if result[0] == "eager")
-    _, eager_seconds, eager_hot_path, eager_first, eager_warm, eager_warm_average = eager
+    eager = next(result for result in results if result.name == "eager")
+    eager_seconds = eager.wall_seconds
+    eager_hot_path = eager.hot_path_seconds
+    eager_first = eager.first_call_seconds
+    eager_warm = eager.warm_seconds
+    eager_warm_average = eager.warm_average_seconds
 
     print("\nbenchmark summary:")
     print(f"  eager warm runtime: {eager_warm:.3f}s total, {eager_warm_average:.3f}s avg")
+    if exists(eager.peak_allocated_mib) and exists(eager.peak_reserved_mib):
+        print(f"  eager peak CUDA memory: {eager.peak_allocated_mib:.1f} MiB allocated, {eager.peak_reserved_mib:.1f} MiB reserved")
 
-    for compiled in (result for result in results if result[0] != "eager"):
-        name, compiled_seconds, compiled_hot_path, compiled_first, compiled_warm, compiled_warm_average = compiled
+    for compiled in (result for result in results if result.name != "eager"):
+        name = compiled.name
+        compiled_seconds = compiled.wall_seconds
+        compiled_hot_path = compiled.hot_path_seconds
+        compiled_first = compiled.first_call_seconds
+        compiled_warm = compiled.warm_seconds
+        compiled_warm_average = compiled.warm_average_seconds
         warm_speedup = eager_warm / compiled_warm if compiled_warm > 0 else float("inf")
         compile_overhead = max(compiled_first - eager_first, 0.)
 
@@ -1554,6 +1599,8 @@ def run_compile_benchmark(
         print(f"    compiled warm runtime: {compiled_warm:.3f}s total, {compiled_warm_average:.3f}s avg")
         print(f"    compiled first-call time: {compiled_first:.3f}s")
         print(f"    estimated compile overhead vs eager first call: {compile_overhead:.3f}s")
+        if exists(compiled.peak_allocated_mib) and exists(compiled.peak_reserved_mib):
+            print(f"    peak CUDA memory: {compiled.peak_allocated_mib:.1f} MiB allocated, {compiled.peak_reserved_mib:.1f} MiB reserved")
 
         if exists(break_even_calls):
             print(f"    estimated break-even warm calls: {break_even_calls:.1f}")
