@@ -78,27 +78,14 @@ def benchmark_common_kwargs(
 
     smoke = benchmark_preset == "smoke"
 
-    common_kwargs.update(
+    benchmark_kwargs = dict(
         num_loops = benchmark_num_loops,
         rollouts_per_loop = 1,
         num_envs = benchmark_num_envs,
         max_timesteps = benchmark_max_timesteps,
         replay_size = 4,
-        model_dim = min(int(common_kwargs["model_dim"]), 32) if smoke else common_kwargs["model_dim"],
-        depth = min(int(common_kwargs["depth"]), 1) if smoke else common_kwargs["depth"],
         time_block_every = 1,
-        world_model_batch_size = 1 if smoke else common_kwargs["world_model_batch_size"],
-        world_model_train_steps = max(2, min(int(common_kwargs["world_model_train_steps"]), 2)),
-        world_model_train_sequence_length = min(int(common_kwargs["world_model_train_sequence_length"]), benchmark_max_timesteps) if smoke else common_kwargs["world_model_train_sequence_length"],
-        imagination_batch_size = 1 if smoke else common_kwargs["imagination_batch_size"],
-        imagination_horizon = min(int(common_kwargs["imagination_horizon"]), 4) if smoke else common_kwargs["imagination_horizon"],
-        imagination_prompt_length = min(int(common_kwargs["imagination_prompt_length"]), 2),
-        imagination_train_steps = max(2, min(int(common_kwargs["imagination_train_steps"]), 2)),
-        imagination_generate_steps = 2,
         imagination_use_time_cache = False,
-        pretrain_tokenizer_steps = max(1, min(int(common_kwargs["pretrain_tokenizer_steps"]), 1)) if smoke else common_kwargs["pretrain_tokenizer_steps"],
-        pretrain_tokenizer_observations = max(32, benchmark_num_envs * benchmark_max_timesteps) if smoke else common_kwargs["pretrain_tokenizer_observations"],
-        tokenizer_batch_size = min(int(common_kwargs["tokenizer_batch_size"]), 16) if smoke else common_kwargs["tokenizer_batch_size"],
         tokenizer_eval_every = 0,
         use_muon_optimizer = False,
         use_tensorboard = False,
@@ -111,6 +98,25 @@ def benchmark_common_kwargs(
         require_cuda = benchmark_require_cuda,
         prob_shortcut_train = 1.,
     )
+
+    if smoke:
+        benchmark_kwargs.update(
+            model_dim = min(int(common_kwargs["model_dim"]), 32),
+            depth = min(int(common_kwargs["depth"]), 1),
+            world_model_batch_size = 1,
+            world_model_train_steps = max(2, min(int(common_kwargs["world_model_train_steps"]), 2)),
+            world_model_train_sequence_length = min(int(common_kwargs["world_model_train_sequence_length"]), benchmark_max_timesteps),
+            imagination_batch_size = 1,
+            imagination_horizon = min(int(common_kwargs["imagination_horizon"]), 4),
+            imagination_prompt_length = min(int(common_kwargs["imagination_prompt_length"]), 2),
+            imagination_train_steps = max(2, min(int(common_kwargs["imagination_train_steps"]), 2)),
+            imagination_generate_steps = 2,
+            pretrain_tokenizer_steps = max(1, min(int(common_kwargs["pretrain_tokenizer_steps"]), 1)),
+            pretrain_tokenizer_observations = max(32, benchmark_num_envs * benchmark_max_timesteps),
+            tokenizer_batch_size = min(int(common_kwargs["tokenizer_batch_size"]), 16),
+        )
+
+    common_kwargs.update(benchmark_kwargs)
 
     return common_kwargs
 
