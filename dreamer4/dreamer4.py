@@ -5820,6 +5820,10 @@ class DynamicsWorldModel(Module):
         assert self.discrete_action_loss_weight.numel() in {1, multi_token_pred_len}
         assert self.continuous_action_loss_weight.numel() in {1, multi_token_pred_len}
 
+        # computed once as a python bool so the loss-gating branch stays compile-friendly
+
+        self.has_action_loss_weight = (self.discrete_action_loss_weight.sum() + self.continuous_action_loss_weight.sum()).item() > 0
+
         self.register_buffer('zero', tensor(0.), persistent = False)
 
     @property
@@ -8354,6 +8358,7 @@ class DynamicsWorldModel(Module):
         continuous_action_loss = self.zero
 
         if (
+            self.has_action_loss_weight and
             self.num_agents == 1 and
             add_autoregressive_action_loss and
             time > 1 and
