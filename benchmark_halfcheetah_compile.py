@@ -43,9 +43,12 @@ class BenchmarkResult:
     name: str
     wall_seconds: float
     hot_path_seconds: float
-    first_call_seconds: float
+    cold_seconds: float
     warm_seconds: float
     warm_average_seconds: float | None
+    # sum of per-timing warm averages - warm cost of one world-model step plus one
+    # imagination step, comparable across arms even when warmup call counts differ
+    warm_step_seconds: float | None
     peak_allocated_mib: float | None
     peak_reserved_mib: float | None
 
@@ -75,7 +78,7 @@ def benchmark_common_kwargs(
 
     smoke = benchmark_preset == "smoke"
 
-    benchmark_kwargs = dict(
+    pinned_kwargs = dict(
         num_loops = benchmark_num_loops,
         rollouts_per_loop = 1,
         num_envs = benchmark_num_envs,
@@ -96,13 +99,32 @@ def benchmark_common_kwargs(
         prob_shortcut_train = 1.,
     )
 
+    conflicting = sorted(
+        key
+        for key in pinned_kwargs.keys() & train_kwargs.keys()
+        if train_kwargs[key] != pinned_kwargs[key]
+    )
+
+    if conflicting:
+        raise ValueError(
+            f"these kwargs are pinned by the benchmark and cannot be overridden: {conflicting} "
+            "(use the benchmark_* flags where available)"
+        )
+
+    benchmark_kwargs = dict(pinned_kwargs)
+
+    # rollouts only ever produce max_timesteps frames, so longer train windows are pure padding
+
+    benchmark_kwargs.update(
+        world_model_train_sequence_length = min(int(common_kwargs["world_model_train_sequence_length"]), benchmark_max_timesteps),
+    )
+
     if smoke:
         benchmark_kwargs.update(
             model_dim = min(int(common_kwargs["model_dim"]), 32),
             depth = min(int(common_kwargs["depth"]), 1),
             world_model_batch_size = 1,
             world_model_train_steps = max(2, min(int(common_kwargs["world_model_train_steps"]), 2)),
-            world_model_train_sequence_length = min(int(common_kwargs["world_model_train_sequence_length"]), benchmark_max_timesteps),
             imagination_batch_size = 1,
             imagination_horizon = min(int(common_kwargs["imagination_horizon"]), 4),
             imagination_prompt_length = min(int(common_kwargs["imagination_prompt_length"]), 2),
@@ -111,6 +133,24 @@ def benchmark_common_kwargs(
             pretrain_tokenizer_steps = max(1, min(int(common_kwargs["pretrain_tokenizer_steps"]), 1)),
             pretrain_tokenizer_observations = max(32, benchmark_num_envs * benchmark_max_timesteps),
             tokenizer_batch_size = min(int(common_kwargs["tokenizer_batch_size"]), 16),
+        )
+    else:
+        # the replay grows loop by loop, so batches larger than one rollout's episode count
+        # change shape across loops and force compiled arms to recompile mid-run
+
+        max_static_batch = max(benchmark_num_envs, 1)
+        world_model_batch_size = int(common_kwargs["world_model_batch_size"])
+        imagination_batch_size = int(common_kwargs["imagination_batch_size"])
+
+        if max(world_model_batch_size, imagination_batch_size) > max_static_batch:
+            print(
+                f"benchmark: clamping batch sizes to {max_static_batch} to keep compiled shapes "
+                "static across loops (raise --benchmark_num_envs for larger batches)"
+            )
+
+        benchmark_kwargs.update(
+            world_model_batch_size = min(world_model_batch_size, max_static_batch),
+            imagination_batch_size = min(imagination_batch_size, max_static_batch),
         )
 
     common_kwargs.update(benchmark_kwargs)
@@ -156,10 +196,14 @@ def run_benchmark_arm(
     ]
 
     hot_path_seconds = sum(timing.total_seconds for timing in step_timings)
-    first_call_seconds = sum(timing.first_call_seconds or 0. for timing in step_timings)
+    cold_seconds = sum(timing.cold_seconds for timing in step_timings)
     warm_seconds = sum(timing.warm_seconds for timing in step_timings)
     warm_calls = sum(timing.warm_calls for timing in step_timings)
     warm_average_seconds = warm_seconds / warm_calls if warm_calls > 0 else None
+
+    warm_step_seconds = None
+    if len(step_timings) > 0 and all(exists(timing.warm_average_seconds) for timing in step_timings):
+        warm_step_seconds = sum(timing.warm_average_seconds for timing in step_timings)
 
     peak_allocated_mib = peak_reserved_mib = None
     if device.type == "cuda":
@@ -170,19 +214,23 @@ def run_benchmark_arm(
         name = name,
         wall_seconds = wall_seconds,
         hot_path_seconds = hot_path_seconds,
-        first_call_seconds = first_call_seconds,
+        cold_seconds = cold_seconds,
         warm_seconds = warm_seconds,
         warm_average_seconds = warm_average_seconds,
+        warm_step_seconds = warm_step_seconds,
         peak_allocated_mib = peak_allocated_mib,
         peak_reserved_mib = peak_reserved_mib,
     )
 
     print(f"benchmark {name} wall time: {wall_seconds:.3f}s")
     print(f"benchmark {name} measured hot-path time: {hot_path_seconds:.3f}s")
-    print(f"benchmark {name} measured first-call time: {first_call_seconds:.3f}s")
+    print(f"benchmark {name} measured cold time (compile/capture warmup): {cold_seconds:.3f}s")
 
     if exists(warm_average_seconds):
         print(f"benchmark {name} measured warm time: {warm_seconds:.3f}s total, {warm_average_seconds:.3f}s avg")
+
+    if exists(warm_step_seconds):
+        print(f"benchmark {name} warm per-step time (world model + imagination): {warm_step_seconds:.3f}s")
 
     if exists(peak_allocated_mib) and exists(peak_reserved_mib):
         print(f"benchmark {name} peak CUDA memory: {peak_allocated_mib:.1f} MiB allocated, {peak_reserved_mib:.1f} MiB reserved")
@@ -192,42 +240,45 @@ def run_benchmark_arm(
 
 def print_benchmark_summary(results: list[BenchmarkResult]):
     eager = next(result for result in results if result.name == "eager")
-    eager_warm_average = eager.warm_average_seconds
+    eager_warm_step = eager.warm_step_seconds
 
     print("\nbenchmark summary:")
-    eager_warm_average_text = f"{eager_warm_average:.3f}s" if exists(eager_warm_average) else "n/a"
-    print(f"  eager warm runtime: {eager.warm_seconds:.3f}s total, {eager_warm_average_text} avg")
+    eager_warm_step_text = f"{eager_warm_step:.3f}s" if exists(eager_warm_step) else "n/a"
+    print(f"  eager warm runtime: {eager.warm_seconds:.3f}s total, {eager_warm_step_text} per step")
 
     if exists(eager.peak_allocated_mib) and exists(eager.peak_reserved_mib):
         print(f"  eager peak CUDA memory: {eager.peak_allocated_mib:.1f} MiB allocated, {eager.peak_reserved_mib:.1f} MiB reserved")
 
     for compiled in (result for result in results if result.name != "eager"):
-        warm_speedup = eager.warm_seconds / compiled.warm_seconds if compiled.warm_seconds > 0 else None
-        compile_overhead = max(compiled.first_call_seconds - eager.first_call_seconds, 0.)
+        warm_speedup = None
+        if exists(eager_warm_step) and exists(compiled.warm_step_seconds) and compiled.warm_step_seconds > 0:
+            warm_speedup = eager_warm_step / compiled.warm_step_seconds
 
-        break_even_calls = None
+        compile_overhead = max(compiled.cold_seconds - eager.cold_seconds, 0.)
+
+        break_even_steps = None
         if (
-            exists(eager_warm_average) and
-            exists(compiled.warm_average_seconds) and
-            compiled.warm_average_seconds < eager_warm_average
+            exists(eager_warm_step) and
+            exists(compiled.warm_step_seconds) and
+            compiled.warm_step_seconds < eager_warm_step
         ):
-            break_even_calls = compile_overhead / (eager_warm_average - compiled.warm_average_seconds)
+            break_even_steps = compile_overhead / (eager_warm_step - compiled.warm_step_seconds)
 
         print(f"\n  {compiled.name}:")
         warm_speedup_text = f"{warm_speedup:.3f}x" if exists(warm_speedup) else "n/a"
-        print(f"    steady-state warm runtime speedup: {warm_speedup_text}")
-        compiled_warm_average_text = f"{compiled.warm_average_seconds:.3f}s" if exists(compiled.warm_average_seconds) else "n/a"
-        print(f"    compiled warm runtime: {compiled.warm_seconds:.3f}s total, {compiled_warm_average_text} avg")
-        print(f"    compiled first-call time: {compiled.first_call_seconds:.3f}s")
-        print(f"    estimated compile overhead vs eager first call: {compile_overhead:.3f}s")
+        print(f"    steady-state warm per-step speedup: {warm_speedup_text}")
+        compiled_warm_step_text = f"{compiled.warm_step_seconds:.3f}s" if exists(compiled.warm_step_seconds) else "n/a"
+        print(f"    compiled warm runtime: {compiled.warm_seconds:.3f}s total, {compiled_warm_step_text} per step")
+        print(f"    compiled cold time (compile/capture warmup): {compiled.cold_seconds:.3f}s")
+        print(f"    estimated compile overhead vs eager cold calls: {compile_overhead:.3f}s")
 
         if exists(compiled.peak_allocated_mib) and exists(compiled.peak_reserved_mib):
             print(f"    peak CUDA memory: {compiled.peak_allocated_mib:.1f} MiB allocated, {compiled.peak_reserved_mib:.1f} MiB reserved")
 
-        if exists(break_even_calls):
-            print(f"    estimated break-even warm calls: {break_even_calls:.1f}")
+        if exists(break_even_steps):
+            print(f"    estimated break-even warm steps: {break_even_steps:.1f}")
         else:
-            print("    estimated break-even warm calls: never (compiled warm runtime is not faster)")
+            print("    estimated break-even warm steps: never (compiled warm runtime is not faster)")
 
         print(f"    total elapsed, including setup and compile: {compiled.wall_seconds:.3f}s")
         print(f"    measured hot-path elapsed, including compile: {compiled.hot_path_seconds:.3f}s")
