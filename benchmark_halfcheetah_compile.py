@@ -25,12 +25,9 @@ from typing import Literal
 import fire
 import torch
 
-from train_halfcheetah_imagination_rl import (
-    exists,
-    main as train_halfcheetah,
-    reset_torch_compile_state,
-    synchronize_if_cuda,
-)
+from compile_runtime import reset_torch_compile_state, synchronize_if_cuda
+from dreamer4.dreamer4 import exists
+from train_halfcheetah_imagination_rl import main as train_halfcheetah
 
 
 BENCHMARK_ARMS = (
