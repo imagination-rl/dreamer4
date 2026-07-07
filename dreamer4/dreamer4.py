@@ -366,18 +366,25 @@ def identity(t, *args, **kwargs):
 def detach(t):
     return t.detach()
 
-def masked_mean(t: Tensor, mask: Tensor, dim = None):
+def masked_mean(t: Tensor, mask: Tensor | None = None, dim = None, eps = 1e-5, keepdim = False):
+    dim_kwargs = dict(dim = dim, keepdim = keepdim)
+
+    if not exists(mask):
+        return t.mean(**dim_kwargs) if exists(dim) else t.mean()
+
     while mask.ndim < t.ndim:
         mask = mask[..., None]
 
-    mask_float = mask.to(t.dtype)
+    mask = mask.bool()
+    count_dtype = t.real.dtype if t.is_complex() else t.dtype
+    expanded_mask = mask.expand_as(t)
+    mask_float = expanded_mask.to(count_dtype)
     masked = t.masked_fill(~mask, 0.)
 
     if exists(dim):
-        return masked.sum(dim = dim) / mask_float.sum(dim = dim).clamp(min = 1.)
+        return masked.sum(**dim_kwargs) / mask_float.sum(**dim_kwargs).clamp(min = eps)
 
-    expanded_mask = mask.expand_as(t)
-    return masked.sum() / expanded_mask.sum().clamp(min = 1.).to(t.dtype)
+    return masked.sum() / mask_float.sum().clamp(min = eps)
 
 def first(arr):
     return arr[0]
