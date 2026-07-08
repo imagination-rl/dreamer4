@@ -52,6 +52,7 @@ from dreamer4.dreamer4 import (
     Actions,
     DynamicsWorldModel,
     Experience,
+    ShortcutTrainMode,
     StateTokenizer,
     divisible_by,
     exists,
@@ -743,6 +744,8 @@ def train_world_model(
     max_grad_norm: float,
     global_step: int,
     writer: SummaryWriter | None,
+    shortcut_train_mode: ShortcutTrainMode,
+    desc: str,
 ):
     if len(replay) == 0 or steps <= 0:
         return global_step, {}
@@ -765,7 +768,7 @@ def train_world_model(
 
     dataloader_iter = cycle(dataloader) if len(dataloader) > 0 else None
 
-    pbar = tqdm(range(steps), desc="world model", dynamic_ncols=True)
+    pbar = tqdm(range(steps), desc = desc, dynamic_ncols = True)
 
     for step in pbar:
         if exists(world_model_step_timing):
@@ -792,6 +795,7 @@ def train_world_model(
                 exp.terminals,
                 exp.actions.continuous if exists(exp.actions) else None,
                 exp.lens,
+                shortcut_train_mode,
             )
 
             loss.backward()
@@ -1100,6 +1104,8 @@ def main(
     final_special_cross_attn: bool,
     reward_encoder_type: Literal["symexp_two_hot", "hl_gauss"],
     prob_shortcut_train: float | None,
+    pretrain_world_model_finetune_steps: int,
+    pretrain_world_model_combined_steps: int,
     policy_all_tokens: bool,
     world_model_batch_size: int,
     world_model_train_steps: int,
@@ -1344,6 +1350,7 @@ def main(
     wm_step = 0
     imagination_step = 0
     env_step = 0
+    did_world_model_pretrain = start_loop > 0
 
     print(f"training {env_name} from {obs_dim} raw observations on {device}")
     print(f"tensorboard log dir: {run_log_dir.absolute()}" if use_tensorboard else "tensorboard disabled")
@@ -1462,6 +1469,44 @@ def main(
                 },
                 loop,
             )
+
+        if not did_world_model_pretrain:
+            wm_step, _ = train_world_model(
+                world_model,
+                world_optimizer,
+                replay,
+                world_model_loss_fn = compile_runtime.world_model_loss,
+                world_model_loss_timing = compile_runtime.world_model_loss_timing,
+                world_model_step_timing = compile_runtime.world_model_step_timing,
+                steps = pretrain_world_model_finetune_steps,
+                batch_size = world_model_batch_size,
+                sequence_length = world_model_train_sequence_length,
+                max_grad_norm = max_grad_norm,
+                global_step = wm_step,
+                writer = writer,
+                shortcut_train_mode = "finetune",
+                desc = "world model pretrain finetune",
+            )
+
+            wm_step, _ = train_world_model(
+                world_model,
+                world_optimizer,
+                replay,
+                world_model_loss_fn = compile_runtime.world_model_loss,
+                world_model_loss_timing = compile_runtime.world_model_loss_timing,
+                world_model_step_timing = compile_runtime.world_model_step_timing,
+                steps = pretrain_world_model_combined_steps,
+                batch_size = world_model_batch_size,
+                sequence_length = world_model_train_sequence_length,
+                max_grad_norm = max_grad_norm,
+                global_step = wm_step,
+                writer = writer,
+                shortcut_train_mode = "combined",
+                desc = "world model pretrain combined",
+            )
+
+            did_world_model_pretrain = True
+
         wm_step, wm_metrics = train_world_model(
             world_model,
             world_optimizer,
@@ -1475,6 +1520,8 @@ def main(
             max_grad_norm = max_grad_norm,
             global_step = wm_step,
             writer = writer,
+            shortcut_train_mode = "combined",
+            desc = "world model",
         )
 
         world_model.train()

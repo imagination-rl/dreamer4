@@ -36,6 +36,8 @@ replay_size: 256
 
 # World model training
 world_model_batch_size: 32
+pretrain_world_model_finetune_steps: 64
+pretrain_world_model_combined_steps: 256
 world_model_train_steps: 13
 world_model_train_sequence_length: 200
 world_model_learning_rate: 0.0003

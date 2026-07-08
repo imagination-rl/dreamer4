@@ -27,14 +27,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 GYM_LOG_ROOT = Path("runs/gym_imagination")
 
-# Edit this list in-place to define your ablations.
-#
-# Example:
-# ABLATIONS = [
-#     {"run_name": "depth8", "run_details": "Depth-8 ablation", "depth": 8},
-#     {"run_name": "wider_deeper", "run_details": "Wider/deeper ablation", "model_dim": 256, "depth": 4},
-# ]
-ABLATIONS: list[dict[str, Any]] = []
+ABLATIONS = [
+    {"run_name": "baseline", "run_details": "baseline, with the symexp changes and new script"},
+]
+
 
 RUN_PARALLEL = False
 MAX_PARALLEL_WORKERS: int | None = None

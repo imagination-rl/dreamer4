@@ -14,6 +14,7 @@ from dreamer4.dreamer4 import (
     Actions,
     DynamicsWorldModel,
     Experience,
+    ShortcutTrainMode,
     exists,
 )
 
@@ -148,6 +149,7 @@ class WorldModelTrainingLoss(nn.Module):
         terminals: Tensor | None,
         continuous_actions: Tensor | None,
         lens: Tensor | None,
+        shortcut_train_mode: ShortcutTrainMode = "combined",
     ):
         return self.world_model(
             latents = latents,
@@ -158,6 +160,7 @@ class WorldModelTrainingLoss(nn.Module):
             latent_has_view_dim = latents.ndim == 5,
             return_all_losses = True,
             update_loss_ema = True,
+            shortcut_train_mode = shortcut_train_mode,
         )
 
 
