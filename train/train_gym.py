@@ -327,9 +327,10 @@ def make_optimizer(
     muon_params = (),
 ):
     params = list(dict.fromkeys(params))
+    fused = len(params) > 0 and all(param.is_cuda for param in params)
 
     if not use_muon:
-        return AdamW(params, lr = lr, weight_decay = weight_decay)
+        return AdamW(params, lr = lr, weight_decay = weight_decay, fused = fused)
 
     optimizer_param_set = set(params)
     muon_params = [
@@ -338,7 +339,7 @@ def make_optimizer(
     ]
 
     if len(muon_params) == 0:
-        return AdamW(params, lr = lr, weight_decay = weight_decay)
+        return AdamW(params, lr = lr, weight_decay = weight_decay, fused = fused)
 
     return MuonAdamAtan2(
         muon_params = muon_params,
@@ -669,7 +670,7 @@ def train_tokenizer(
 
     dataset = TensorDataset(observations)
     dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = len(dataset) >= batch_size)
-    optimizer = AdamW(tokenizer.parameters(), lr = learning_rate)
+    optimizer = AdamW(tokenizer.parameters(), lr = learning_rate, fused = device.type == "cuda")
     iterator = cycle(dataloader) if len(dataloader) > 0 else None
 
     last_loss = None
