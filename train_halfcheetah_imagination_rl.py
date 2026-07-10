@@ -1002,38 +1002,24 @@ def save_checkpoint(
 
 
 def load_optimizer_state_if_compatible(optimizer: Optimizer, state_dict, name: str):
-    state_backup = {
-        param: dict(state)
-        for param, state in optimizer.state.items()
-    }
-    param_groups_backup = []
-
-    for group in optimizer.param_groups:
-        group_backup = dict(group)
-        group_backup["params"] = list(group["params"])
-        param_groups_backup.append(group_backup)
+    # load_state_dict swaps in freshly built state rather than mutating existing tensors,
+    # so the backup stays valid for restoring after a failed or rejected load
+    backup = optimizer.state_dict()
 
     try:
         optimizer.load_state_dict(state_dict)
 
         for group in optimizer.param_groups:
             for param in group["params"]:
-                state = optimizer.state.get(param, {})
-
-                for state_name, value in state.items():
-                    if not torch.is_tensor(value) or value.ndim == 0:
-                        continue
-
-                    if value.shape != param.shape:
+                for state_name, value in optimizer.state.get(param, {}).items():
+                    if torch.is_tensor(value) and value.ndim > 0 and value.shape != param.shape:
                         raise ValueError(
                             f"{state_name} has shape {tuple(value.shape)} for parameter shape {tuple(param.shape)}"
                         )
 
         return True
     except (KeyError, RuntimeError, ValueError) as exc:
-        optimizer.state.clear()
-        optimizer.state.update(state_backup)
-        optimizer.param_groups[:] = param_groups_backup
+        optimizer.load_state_dict(backup)
         print(f"skipping {name} optimizer state: {exc}")
         return False
 
