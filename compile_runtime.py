@@ -170,12 +170,14 @@ class ImaginationGenerateRollout(nn.Module):
         generate_steps: int,
         store_old_action_unembeds: bool,
         use_time_cache: bool,
+        preallocate_outputs: bool,
     ):
         super().__init__()
         self.world_model = world_model
         self.generate_steps = generate_steps
         self.store_old_action_unembeds = store_old_action_unembeds
         self.use_time_cache = use_time_cache
+        self.preallocate_outputs = preallocate_outputs
 
     def forward(
         self,
@@ -199,6 +201,7 @@ class ImaginationGenerateRollout(nn.Module):
             use_time_cache = self.use_time_cache,
             store_agent_embed = True,
             store_old_action_unembeds = self.store_old_action_unembeds,
+            preallocate_outputs = self.preallocate_outputs,
             prompt_latents = prompt_latents,
             prompt_proprio = prompt_proprio,
             prompt_discrete_actions = prompt_discrete_actions,
@@ -350,8 +353,8 @@ def maybe_compile_and_time(
     effective_compile_mode = compile_mode
 
     if enabled and compile_mode_uses_cuda_graphs(compile_mode) and not compile_cudagraphs:
-        # CUDA Graph capture is unsafe for these autograd loss wrappers: AOTAutograd
-        # keeps forward intermediates live for backward, and graph replay can overwrite them.
+        # AOTAutograd keeps forward intermediates live for backward, and CUDA
+        # Graph replay can overwrite them before compiled loss wrappers finish.
         effective_compile_mode = "max-autotune-no-cudagraphs" if compile_mode == "max-autotune" else "default"
 
     timing = CallTiming(
@@ -391,6 +394,7 @@ def build_compile_runtime(
     compile_mode: str | None,
     compile_fullgraph: bool,
     compile_dynamic: bool | None,
+    compile_generate_cudagraphs: bool,
     track_compile_performance: bool,
     imagination_generate_steps: int,
     imagination_use_time_cache: bool,
@@ -416,13 +420,16 @@ def build_compile_runtime(
     world_model_loss_timing = timing if track_compile_performance else None
     timings.append(timing)
 
+    generate_rollout_module = ImaginationGenerateRollout(
+        world_model,
+        generate_steps = imagination_generate_steps,
+        store_old_action_unembeds = store_old_action_unembeds,
+        use_time_cache = imagination_use_time_cache,
+        preallocate_outputs = compile_generate,
+    )
+
     generate_rollout, timing = maybe_compile_and_time(
-        ImaginationGenerateRollout(
-            world_model,
-            generate_steps = imagination_generate_steps,
-            store_old_action_unembeds = store_old_action_unembeds,
-            use_time_cache = imagination_use_time_cache,
-        ),
+        generate_rollout_module,
         name = "imagination_generate",
         enabled = compile_generate,
         track_timing = track_compile_performance,
@@ -431,7 +438,7 @@ def build_compile_runtime(
         compile_mode = compile_mode,
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = compile_dynamic,
-        compile_cudagraphs = True,
+        compile_cudagraphs = compile_generate_cudagraphs,
     )
     generate_rollout_timing = timing if track_compile_performance else None
     generate_uses_cuda_graphs = timing.cuda_graphs

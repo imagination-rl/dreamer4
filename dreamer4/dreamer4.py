@@ -7014,6 +7014,7 @@ class DynamicsWorldModel(Module):
         return_time_cache = False,
         store_agent_embed = True,
         store_old_action_unembeds = True,
+        preallocate_outputs = False,
         prompt: Tensor | None = None,           # (b c t h w) or (b c h w)
         prompt_audio: Tensor | None = None,     # (b c t samples) or (b c samples)
         prompt_state: Tensor | None = None,     # (b t d) or (b d)
@@ -7130,6 +7131,29 @@ class DynamicsWorldModel(Module):
         # prompt related variables
 
         prompt_time = latents.shape[1]
+        use_preallocated_outputs = (
+            preallocate_outputs and
+            time_steps > prompt_time and
+            not (return_terminals and self.predict_terminals)
+        )
+        generated_time = max(time_steps - prompt_time, 0)
+
+        # when preallocating, every accumulator becomes a growing view over a full (b, time_steps, ...) buffer,
+        # so appends are in-place writes and output shapes stay static for compiled generation
+
+        def preallocate_sequence(values):
+            buffer = empty((batch_size, time_steps, *values.shape[2:]), device = self.device, dtype = values.dtype)
+            buffer[:, :prompt_time] = values
+            return buffer, buffer[:, :prompt_time]
+
+        preallocated_latents = preallocated_latents_context_noise = None
+        preallocated_proprio = preallocated_proprio_context_noise = None
+        preallocated_rewards = None
+        preallocated_discrete_actions = preallocated_continuous_actions = None
+
+        if use_preallocated_outputs:
+            preallocated_latents, latents = preallocate_sequence(latents)
+            preallocated_latents_context_noise, past_latents_context_noise = preallocate_sequence(past_latents_context_noise)
 
         # proprio
 
@@ -7140,6 +7164,10 @@ class DynamicsWorldModel(Module):
                 proprio = zeros((batch_size, prompt_time, self.dim_proprio), device = self.device)
 
             past_proprio_context_noise = proprio.clone()
+
+            if use_preallocated_outputs:
+                preallocated_proprio, proprio = preallocate_sequence(proprio)
+                preallocated_proprio_context_noise, past_proprio_context_noise = preallocate_sequence(past_proprio_context_noise)
 
         # actions
 
@@ -7152,15 +7180,34 @@ class DynamicsWorldModel(Module):
             num_discrete = self.action_embedder.num_discrete_action_types
             num_continuous = self.action_embedder.num_continuous_action_types
 
-            if exists(decoded_discrete_actions):
-                decoded_discrete_actions = decoded_discrete_actions.clone()
-            elif num_discrete > 0:
-                decoded_discrete_actions = zeros((batch_size, prompt_time, num_discrete), device = self.device, dtype = torch.long)
+            if use_preallocated_outputs:
+                def preallocate_actions(prompt_actions, num_actions, dtype):
+                    if num_actions == 0:
+                        return None, None
 
-            if exists(decoded_continuous_actions):
-                decoded_continuous_actions = decoded_continuous_actions.clone()
-            elif num_continuous > 0:
-                decoded_continuous_actions = zeros((batch_size, prompt_time, num_continuous), device = self.device, dtype = torch.float)
+                    buffer = zeros((batch_size, time_steps, num_actions), device = self.device, dtype = dtype)
+                    action_time = prompt_time
+
+                    if exists(prompt_actions):
+                        action_time = min(prompt_actions.shape[1], prompt_time)
+                        buffer[:, :action_time] = prompt_actions[:, :action_time]
+
+                    return buffer, buffer[:, :action_time]
+
+                continuous_dtype = prompt_continuous_actions.dtype if exists(prompt_continuous_actions) else torch.float
+
+                preallocated_discrete_actions, decoded_discrete_actions = preallocate_actions(prompt_discrete_actions, num_discrete, torch.long)
+                preallocated_continuous_actions, decoded_continuous_actions = preallocate_actions(prompt_continuous_actions, num_continuous, continuous_dtype)
+            else:
+                if exists(decoded_discrete_actions):
+                    decoded_discrete_actions = decoded_discrete_actions.clone()
+                elif num_discrete > 0:
+                    decoded_discrete_actions = zeros((batch_size, prompt_time, num_discrete), device = self.device, dtype = torch.long)
+
+                if exists(decoded_continuous_actions):
+                    decoded_continuous_actions = decoded_continuous_actions.clone()
+                elif num_continuous > 0:
+                    decoded_continuous_actions = zeros((batch_size, prompt_time, num_continuous), device = self.device, dtype = torch.float)
 
         # policy optimization related
 
@@ -7188,6 +7235,30 @@ class DynamicsWorldModel(Module):
             else:
                 decoded_rewards = zeros((batch_size, prompt_time), device = self.device, dtype = torch.float32)
 
+            if use_preallocated_outputs:
+                preallocated_rewards = zeros((batch_size, time_steps), device = self.device, dtype = torch.float32)
+                reward_prompt_time = min(decoded_rewards.shape[1], time_steps)
+                preallocated_rewards[:, :reward_prompt_time] = decoded_rewards[:, :reward_prompt_time]
+                decoded_rewards = preallocated_rewards[:, :prompt_time]
+
+        def grow_sequence(preallocated, current, value):
+            if use_preallocated_outputs and exists(preallocated) and exists(value):
+                next_time = current.shape[1]
+                preallocated[:, next_time:next_time + 1] = value
+                return preallocated[:, :next_time + 1]
+
+            return safe_cat((current, value), dim = 1)
+
+        def store_generated(t, value, index):
+            if use_preallocated_outputs:
+                if not exists(t):
+                    t = value.new_empty((batch_size, generated_time, *value.shape[2:]))
+
+                t[:, index:index + 1] = value
+                return t
+
+            return safe_cat((t, value), dim = 1)
+
         # maybe return terminals
 
         decoded_terminals = zeros((batch_size,), device = self.device, dtype = torch.bool)
@@ -7200,6 +7271,7 @@ class DynamicsWorldModel(Module):
         while latents.shape[1] < time_steps:
 
             curr_time_steps = latents.shape[1]
+            generated_index = curr_time_steps - prompt_time
 
             # determine whether to take an extra step if
             # (1) using time kv cache
@@ -7341,7 +7413,7 @@ class DynamicsWorldModel(Module):
                 reward_logits = self.to_latent_state_reward_pred(pooled_latents)
                 pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
 
-                decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
+                decoded_rewards = grow_sequence(preallocated_rewards, decoded_rewards, pred_reward)
 
             # maybe predict terminals
 
@@ -7361,7 +7433,7 @@ class DynamicsWorldModel(Module):
             # maybe store agent embed
 
             if store_agent_embed:
-                acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+                acc_agent_embed = store_generated(acc_agent_embed, one_agent_embed, generated_index)
 
             # decode the agent actions if needed
 
@@ -7373,7 +7445,7 @@ class DynamicsWorldModel(Module):
                 # maybe store old actions
 
                 if store_old_action_unembeds:
-                    acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
+                    acc_policy_embed = store_generated(acc_policy_embed, policy_embed, generated_index)
 
                 # sample actions
 
@@ -7385,8 +7457,8 @@ class DynamicsWorldModel(Module):
                     continuous_temperature = continuous_temperature
                 )
 
-                decoded_discrete_actions = safe_cat((decoded_discrete_actions, sampled_discrete_actions), dim = 1)
-                decoded_continuous_actions = safe_cat((decoded_continuous_actions, sampled_continuous_actions), dim = 1)
+                decoded_discrete_actions = grow_sequence(preallocated_discrete_actions, decoded_discrete_actions, sampled_discrete_actions)
+                decoded_continuous_actions = grow_sequence(preallocated_continuous_actions, decoded_continuous_actions, sampled_continuous_actions)
 
                 if return_log_probs_and_values:
                     discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
@@ -7396,28 +7468,31 @@ class DynamicsWorldModel(Module):
                         continuous_targets = sampled_continuous_actions
                     )
 
-                    decoded_discrete_log_probs = safe_cat((decoded_discrete_log_probs, discrete_log_probs), dim = 1)
-                    decoded_continuous_log_probs = safe_cat((decoded_continuous_log_probs, continuous_log_probs), dim = 1)
+                    if exists(discrete_log_probs):
+                        decoded_discrete_log_probs = store_generated(decoded_discrete_log_probs, discrete_log_probs, generated_index)
+
+                    if exists(continuous_log_probs):
+                        decoded_continuous_log_probs = store_generated(decoded_continuous_log_probs, continuous_log_probs, generated_index)
 
                     value_bins = self.value_head(one_agent_embed)
                     values = self.value_encoder.bins_to_scalar_value(value_bins)
 
-                    decoded_values = safe_cat((decoded_values, values), dim = 1)
+                    decoded_values = store_generated(decoded_values, values, generated_index)
 
             # concat the denoised latent
 
-            latents = cat((latents, denoised_latent), dim = 1)
+            latents = grow_sequence(preallocated_latents, latents, denoised_latent)
 
             # add new fixed context noise for the temporal consistency
 
-            past_latents_context_noise = cat((past_latents_context_noise, randn_like(denoised_latent)), dim = 1)
+            past_latents_context_noise = grow_sequence(preallocated_latents_context_noise, past_latents_context_noise, randn_like(denoised_latent))
 
             # handle proprio
 
             if has_proprio:
-                proprio = cat((proprio, denoised_proprio), dim = 1)
+                proprio = grow_sequence(preallocated_proprio, proprio, denoised_proprio)
 
-                past_proprio_context_noise = cat((past_proprio_context_noise, randn_like(denoised_proprio)), dim = 1)
+                past_proprio_context_noise = grow_sequence(preallocated_proprio_context_noise, past_proprio_context_noise, randn_like(denoised_proprio))
 
             # maybe early break if entirely terminated
 

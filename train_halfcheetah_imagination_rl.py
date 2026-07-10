@@ -75,6 +75,20 @@ def cycle(dl):
         for data in dl:
             yield data
 
+
+def repeat_batch_to_size(batch, size: int):
+    tensor = next((t for t in batch.values() if torch.is_tensor(t)), None)
+
+    if not exists(tensor) or tensor.shape[0] == size:
+        return batch
+
+    batch_size = tensor.shape[0]
+    assert 0 < batch_size <= size
+
+    indices = torch.arange(size, device = tensor.device) % batch_size
+
+    return tree_map(lambda t: t.index_select(0, indices) if torch.is_tensor(t) else t, batch)
+
 # tokenizer
 
 class ObservationTokenizer(nn.Module):
@@ -681,6 +695,7 @@ def train_world_model(
     steps: int,
     batch_size: int,
     sequence_length: int | None,
+    static_batch_shape: bool,
     max_grad_norm: float,
     global_step: int,
     writer: SummaryWriter | None,
@@ -714,6 +729,9 @@ def train_world_model(
             step_start = perf_counter()
 
         batch = next(dataloader_iter)
+
+        if static_batch_shape:
+            batch = repeat_batch_to_size(batch, batch_size)
 
         exp = Experience.from_buffer_dict(batch)
         exp.lens = batch.get('_lens')
@@ -786,6 +804,7 @@ def train_agent_in_imagination(
     horizon: int,
     prompt_length: int,
     prompt_probability: float,
+    static_generate_shape: bool,
     generate_steps: int,
     max_grad_norm: float,
     objective: Literal["ppo", "pmpo", "spo"],
@@ -814,19 +833,26 @@ def train_agent_in_imagination(
 
     prompt_iterator = cycle(prompt_dataloader) if prompt_length > 0 and len(prompt_dataloader) > 0 else None
 
+    if static_generate_shape and prompt_length > 0 and not exists(prompt_iterator):
+        raise ValueError("static compiled generation requires at least one prompt window")
+
     for _ in pbar:
         if exists(imagination_step_timing):
             synchronize_if_cuda(world_model.device)
             step_start = perf_counter()
 
         with torch.no_grad():
-            use_prompt = random.random() < prompt_probability
+            use_prompt = static_generate_shape or random.random() < prompt_probability
             prompts = None
 
             if use_prompt and exists(prompt_iterator):
                 prompt_batch = next(prompt_iterator)
 
                 prompt_batch = tree_map(lambda t: t.to(world_model.device) if torch.is_tensor(t) else t, prompt_batch)
+
+                if static_generate_shape:
+                    # Keep compiled generation at one batch shape even when the last prompt batch is short.
+                    prompt_batch = repeat_batch_to_size(prompt_batch, batch_size)
 
                 prompts = dict(
                     prompt_latents = prompt_batch.get('latents'),
@@ -976,10 +1002,24 @@ def save_checkpoint(
 
 
 def load_optimizer_state_if_compatible(optimizer: Optimizer, state_dict, name: str):
+    # load_state_dict swaps in freshly built state rather than mutating existing tensors,
+    # so the backup stays valid for restoring after a failed or rejected load
+    backup = optimizer.state_dict()
+
     try:
         optimizer.load_state_dict(state_dict)
+
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                for state_name, value in optimizer.state.get(param, {}).items():
+                    if torch.is_tensor(value) and value.ndim > 0 and value.shape != param.shape:
+                        raise ValueError(
+                            f"{state_name} has shape {tuple(value.shape)} for parameter shape {tuple(param.shape)}"
+                        )
+
         return True
     except (KeyError, RuntimeError, ValueError) as exc:
+        optimizer.load_state_dict(backup)
         print(f"skipping {name} optimizer state: {exc}")
         return False
 
@@ -1048,14 +1088,15 @@ def main(
     checkpoint_path: str | None = None,
     clear_log_dir = False,
     unique_log_dir = True,
-    compile = False,
+    compile: bool | None = None,
     compile_world_model = False,
     compile_generate = False,
     compile_learn = False,
     compile_backend = "inductor",
     compile_mode: str | None = "reduce-overhead",
     compile_fullgraph = False,
-    compile_dynamic: bool | None = None,
+    compile_dynamic: bool | None = False,
+    compile_generate_cudagraphs = True,
     track_compile_performance = False,
     allow_tf32 = True,
     require_cuda = False,
@@ -1068,6 +1109,9 @@ def main(
     np.random.seed(seed)
 
     device = torch.device("cpu" if cpu or not torch.cuda.is_available() else "cuda")
+
+    if compile is None:
+        compile = device.type == "cuda"
 
     if require_cuda and device.type != "cuda":
         raise RuntimeError("CUDA was required for this run, but no CUDA device is available")
@@ -1204,6 +1248,10 @@ def main(
     compile_world_model = compile or compile_world_model
     compile_generate = compile or compile_generate
     compile_learn = compile or compile_learn
+    static_compile_shapes = compile_dynamic is False
+
+    if compile_generate and static_compile_shapes and imagination_prompt_length > 0 and imagination_prompt_probability != 1.:
+        raise ValueError("compile_generate requires imagination_prompt_probability=1.0 when imagination_prompt_length > 0")
 
     compile_runtime = build_compile_runtime(
         world_model,
@@ -1218,6 +1266,7 @@ def main(
         track_compile_performance = track_compile_performance,
         imagination_generate_steps = imagination_generate_steps,
         imagination_use_time_cache = imagination_use_time_cache,
+        compile_generate_cudagraphs = compile_generate_cudagraphs,
         objective = objective,
         use_delight_gating = use_delight_gating,
         store_old_action_unembeds = objective == "pmpo" and not exists(policy_prior),
@@ -1228,8 +1277,11 @@ def main(
     if start_loop == 0:
         shutil.rmtree(memmap_path, ignore_errors=True)
         replay = None
-    else:
+    elif (memmap_path / "metadata.pkl").exists():
         replay = ReplayBuffer.from_folder(memmap_path)
+    else:
+        print(f"replay buffer not found at {memmap_path}; starting a fresh replay buffer from resumed checkpoint")
+        replay = None
 
     wm_step = 0
     imagination_step = 0
@@ -1248,18 +1300,21 @@ def main(
             if enabled
         ]
         print(f"torch.compile enabled for: {', '.join(compiled_paths)}")
-        if device.type == "cuda" and compile_mode_uses_cuda_graphs(compile_mode):
-            cuda_graph_paths = [
-                name
-                for name, enabled in (
-                    ("imagination_generate", compile_generate),
-                )
-                if enabled
-            ]
+        if device.type == "cuda":
+            cuda_graph_paths = [timing.name for timing in compile_runtime.timings if timing.cuda_graphs]
 
             if len(cuda_graph_paths) > 0:
                 print(f"CUDA Graph capture enabled for: {', '.join(cuda_graph_paths)}")
-                print("CUDA Graph capture disabled for autograd training losses")
+            elif compile_mode_uses_cuda_graphs(compile_mode):
+                print("CUDA Graph capture disabled for compiled training paths")
+
+        fallback_paths = [
+            f"{timing.name}:{compile_mode}->{timing.compile_mode}"
+            for timing in compile_runtime.timings
+            if timing.compiled and exists(timing.compile_mode) and timing.compile_mode != compile_mode
+        ]
+        if len(fallback_paths) > 0:
+            print(f"torch.compile mode fallback for: {', '.join(fallback_paths)}")
     if exists(tokenizer_loss):
         print(f"tokenizer pretrain recon loss: {tokenizer_loss:.4f}")
 
@@ -1361,6 +1416,7 @@ def main(
             steps = world_model_train_steps,
             batch_size = world_model_batch_size,
             sequence_length = world_model_train_sequence_length,
+            static_batch_shape = compile_world_model and static_compile_shapes,
             max_grad_norm = max_grad_norm,
             global_step = wm_step,
             writer = writer,
@@ -1384,6 +1440,7 @@ def main(
             horizon = imagination_horizon,
             prompt_length = imagination_prompt_length,
             prompt_probability = imagination_prompt_probability,
+            static_generate_shape = compile_generate and static_compile_shapes,
             generate_steps = imagination_generate_steps,
             max_grad_norm = max_grad_norm,
             objective = objective,

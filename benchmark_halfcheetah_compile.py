@@ -135,8 +135,9 @@ def benchmark_common_kwargs(
             tokenizer_batch_size = min(int(common_kwargs["tokenizer_batch_size"]), 16),
         )
     else:
-        # the replay grows loop by loop, so batches larger than one rollout's episode count
-        # change shape across loops and force compiled arms to recompile mid-run
+        # Keep the performance preset on full, non-repeated batches. The training
+        # path can repeat short batches for static compilation, but benchmarking
+        # duplicated episodes would distort throughput comparisons.
 
         max_static_batch = max(benchmark_num_envs, 1)
         world_model_batch_size = int(common_kwargs["world_model_batch_size"])
@@ -144,8 +145,8 @@ def benchmark_common_kwargs(
 
         if max(world_model_batch_size, imagination_batch_size) > max_static_batch:
             print(
-                f"benchmark: clamping batch sizes to {max_static_batch} to keep compiled shapes "
-                "static across loops (raise --benchmark_num_envs for larger batches)"
+                f"benchmark: clamping batch sizes to {max_static_batch} so the initial replay "
+                "provides full batches (raise --benchmark_num_envs for larger batches)"
             )
 
         benchmark_kwargs.update(

@@ -174,6 +174,11 @@ Shout out to [@CarsonBurke](https://github.com/CarsonBurke) for this [contributi
 $ uv run train_halfcheetah_imagination_rl.py
 ```
 
+CUDA runs compile the world-model loss, imagination rollout, and imagination
+learning paths with static shapes by default. Pass `--compile=False` to run
+eagerly, or `--compile_mode=max-autotune` to trade additional startup time for
+kernel autotuning.
+
 ## Toy Snake World Model
 
 You can play the ground truth Toy Snake environment in the browser with:
