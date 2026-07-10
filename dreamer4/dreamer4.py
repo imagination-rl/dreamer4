@@ -7138,19 +7138,22 @@ class DynamicsWorldModel(Module):
         )
         generated_time = max(time_steps - prompt_time, 0)
 
+        # when preallocating, every accumulator becomes a growing view over a full (b, time_steps, ...) buffer,
+        # so appends are in-place writes and output shapes stay static for compiled generation
+
+        def preallocate_sequence(values):
+            buffer = empty((batch_size, time_steps, *values.shape[2:]), device = self.device, dtype = values.dtype)
+            buffer[:, :prompt_time] = values
+            return buffer, buffer[:, :prompt_time]
+
         preallocated_latents = preallocated_latents_context_noise = None
         preallocated_proprio = preallocated_proprio_context_noise = None
+        preallocated_rewards = None
+        preallocated_discrete_actions = preallocated_continuous_actions = None
 
         if use_preallocated_outputs:
-            preallocated_latents = empty((batch_size, time_steps, self.num_video_views, *latent_shape), device = self.device, dtype = latents.dtype)
-            preallocated_latents_context_noise = torch.empty_like(preallocated_latents)
-
-            if prompt_time > 0:
-                preallocated_latents[:, :prompt_time] = latents
-                preallocated_latents_context_noise[:, :prompt_time] = past_latents_context_noise
-
-            latents = preallocated_latents[:, :prompt_time]
-            past_latents_context_noise = preallocated_latents_context_noise[:, :prompt_time]
+            preallocated_latents, latents = preallocate_sequence(latents)
+            preallocated_latents_context_noise, past_latents_context_noise = preallocate_sequence(past_latents_context_noise)
 
         # proprio
 
@@ -7163,15 +7166,8 @@ class DynamicsWorldModel(Module):
             past_proprio_context_noise = proprio.clone()
 
             if use_preallocated_outputs:
-                preallocated_proprio = empty((batch_size, time_steps, self.dim_proprio), device = self.device, dtype = proprio.dtype)
-                preallocated_proprio_context_noise = torch.empty_like(preallocated_proprio)
-
-                if prompt_time > 0:
-                    preallocated_proprio[:, :prompt_time] = proprio
-                    preallocated_proprio_context_noise[:, :prompt_time] = past_proprio_context_noise
-
-                proprio = preallocated_proprio[:, :prompt_time]
-                past_proprio_context_noise = preallocated_proprio_context_noise[:, :prompt_time]
+                preallocated_proprio, proprio = preallocate_sequence(proprio)
+                preallocated_proprio_context_noise, past_proprio_context_noise = preallocate_sequence(past_proprio_context_noise)
 
         # actions
 
@@ -7179,36 +7175,29 @@ class DynamicsWorldModel(Module):
 
         decoded_discrete_actions = prompt_discrete_actions
         decoded_continuous_actions = prompt_continuous_actions
-        decoded_discrete_action_time = None
-        decoded_continuous_action_time = None
 
         if return_agent_actions:
             num_discrete = self.action_embedder.num_discrete_action_types
             num_continuous = self.action_embedder.num_continuous_action_types
 
             if use_preallocated_outputs:
-                if num_discrete > 0:
-                    decoded_discrete_actions = zeros((batch_size, time_steps, num_discrete), device = self.device, dtype = torch.long)
-                    decoded_discrete_action_time = prompt_time
+                def preallocate_actions(prompt_actions, num_actions, dtype):
+                    if num_actions == 0:
+                        return None, None
 
-                    if exists(prompt_discrete_actions):
-                        discrete_prompt_time = min(prompt_discrete_actions.shape[1], prompt_time)
-                        decoded_discrete_actions[:, :discrete_prompt_time] = prompt_discrete_actions[:, :discrete_prompt_time]
-                        decoded_discrete_action_time = discrete_prompt_time
-                else:
-                    decoded_discrete_actions = None
+                    buffer = zeros((batch_size, time_steps, num_actions), device = self.device, dtype = dtype)
+                    action_time = prompt_time
 
-                if num_continuous > 0:
-                    continuous_dtype = prompt_continuous_actions.dtype if exists(prompt_continuous_actions) else torch.float
-                    decoded_continuous_actions = zeros((batch_size, time_steps, num_continuous), device = self.device, dtype = continuous_dtype)
-                    decoded_continuous_action_time = prompt_time
+                    if exists(prompt_actions):
+                        action_time = min(prompt_actions.shape[1], prompt_time)
+                        buffer[:, :action_time] = prompt_actions[:, :action_time]
 
-                    if exists(prompt_continuous_actions):
-                        continuous_prompt_time = min(prompt_continuous_actions.shape[1], prompt_time)
-                        decoded_continuous_actions[:, :continuous_prompt_time] = prompt_continuous_actions[:, :continuous_prompt_time]
-                        decoded_continuous_action_time = continuous_prompt_time
-                else:
-                    decoded_continuous_actions = None
+                    return buffer, buffer[:, :action_time]
+
+                continuous_dtype = prompt_continuous_actions.dtype if exists(prompt_continuous_actions) else torch.float
+
+                preallocated_discrete_actions, decoded_discrete_actions = preallocate_actions(prompt_discrete_actions, num_discrete, torch.long)
+                preallocated_continuous_actions, decoded_continuous_actions = preallocate_actions(prompt_continuous_actions, num_continuous, continuous_dtype)
             else:
                 if exists(decoded_discrete_actions):
                     decoded_discrete_actions = decoded_discrete_actions.clone()
@@ -7236,16 +7225,7 @@ class DynamicsWorldModel(Module):
         decoded_rewards = None
 
         if return_rewards_per_frame:
-            if use_preallocated_outputs:
-                decoded_rewards = zeros((batch_size, time_steps), device = self.device, dtype = torch.float32)
-
-                if exists(prompt_rewards):
-                    if prompt_rewards.shape[1] == prompt_time - 1:
-                        decoded_rewards[:, 1:prompt_time] = prompt_rewards
-                    else:
-                        reward_prompt_time = min(prompt_rewards.shape[1], time_steps)
-                        decoded_rewards[:, :reward_prompt_time] = prompt_rewards[:, :reward_prompt_time]
-            elif exists(prompt_rewards):
+            if exists(prompt_rewards):
                 decoded_rewards = prompt_rewards.clone()
 
                 # if prompt rewards has 1 less timestep than latents (e.g. from standard RL episodes where the first state has no reward)
@@ -7255,12 +7235,19 @@ class DynamicsWorldModel(Module):
             else:
                 decoded_rewards = zeros((batch_size, prompt_time), device = self.device, dtype = torch.float32)
 
-        def grow_sequence(preallocated, current, value):
             if use_preallocated_outputs:
-                preallocated[:, curr_time_steps:curr_time_steps + 1] = value
-                return preallocated[:, :curr_time_steps + 1]
+                preallocated_rewards = zeros((batch_size, time_steps), device = self.device, dtype = torch.float32)
+                reward_prompt_time = min(decoded_rewards.shape[1], time_steps)
+                preallocated_rewards[:, :reward_prompt_time] = decoded_rewards[:, :reward_prompt_time]
+                decoded_rewards = preallocated_rewards[:, :prompt_time]
 
-            return cat((current, value), dim = 1)
+        def grow_sequence(preallocated, current, value):
+            if use_preallocated_outputs and exists(preallocated) and exists(value):
+                next_time = current.shape[1]
+                preallocated[:, next_time:next_time + 1] = value
+                return preallocated[:, :next_time + 1]
+
+            return safe_cat((current, value), dim = 1)
 
         def store_generated(t, value, index):
             if use_preallocated_outputs:
@@ -7271,13 +7258,6 @@ class DynamicsWorldModel(Module):
                 return t
 
             return safe_cat((t, value), dim = 1)
-
-        def store_timestep(t, value, index):
-            if use_preallocated_outputs:
-                t[:, index:index + 1] = value
-                return t
-
-            return cat((t, value), dim = 1)
 
         # maybe return terminals
 
@@ -7346,29 +7326,23 @@ class DynamicsWorldModel(Module):
 
                 # action conditioning
 
-                valid_discrete_action_time = default(decoded_discrete_action_time, curr_time_steps)
-
                 curr_discrete = None
-                if exists(decoded_discrete_actions) and valid_discrete_action_time > 0:
-                    curr_discrete = decoded_discrete_actions[:, :valid_discrete_action_time]
+                if exists(decoded_discrete_actions) and not is_empty(decoded_discrete_actions):
+                    curr_discrete = decoded_discrete_actions[:, :curr_time_steps]
                     curr_discrete = pad_right_at_dim_to(curr_discrete, curr_time_steps, dim = 1)
 
-                valid_continuous_action_time = default(decoded_continuous_action_time, curr_time_steps)
-
                 curr_continuous = None
-                if exists(decoded_continuous_actions) and valid_continuous_action_time > 0:
-                    curr_continuous = decoded_continuous_actions[:, :valid_continuous_action_time]
+                if exists(decoded_continuous_actions) and not is_empty(decoded_continuous_actions):
+                    curr_continuous = decoded_continuous_actions[:, :curr_time_steps]
                     curr_continuous = pad_right_at_dim_to(curr_continuous, curr_time_steps, dim = 1)
 
                 # forward for prediction
-
-                curr_rewards = decoded_rewards[:, :curr_time_steps] if use_preallocated_outputs and exists(decoded_rewards) else decoded_rewards
 
                 pred, (embeds, next_time_cache) = self.forward(
                     latents = noised_latent_with_context,
                     signal_levels = signal_levels_with_context,
                     step_sizes = step_size,
-                    rewards = curr_rewards,
+                    rewards = decoded_rewards,
                     tasks = tasks,
                     latent_gene_ids = latent_gene_ids,
                     discrete_actions = curr_discrete,
@@ -7439,7 +7413,7 @@ class DynamicsWorldModel(Module):
                 reward_logits = self.to_latent_state_reward_pred(pooled_latents)
                 pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
 
-                decoded_rewards = store_timestep(decoded_rewards, pred_reward, curr_time_steps)
+                decoded_rewards = grow_sequence(preallocated_rewards, decoded_rewards, pred_reward)
 
             # maybe predict terminals
 
@@ -7483,17 +7457,8 @@ class DynamicsWorldModel(Module):
                     continuous_temperature = continuous_temperature
                 )
 
-                if use_preallocated_outputs:
-                    if exists(sampled_discrete_actions):
-                        decoded_discrete_actions[:, decoded_discrete_action_time:decoded_discrete_action_time + 1] = sampled_discrete_actions
-                        decoded_discrete_action_time += 1
-
-                    if exists(sampled_continuous_actions):
-                        decoded_continuous_actions[:, decoded_continuous_action_time:decoded_continuous_action_time + 1] = sampled_continuous_actions
-                        decoded_continuous_action_time += 1
-                else:
-                    decoded_discrete_actions = safe_cat((decoded_discrete_actions, sampled_discrete_actions), dim = 1)
-                    decoded_continuous_actions = safe_cat((decoded_continuous_actions, sampled_continuous_actions), dim = 1)
+                decoded_discrete_actions = grow_sequence(preallocated_discrete_actions, decoded_discrete_actions, sampled_discrete_actions)
+                decoded_continuous_actions = grow_sequence(preallocated_continuous_actions, decoded_continuous_actions, sampled_continuous_actions)
 
                 if return_log_probs_and_values:
                     discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
@@ -7598,16 +7563,6 @@ class DynamicsWorldModel(Module):
         if exists(acc_policy_embed) and store_old_action_unembeds:
             old_action_unembeds = Actions(*self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0))
 
-        decoded_discrete_actions_out = decoded_discrete_actions
-        decoded_continuous_actions_out = decoded_continuous_actions
-
-        if use_preallocated_outputs and return_agent_actions:
-            if exists(decoded_discrete_actions_out):
-                decoded_discrete_actions_out = decoded_discrete_actions_out[:, :decoded_discrete_action_time]
-
-            if exists(decoded_continuous_actions_out):
-                decoded_continuous_actions_out = decoded_continuous_actions_out[:, :decoded_continuous_action_time]
-
         gen = Experience(
             latents = latents,
             video = video,
@@ -7622,7 +7577,7 @@ class DynamicsWorldModel(Module):
             is_from_world_model = True,
             episode_return = episode_return,
             rewards = decoded_rewards if return_rewards_per_frame else None,
-            actions = Actions(decoded_discrete_actions_out, decoded_continuous_actions_out) if return_agent_actions else None,
+            actions = Actions(decoded_discrete_actions, decoded_continuous_actions) if return_agent_actions else None,
             log_probs = Actions(decoded_discrete_log_probs, decoded_continuous_log_probs) if return_log_probs_and_values else None,
             values = decoded_values if return_log_probs_and_values else None
         )

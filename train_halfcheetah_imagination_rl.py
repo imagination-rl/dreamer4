@@ -824,9 +824,6 @@ def train_agent_in_imagination(
         window_length = prompt_length,
     )
 
-    if static_generate_shape and prompt_length > 0 and prompt_probability != 1.:
-        raise ValueError("static compiled generation requires prompt_probability=1.0 when prompt_length > 0")
-
     prompt_dataloader = DataLoader(
         prompt_dataset,
         batch_size = batch_size,
