@@ -1294,8 +1294,11 @@ def main(
     if start_loop == 0:
         shutil.rmtree(memmap_path, ignore_errors=True)
         replay = None
-    else:
+    elif (memmap_path / "metadata.pkl").exists():
         replay = ReplayBuffer.from_folder(memmap_path)
+    else:
+        print(f"replay buffer not found at {memmap_path}; starting a fresh replay buffer from resumed checkpoint")
+        replay = None
 
     wm_step = 0
     imagination_step = 0
