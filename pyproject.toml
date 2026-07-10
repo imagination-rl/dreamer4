@@ -36,6 +36,7 @@ dependencies = [
     "fire",
     "hl-gauss-pytorch",
     "h-net-dynamic-chunking>=0.5.12",
+    "imageio",
     "imageio-ffmpeg",
     "loguru",
     "memmap-replay-buffer>=0.1.10",
