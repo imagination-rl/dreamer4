@@ -2,7 +2,7 @@
 env_name: HalfCheetah-v4
 seed: 42
 cpu: false
-require_cuda: false
+require_cuda: true
 allow_tf32: true
 obs_dim: null
 
@@ -31,14 +31,15 @@ tokenizer_eval_batch_size: 2048
 num_loops: 500
 rollouts_per_loop: 1
 num_envs: 32
-max_timesteps: 1000
+env_vectorization_mode: async
+max_timesteps: 750
 replay_size: 256
 
 # World model training
 world_model_batch_size: 32
 pretrain_world_model_finetune_steps: 64
 pretrain_world_model_combined_steps: 256
-world_model_train_steps: 13
+world_model_train_steps: 32
 world_model_train_sequence_length: 200
 world_model_learning_rate: 0.0003
 
@@ -47,7 +48,7 @@ imagination_batch_size: 128
 imagination_horizon: 32
 imagination_prompt_length: 8
 imagination_prompt_probability: 1.0
-imagination_train_steps: 3
+imagination_train_steps: 10
 imagination_generate_steps: 4
 imagination_use_time_cache: true
 
@@ -57,25 +58,37 @@ objective: pmpo
 pmpo_pos_to_neg_weight: 0.5
 pmpo_kl_div_loss_weight: 0.3
 use_delight_gating: false
-agent_predicts_state: true
+agent_predicts_state: false
 agent_state_pred_loss_weight: 0.1
 
 # Optimization
 use_muon_optimizer: true
 optimizer_weight_decay: 0.01
-max_grad_norm: 0.5
+max_grad_norm: 1
 
 # torch.compile runtime
-compile: false
-compile_world_model: false
-compile_generate: false
-compile_learn: false
+compile: null
+compile_interact: true
+compile_world_model: true
+compile_generate: true
+compile_learn: true
 compile_backend: inductor
 compile_mode: reduce-overhead
 compile_fullgraph: false
-compile_dynamic: null
+compile_dynamic: false
+compile_generate_cudagraphs: true
+optimize_generate_compilation: true
 track_compile_performance: false
 return_compile_timings: false
+
+# Profiling. Lightweight record_function timings are enabled by default.
+# Full profile mode always exits after 5 warmup + 4 measured model steps.
+collect_timings: true
+profile: false
+profile_memory: false
+profile_record_shapes: false
+profile_with_stack: false
+profile_with_flops: false
 
 # Logging and checkpoints
 use_tensorboard: true

@@ -137,6 +137,69 @@ class CompiledCallable:
         return self.fn(*args, **kwargs)
 
 
+class DynamicTimeCacheCallable:
+    def __init__(self, fn: Callable, max_time: int):
+        self.fn = fn
+        self.max_time = max_time
+        self.timing = getattr(fn, "timing", None)
+
+    def __call__(self, *args, **kwargs):
+        time_cache = kwargs.get("time_cache")
+
+        if exists(time_cache):
+            for transformer_cache in time_cache[:5]:
+                if not exists(transformer_cache):
+                    continue
+
+                kv_cache = transformer_cache.next_kv_cache
+                if exists(kv_cache):
+                    torch._dynamo.mark_dynamic(
+                        kv_cache,
+                        -2,
+                        min = 1,
+                        max = self.max_time,
+                    )
+
+        return self.fn(*args, **kwargs)
+
+
+class InteractWithEnvForward(nn.Module):
+    def __init__(self, world_model: DynamicsWorldModel):
+        super().__init__()
+        self.world_model = world_model
+
+    def forward(
+        self,
+        *,
+        latents: Tensor,
+        signal_levels: int | Tensor,
+        step_sizes: int | Tensor,
+        rewards: Tensor | None,
+        discrete_actions: Tensor | None,
+        continuous_actions: Tensor | None,
+        proprio: Tensor | None,
+        time_cache,
+        latent_is_noised: bool = True,
+        latent_has_view_dim: bool = True,
+        return_pred_only: bool = True,
+        return_intermediates: bool = True,
+    ):
+        return self.world_model(
+            latents = latents,
+            signal_levels = signal_levels,
+            step_sizes = step_sizes,
+            rewards = rewards,
+            discrete_actions = discrete_actions,
+            continuous_actions = continuous_actions,
+            proprio = proprio,
+            time_cache = time_cache,
+            latent_is_noised = latent_is_noised,
+            latent_has_view_dim = latent_has_view_dim,
+            return_pred_only = return_pred_only,
+            return_intermediates = return_intermediates,
+        )
+
+
 class WorldModelTrainingLoss(nn.Module):
     def __init__(self, world_model: DynamicsWorldModel):
         super().__init__()
@@ -172,12 +235,16 @@ class ImaginationGenerateRollout(nn.Module):
         generate_steps: int,
         store_old_action_unembeds: bool,
         use_time_cache: bool,
+        preallocate_outputs: bool,
+        optimize_generate_compilation: bool = False,
     ):
         super().__init__()
         self.world_model = world_model
         self.generate_steps = generate_steps
         self.store_old_action_unembeds = store_old_action_unembeds
         self.use_time_cache = use_time_cache
+        self.preallocate_outputs = preallocate_outputs
+        self.optimize_generate_compilation = optimize_generate_compilation
 
     def forward(
         self,
@@ -201,6 +268,8 @@ class ImaginationGenerateRollout(nn.Module):
             use_time_cache = self.use_time_cache,
             store_agent_embed = True,
             store_old_action_unembeds = self.store_old_action_unembeds,
+            preallocate_outputs = self.preallocate_outputs,
+            optimize_generate_compilation = self.optimize_generate_compilation,
             prompt_latents = prompt_latents,
             prompt_proprio = prompt_proprio,
             prompt_discrete_actions = prompt_discrete_actions,
@@ -274,6 +343,7 @@ class ImaginationLearningLoss(nn.Module):
 
 @dataclass
 class CompileRuntime:
+    interact_forward: Callable
     world_model_loss: Callable
     world_model_loss_timing: CallTiming | None
     generate_rollout: Callable
@@ -354,8 +424,8 @@ def maybe_compile_and_time(
     effective_compile_mode = compile_mode
 
     if enabled and compile_mode_uses_cuda_graphs(compile_mode) and not compile_cudagraphs:
-        # CUDA Graph capture is unsafe for these autograd loss wrappers: AOTAutograd
-        # keeps forward intermediates live for backward, and graph replay can overwrite them.
+        # Dynamic caches and live autograd intermediates are unsafe to replay,
+        # so paths that opt out fall back to a non-CUDA-graph mode.
         effective_compile_mode = "max-autotune-no-cudagraphs" if compile_mode == "max-autotune" else "default"
 
     timing = CallTiming(
@@ -395,14 +465,38 @@ def build_compile_runtime(
     compile_mode: str | None,
     compile_fullgraph: bool,
     compile_dynamic: bool | None,
+    compile_generate_cudagraphs: bool,
+    optimize_generate_compilation: bool = False,
     track_compile_performance: bool,
     imagination_generate_steps: int,
     imagination_use_time_cache: bool,
     objective: Literal["ppo", "pmpo", "spo"],
     use_delight_gating: bool,
     store_old_action_unembeds: bool,
+    compile_interact: bool = False,
+    interact_max_timesteps: int = 16,
 ) -> CompileRuntime:
     timings = []
+
+    interact_forward, timing = maybe_compile_and_time(
+        InteractWithEnvForward(world_model),
+        name = "interact_forward",
+        enabled = compile_interact,
+        track_timing = False,
+        device = device,
+        compile_backend = compile_backend,
+        compile_mode = compile_mode,
+        compile_fullgraph = compile_fullgraph,
+        compile_dynamic = True,
+        compile_cudagraphs = False,
+        wrap_timing = False,
+    )
+    if compile_interact:
+        interact_forward = DynamicTimeCacheCallable(
+            interact_forward,
+            max_time = interact_max_timesteps + 1,
+        )
+    timings.append(timing)
 
     world_model_loss, timing = maybe_compile_and_time(
         WorldModelTrainingLoss(world_model),
@@ -420,22 +514,26 @@ def build_compile_runtime(
     world_model_loss_timing = timing if track_compile_performance else None
     timings.append(timing)
 
+    generate_rollout_module = ImaginationGenerateRollout(
+        world_model,
+        generate_steps = imagination_generate_steps,
+        store_old_action_unembeds = store_old_action_unembeds,
+        use_time_cache = imagination_use_time_cache,
+        preallocate_outputs = compile_generate or optimize_generate_compilation,
+        optimize_generate_compilation = optimize_generate_compilation,
+    )
+
     generate_rollout, timing = maybe_compile_and_time(
-        ImaginationGenerateRollout(
-            world_model,
-            generate_steps = imagination_generate_steps,
-            store_old_action_unembeds = store_old_action_unembeds,
-            use_time_cache = imagination_use_time_cache,
-        ),
+        generate_rollout_module,
         name = "imagination_generate",
-        enabled = compile_generate,
+        enabled = compile_generate and not optimize_generate_compilation,
         track_timing = track_compile_performance,
         device = device,
         compile_backend = compile_backend,
         compile_mode = compile_mode,
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = compile_dynamic,
-        compile_cudagraphs = True,
+        compile_cudagraphs = compile_generate_cudagraphs,
     )
     generate_rollout_timing = timing if track_compile_performance else None
     generate_uses_cuda_graphs = timing.cuda_graphs
@@ -475,6 +573,7 @@ def build_compile_runtime(
         imagination_step_timing = None
 
     return CompileRuntime(
+        interact_forward = interact_forward,
         world_model_loss = world_model_loss,
         world_model_loss_timing = world_model_loss_timing,
         generate_rollout = generate_rollout,

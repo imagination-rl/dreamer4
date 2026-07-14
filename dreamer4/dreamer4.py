@@ -2940,7 +2940,19 @@ class AxialSpaceTimeTransformer(Module):
 
         # attention
 
-        self.attn_softclamp_value = attn_softclamp_value
+        # A nonpersistent tensor avoids FlexAttention SymFloat captures under
+        # dynamic compilation without changing checkpoint state dictionaries.
+        attn_softclamp_value = (
+            torch.as_tensor(attn_softclamp_value)
+            if exists(attn_softclamp_value)
+            else None
+        )
+        assert not exists(attn_softclamp_value) or attn_softclamp_value.numel() == 1
+        self.register_buffer(
+            'attn_softclamp_value',
+            attn_softclamp_value,
+            persistent = False,
+        )
 
         # attention masking
 
@@ -3102,6 +3114,9 @@ class AxialSpaceTimeTransformer(Module):
         # maybe excise past tokens if continuing from cache, and redefine time as the number of tokens to process
 
         has_kv_cache = exists(kv_cache)
+
+        if has_kv_cache:
+            token_count = kv_cache.shape[-2]
 
         past_tokens = tokens[:, :0]
 
@@ -5262,11 +5277,14 @@ class DynamicsWorldModel(Module):
         policy_head_mlp_activation: Activation = 'silu',
         agent_state_pred_mlp_activation: Activation = 'silu',
         state_terminal_pred_mlp_activation: Activation = 'silu',
-        value_head_mlp_activation: Activation = 'silu'
+        value_head_mlp_activation: Activation = 'silu',
+        optimize_generate_compilation: bool = False
     ):
         super().__init__()
         self.dim = dim
         self.depth = depth
+        self.optimize_generate_compilation = optimize_generate_compilation
+        self._compiled_generate_forward_fn = None
 
         # tokenizers
 
@@ -6131,9 +6149,16 @@ class DynamicsWorldModel(Module):
         use_time_cache = True,
         store_agent_embed = True,
         store_old_action_unembeds = True,
-        obs_to_latents_fn = None
+        obs_to_latents_fn = None,
+        forward_fn = None,
     ):
         device = self.device
+        forward_fn = default(forward_fn, self.forward)
+
+        def flags_to_host(flags):
+            if is_tensor(flags):
+                flags = flags.detach().cpu().numpy()
+            return np.asarray(flags, dtype = np.bool_).reshape((-1,))
 
         init_obs = env.reset(seed = seed)
 
@@ -6195,6 +6220,10 @@ class DynamicsWorldModel(Module):
         is_truncated = full((batch,), False, device = device)
         was_terminated = full((batch,), False, device = device)
         done_flag = full((batch,), False, device = device)
+        is_terminated_host = np.zeros((batch,), dtype = np.bool_)
+        is_truncated_host = np.zeros((batch,), dtype = np.bool_)
+        was_terminated_host = np.zeros((batch,), dtype = np.bool_)
+        done_flag_host = np.zeros((batch,), dtype = np.bool_)
 
         episode_lens = full((batch,), 0, device = device)
 
@@ -6210,7 +6239,7 @@ class DynamicsWorldModel(Module):
         curr_image = image_frame
         curr_state = state_frame
 
-        while not done_flag.all():
+        while not done_flag_host.all():
             step_index += 1
 
             if exists(obs_to_latents_fn):
@@ -6260,7 +6289,7 @@ class DynamicsWorldModel(Module):
             past_proprio = accumulated_proprio[:, -1:] if exists(accumulated_proprio) else None
             past_rewards = rewards[:, -1:] if exists(rewards) else None
 
-            pred, (embeds, next_time_cache) = self.forward(
+            pred, (embeds, next_time_cache) = forward_fn(
                 latents = latents,
                 signal_levels = self.max_steps - 1,
                 step_sizes = step_size,
@@ -6348,18 +6377,20 @@ class DynamicsWorldModel(Module):
 
             if len(env_step_out) == 2:
                 next_obs, reward = env_step_out
-                terminated = full((batch,), False, device = device)
-                truncated = full((batch,), False, device = device)
+                terminated = np.zeros((batch,), dtype = np.bool_)
+                truncated = np.zeros((batch,), dtype = np.bool_)
             elif len(env_step_out) == 3:
                 next_obs, reward, terminated = env_step_out
-                truncated = full((batch,), False, device = device)
+                truncated = np.zeros((batch,), dtype = np.bool_)
             elif len(env_step_out) == 4:
                 next_obs, reward, terminated, truncated = env_step_out
             elif len(env_step_out) == 5:
                 next_obs, reward, terminated, truncated, info = env_step_out
 
-            terminated = cast_to_tensor(terminated, device).view((batch,))
-            truncated = cast_to_tensor(truncated, device).view((batch,))
+            terminated_host = flags_to_host(terminated).reshape((batch,))
+            truncated_host = flags_to_host(truncated).reshape((batch,))
+            terminated = cast_to_tensor(terminated_host, device).view((batch,))
+            truncated = cast_to_tensor(truncated_host, device).view((batch,))
             reward = cast_to_tensor(reward, device, dtype = torch.float32)
 
             if not isinstance(next_obs, dict):
@@ -6381,6 +6412,14 @@ class DynamicsWorldModel(Module):
 
             was_terminated |= terminated
             done_flag |= (is_terminated | is_truncated)
+
+            is_terminated_host |= terminated_host
+            is_truncated_host |= truncated_host
+            if step_index >= max_timesteps:
+                is_truncated_host |= ~is_terminated_host
+
+            was_terminated_host |= terminated_host
+            done_flag_host |= (is_terminated_host | is_truncated_host)
 
             reward = rearrange(reward, 'b -> b 1') if env_is_vectorized else rearrange(reward, ' -> 1 1')
 
@@ -6442,8 +6481,9 @@ class DynamicsWorldModel(Module):
                 video_frames.append(curr_image)
 
             need_bootstrap = is_truncated & ~was_terminated
+            need_bootstrap_host = is_truncated_host & ~was_terminated_host
 
-            if done_flag.all() and need_bootstrap.any():
+            if done_flag_host.all() and need_bootstrap_host.any():
                 if exists(obs_to_latents_fn):
                     bootstrap_latents, _ = obs_to_latents_fn(self, obs, tokenizer_time_cache)
 
@@ -6468,7 +6508,7 @@ class DynamicsWorldModel(Module):
                 elif bootstrap_latents.ndim == 4:
                     bootstrap_latents = rearrange(bootstrap_latents, 'b v n d -> b 1 v n d')
 
-                _, (embeds, _) = self.forward(
+                _, (embeds, _) = forward_fn(
                     latents = bootstrap_latents,
                     signal_levels = self.max_steps - 1,
                     step_sizes = step_size,
@@ -7032,6 +7072,52 @@ class DynamicsWorldModel(Module):
 
         return total_policy_loss, value_loss
 
+    def _forward_for_generate_impl(
+        self,
+        latents,
+        signal_levels,
+        step_sizes,
+        rewards,
+        tasks,
+        latent_gene_ids,
+        discrete_actions,
+        continuous_actions,
+        proprio,
+        time_cache,
+        aug_id,
+        latent_is_noised = True,
+        latent_has_view_dim = True,
+        return_pred_only = True,
+        return_intermediates = True,
+    ):
+        return self.forward(
+            latents = latents,
+            signal_levels = signal_levels,
+            step_sizes = step_sizes,
+            rewards = rewards,
+            tasks = tasks,
+            latent_gene_ids = latent_gene_ids,
+            discrete_actions = discrete_actions,
+            continuous_actions = continuous_actions,
+            proprio = proprio,
+            time_cache = time_cache,
+            aug_id = aug_id,
+            latent_is_noised = latent_is_noised,
+            latent_has_view_dim = latent_has_view_dim,
+            return_pred_only = return_pred_only,
+            return_intermediates = return_intermediates,
+        )
+
+    def _get_compiled_generate_forward_fn(self):
+        if not exists(self._compiled_generate_forward_fn):
+            self._compiled_generate_forward_fn = torch.compile(
+                self._forward_for_generate_impl,
+                dynamic = True,
+                fullgraph = False,
+            )
+
+        return self._compiled_generate_forward_fn
+
     @torch.no_grad()
     @temp_eval
     def generate(
@@ -7056,6 +7142,7 @@ class DynamicsWorldModel(Module):
         return_time_cache = False,
         store_agent_embed = True,
         store_old_action_unembeds = True,
+        preallocate_outputs = False,
         prompt: Tensor | None = None,           # (b c t h w) or (b c h w)
         prompt_audio: Tensor | None = None,     # (b c t samples) or (b c samples)
         prompt_state: Tensor | None = None,     # (b t d) or (b d)
@@ -7067,7 +7154,97 @@ class DynamicsWorldModel(Module):
         aug_id: bool | int | Tensor = False,
         discrete_temperature = 1.,
         continuous_temperature = 1.,
+        optimize_generate_compilation: bool | None = None,
     ): # (b t n d) | (b c t h w)
+
+        optimize_generate_compilation = default(
+            optimize_generate_compilation,
+            self.optimize_generate_compilation,
+        )
+        generate_kwargs = dict(
+            time_steps = time_steps,
+            num_steps = num_steps,
+            batch_size = batch_size,
+            agent_index = agent_index,
+            tasks = tasks,
+            latent_gene_ids = latent_gene_ids,
+            image_height = image_height,
+            image_width = image_width,
+            return_decoded_video = return_decoded_video,
+            context_signal_noise = context_signal_noise,
+            time_cache = time_cache,
+            use_time_cache = use_time_cache,
+            return_rewards_per_frame = return_rewards_per_frame,
+            return_terminals = return_terminals,
+            return_agent_actions = return_agent_actions,
+            return_log_probs_and_values = return_log_probs_and_values,
+            return_for_policy_optimization = return_for_policy_optimization,
+            return_time_cache = return_time_cache,
+            store_agent_embed = store_agent_embed,
+            store_old_action_unembeds = store_old_action_unembeds,
+            preallocate_outputs = preallocate_outputs,
+            prompt = prompt,
+            prompt_audio = prompt_audio,
+            prompt_state = prompt_state,
+            prompt_latents = prompt_latents,
+            prompt_proprio = prompt_proprio,
+            prompt_discrete_actions = prompt_discrete_actions,
+            prompt_continuous_actions = prompt_continuous_actions,
+            prompt_rewards = prompt_rewards,
+            aug_id = aug_id,
+            discrete_temperature = discrete_temperature,
+            continuous_temperature = continuous_temperature,
+        )
+
+        if optimize_generate_compilation:
+            if exists(time_cache) or return_time_cache:
+                raise ValueError("optimized generation does not support external time caches")
+
+            return self._generate_optimized(None, **generate_kwargs)
+
+        return self._generate_impl(self.forward, **generate_kwargs)
+
+    @torch.compiler.disable(recursive = False)
+    def _generate_optimized(
+        self,
+        forward_for_generate,
+        time_steps,
+        num_steps = 4,
+        batch_size = 1,
+        agent_index = 0,
+        tasks: int | Tensor | None = None,
+        latent_gene_ids = None,
+        image_height = None,
+        image_width = None,
+        return_decoded_video = None,
+        context_signal_noise = 0.1,
+        time_cache: Tensor | None = None,
+        use_time_cache = True,
+        return_rewards_per_frame = False,
+        return_terminals = False,
+        return_agent_actions = False,
+        return_log_probs_and_values = False,
+        return_for_policy_optimization = False,
+        return_time_cache = False,
+        store_agent_embed = True,
+        store_old_action_unembeds = True,
+        preallocate_outputs = False,
+        prompt: Tensor | None = None,
+        prompt_audio: Tensor | None = None,
+        prompt_state: Tensor | None = None,
+        prompt_latents: Tensor | None = None,
+        prompt_proprio: Tensor | None = None,
+        prompt_discrete_actions: Tensor | None = None,
+        prompt_continuous_actions: Tensor | None = None,
+        prompt_rewards: Tensor | None = None,
+        aug_id: bool | int | Tensor = False,
+        discrete_temperature = 1.,
+        continuous_temperature = 1.,
+    ):
+
+        optimized_generation = not exists(forward_for_generate)
+        if not exists(forward_for_generate):
+            forward_for_generate = self._get_compiled_generate_forward_fn()
 
         # handy flag for returning generations for rl
 
@@ -7172,6 +7349,28 @@ class DynamicsWorldModel(Module):
         # prompt related variables
 
         prompt_time = latents.shape[1]
+        use_preallocated_outputs = (
+            preallocate_outputs and
+            time_steps > prompt_time and
+            not (return_terminals and self.predict_terminals)
+        )
+        generated_time = max(time_steps - prompt_time, 0)
+
+        # Each growing sequence becomes a view over one full-size buffer. This
+        # avoids repeated concatenation while preserving the public output shapes.
+        def preallocate_sequence(values):
+            buffer = empty((batch_size, time_steps, *values.shape[2:]), device = self.device, dtype = values.dtype)
+            buffer[:, :prompt_time] = values
+            return buffer, buffer[:, :prompt_time]
+
+        preallocated_latents = preallocated_latents_context_noise = None
+        preallocated_proprio = preallocated_proprio_context_noise = None
+        preallocated_rewards = None
+        preallocated_discrete_actions = preallocated_continuous_actions = None
+
+        if use_preallocated_outputs:
+            preallocated_latents, latents = preallocate_sequence(latents)
+            preallocated_latents_context_noise, past_latents_context_noise = preallocate_sequence(past_latents_context_noise)
 
         # proprio
 
@@ -7182,6 +7381,10 @@ class DynamicsWorldModel(Module):
                 proprio = zeros((batch_size, prompt_time, self.dim_proprio), device = self.device)
 
             past_proprio_context_noise = proprio.clone()
+
+            if use_preallocated_outputs:
+                preallocated_proprio, proprio = preallocate_sequence(proprio)
+                preallocated_proprio_context_noise, past_proprio_context_noise = preallocate_sequence(past_proprio_context_noise)
 
         # actions
 
@@ -7194,15 +7397,34 @@ class DynamicsWorldModel(Module):
             num_discrete = self.action_embedder.num_discrete_action_types
             num_continuous = self.action_embedder.num_continuous_action_types
 
-            if exists(decoded_discrete_actions):
-                decoded_discrete_actions = decoded_discrete_actions.clone()
-            elif num_discrete > 0:
-                decoded_discrete_actions = zeros((batch_size, prompt_time, num_discrete), device = self.device, dtype = torch.long)
+            if use_preallocated_outputs:
+                def preallocate_actions(prompt_actions, num_actions, dtype):
+                    if num_actions == 0:
+                        return None, None
 
-            if exists(decoded_continuous_actions):
-                decoded_continuous_actions = decoded_continuous_actions.clone()
-            elif num_continuous > 0:
-                decoded_continuous_actions = zeros((batch_size, prompt_time, num_continuous), device = self.device, dtype = torch.float)
+                    buffer = zeros((batch_size, time_steps, num_actions), device = self.device, dtype = dtype)
+                    action_time = prompt_time
+
+                    if exists(prompt_actions):
+                        action_time = min(prompt_actions.shape[1], prompt_time)
+                        buffer[:, :action_time] = prompt_actions[:, :action_time]
+
+                    return buffer, buffer[:, :action_time]
+
+                continuous_dtype = prompt_continuous_actions.dtype if exists(prompt_continuous_actions) else torch.float
+
+                preallocated_discrete_actions, decoded_discrete_actions = preallocate_actions(prompt_discrete_actions, num_discrete, torch.long)
+                preallocated_continuous_actions, decoded_continuous_actions = preallocate_actions(prompt_continuous_actions, num_continuous, continuous_dtype)
+            else:
+                if exists(decoded_discrete_actions):
+                    decoded_discrete_actions = decoded_discrete_actions.clone()
+                elif num_discrete > 0:
+                    decoded_discrete_actions = zeros((batch_size, prompt_time, num_discrete), device = self.device, dtype = torch.long)
+
+                if exists(decoded_continuous_actions):
+                    decoded_continuous_actions = decoded_continuous_actions.clone()
+                elif num_continuous > 0:
+                    decoded_continuous_actions = zeros((batch_size, prompt_time, num_continuous), device = self.device, dtype = torch.float)
 
         # policy optimization related
 
@@ -7231,6 +7453,30 @@ class DynamicsWorldModel(Module):
             else:
                 decoded_rewards = zeros((batch_size, prompt_time), device = self.device, dtype = torch.float32)
 
+            if use_preallocated_outputs:
+                preallocated_rewards = zeros((batch_size, time_steps), device = self.device, dtype = torch.float32)
+                reward_prompt_time = min(decoded_rewards.shape[1], time_steps)
+                preallocated_rewards[:, :reward_prompt_time] = decoded_rewards[:, :reward_prompt_time]
+                decoded_rewards = preallocated_rewards[:, :prompt_time]
+
+        def grow_sequence(preallocated, current, value):
+            if use_preallocated_outputs and exists(preallocated) and exists(value):
+                next_time = current.shape[1]
+                preallocated[:, next_time:next_time + 1] = value
+                return preallocated[:, :next_time + 1]
+
+            return safe_cat((current, value), dim = 1)
+
+        def store_generated(current, value, index):
+            if use_preallocated_outputs:
+                if not exists(current):
+                    current = value.new_empty((batch_size, generated_time, *value.shape[2:]))
+
+                current[:, index:index + 1] = value
+                return current
+
+            return safe_cat((current, value), dim = 1)
+
         # maybe return terminals
 
         decoded_terminals = zeros((batch_size,), device = self.device, dtype = torch.bool)
@@ -7243,6 +7489,7 @@ class DynamicsWorldModel(Module):
         while latents.shape[1] < time_steps:
 
             curr_time_steps = latents.shape[1]
+            generated_index = curr_time_steps - prompt_time
 
             # determine whether to take an extra step if
             # (1) using time kv cache
@@ -7307,19 +7554,53 @@ class DynamicsWorldModel(Module):
                     curr_continuous = decoded_continuous_actions[:, :curr_time_steps]
                     curr_continuous = pad_right_at_dim_to(curr_continuous, curr_time_steps, dim = 1)
 
+                forward_latents = noised_latent_with_context
+                forward_signal_levels = signal_levels_with_context
+                forward_rewards = decoded_rewards
+                forward_discrete_actions = curr_discrete
+                forward_continuous_actions = curr_continuous
+                forward_proprio = noised_proprio_with_context
+                forward_time_cache = time_cache
+
+                # Fixed-time causal padding avoids per-frame specializations from
+                # growing KV caches and their Python token counts.
+                if optimized_generation:
+                    forward_pad = time_steps - forward_latents.shape[1]
+                    forward_latents = pad_at_dim(forward_latents, (0, forward_pad), dim = 1, value = 0.)
+                    forward_signal_levels = pad_at_dim(
+                        forward_signal_levels,
+                        (0, forward_pad),
+                        dim = 1,
+                        value = self.max_steps - 1,
+                    )
+
+                    if exists(forward_rewards):
+                        forward_rewards = pad_right_at_dim_to(forward_rewards, time_steps - 1, dim = 1)
+
+                    if exists(forward_discrete_actions):
+                        forward_discrete_actions = pad_right_at_dim_to(forward_discrete_actions, time_steps - 1, dim = 1)
+
+                    if exists(forward_continuous_actions):
+                        forward_continuous_actions = pad_right_at_dim_to(forward_continuous_actions, time_steps - 1, dim = 1)
+
+                    if exists(forward_proprio):
+                        forward_proprio = pad_at_dim(forward_proprio, (0, forward_pad), dim = 1, value = 0.)
+
+                    forward_time_cache = None
+
                 # forward for prediction
 
-                pred, (embeds, next_time_cache) = self.forward(
-                    latents = noised_latent_with_context,
-                    signal_levels = signal_levels_with_context,
+                pred, (embeds, next_time_cache) = forward_for_generate(
+                    latents = forward_latents,
+                    signal_levels = forward_signal_levels,
                     step_sizes = step_size,
-                    rewards = decoded_rewards,
+                    rewards = forward_rewards,
                     tasks = tasks,
                     latent_gene_ids = latent_gene_ids,
-                    discrete_actions = curr_discrete,
-                    continuous_actions = curr_continuous,
-                    proprio = noised_proprio_with_context,
-                    time_cache = time_cache,
+                    discrete_actions = forward_discrete_actions,
+                    continuous_actions = forward_continuous_actions,
+                    proprio = forward_proprio,
+                    time_cache = forward_time_cache,
                     aug_id = aug_id,
                     latent_is_noised = True,
                     latent_has_view_dim = True,
@@ -7327,8 +7608,14 @@ class DynamicsWorldModel(Module):
                     return_intermediates = True,
                 )
 
-                if use_time_cache and is_last_step:
+                if use_time_cache and is_last_step and not optimized_generation:
                     time_cache = next_time_cache
+
+                if optimized_generation:
+                    embeds = tree_map_tensor(
+                        lambda tensor: tensor[:, curr_time_steps:curr_time_steps + 1],
+                        embeds,
+                    )
 
                 # early break if taking an extra step for agent embedding off cleaned latents for decoding
 
@@ -7342,10 +7629,16 @@ class DynamicsWorldModel(Module):
 
                 # unpack pred
 
-                _, pred = unpack(pred, pack_context_shape, 'b * v n d')
+                if optimized_generation:
+                    pred = pred[:, curr_time_steps:curr_time_steps + 1]
+                else:
+                    _, pred = unpack(pred, pack_context_shape, 'b * v n d')
 
                 if has_proprio:
-                    _, pred_proprio = unpack(pred_proprio, pack_context_shape, 'b * d')
+                    if optimized_generation:
+                        pred_proprio = pred_proprio[:, curr_time_steps:curr_time_steps + 1]
+                    else:
+                        _, pred_proprio = unpack(pred_proprio, pack_context_shape, 'b * d')
 
                 # derive flow, based on whether in x-space or not
 
@@ -7385,7 +7678,7 @@ class DynamicsWorldModel(Module):
                 reward_logits = self.to_latent_state_reward_pred(pooled_latents)
                 pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
 
-                decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
+                decoded_rewards = grow_sequence(preallocated_rewards, decoded_rewards, pred_reward)
 
             # maybe predict terminals
 
@@ -7405,10 +7698,10 @@ class DynamicsWorldModel(Module):
             # maybe store agent embed
 
             if store_agent_embed:
-                acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+                acc_agent_embed = store_generated(acc_agent_embed, one_agent_embed, generated_index)
 
                 if self.policy_all_tokens:
-                    acc_policy_input = safe_cat((acc_policy_input, one_policy_input), dim = 1)
+                    acc_policy_input = store_generated(acc_policy_input, one_policy_input, generated_index)
 
             # decode the agent actions if needed
 
@@ -7420,7 +7713,7 @@ class DynamicsWorldModel(Module):
                 # maybe store old actions
 
                 if store_old_action_unembeds:
-                    acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
+                    acc_policy_embed = store_generated(acc_policy_embed, policy_embed, generated_index)
 
                 # sample actions
 
@@ -7432,8 +7725,8 @@ class DynamicsWorldModel(Module):
                     continuous_temperature = continuous_temperature
                 )
 
-                decoded_discrete_actions = safe_cat((decoded_discrete_actions, sampled_discrete_actions), dim = 1)
-                decoded_continuous_actions = safe_cat((decoded_continuous_actions, sampled_continuous_actions), dim = 1)
+                decoded_discrete_actions = grow_sequence(preallocated_discrete_actions, decoded_discrete_actions, sampled_discrete_actions)
+                decoded_continuous_actions = grow_sequence(preallocated_continuous_actions, decoded_continuous_actions, sampled_continuous_actions)
 
                 if return_log_probs_and_values:
                     discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
@@ -7443,28 +7736,31 @@ class DynamicsWorldModel(Module):
                         continuous_targets = sampled_continuous_actions
                     )
 
-                    decoded_discrete_log_probs = safe_cat((decoded_discrete_log_probs, discrete_log_probs), dim = 1)
-                    decoded_continuous_log_probs = safe_cat((decoded_continuous_log_probs, continuous_log_probs), dim = 1)
+                    if exists(discrete_log_probs):
+                        decoded_discrete_log_probs = store_generated(decoded_discrete_log_probs, discrete_log_probs, generated_index)
+
+                    if exists(continuous_log_probs):
+                        decoded_continuous_log_probs = store_generated(decoded_continuous_log_probs, continuous_log_probs, generated_index)
 
                     value_bins = self.value_head(one_agent_embed)
                     values = self.value_encoder.bins_to_scalar_value(value_bins)
 
-                    decoded_values = safe_cat((decoded_values, values), dim = 1)
+                    decoded_values = store_generated(decoded_values, values, generated_index)
 
             # concat the denoised latent
 
-            latents = cat((latents, denoised_latent), dim = 1)
+            latents = grow_sequence(preallocated_latents, latents, denoised_latent)
 
             # add new fixed context noise for the temporal consistency
 
-            past_latents_context_noise = cat((past_latents_context_noise, randn_like(denoised_latent)), dim = 1)
+            past_latents_context_noise = grow_sequence(preallocated_latents_context_noise, past_latents_context_noise, randn_like(denoised_latent))
 
             # handle proprio
 
             if has_proprio:
-                proprio = cat((proprio, denoised_proprio), dim = 1)
+                proprio = grow_sequence(preallocated_proprio, proprio, denoised_proprio)
 
-                past_proprio_context_noise = cat((past_proprio_context_noise, randn_like(denoised_proprio)), dim = 1)
+                past_proprio_context_noise = grow_sequence(preallocated_proprio_context_noise, past_proprio_context_noise, randn_like(denoised_proprio))
 
             # maybe early break if entirely terminated
 
@@ -7559,6 +7855,10 @@ class DynamicsWorldModel(Module):
             return gen
 
         return gen, time_cache
+
+    # Keep one implementation for both paths. The default calls the undecorated
+    # function and remains compilable exactly as before.
+    _generate_impl = _generate_optimized.__wrapped__
 
     @torch.no_grad()
     def apply_fire_(

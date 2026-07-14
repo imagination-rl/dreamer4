@@ -1,6 +1,7 @@
 import pytest
 param = pytest.mark.parametrize
 import torch
+from contextlib import nullcontext
 from einops import rearrange
 
 def exists(v):
@@ -360,6 +361,126 @@ def test_action_with_world_model():
 
     actor_loss.backward(retain_graph = True)
     critic_loss.backward()
+
+
+@param('action_kind, has_proprio, use_time_cache, autocast_dtype, policy_all_tokens', (
+    ('continuous', False, False, None, False),
+    ('discrete', True, True, torch.bfloat16, True),
+))
+def test_generate_preallocated_outputs_match_eager_contract(
+    action_kind,
+    has_proprio,
+    use_time_cache,
+    autocast_dtype,
+    policy_all_tokens,
+):
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    use_continuous_actions = action_kind == 'continuous'
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        max_steps = 8,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 2,
+        depth = 1,
+        time_block_every = 1,
+        dim_proprio = 3 if has_proprio else None,
+        num_discrete_actions = 4 if not use_continuous_actions else 0,
+        num_continuous_actions = 2 if use_continuous_actions else 0,
+        continuous_dist_type = "beta",
+        policy_all_tokens = policy_all_tokens,
+        reward_encoder_kwargs = dict(num_bins = 11),
+        value_encoder_kwargs = dict(num_bins = 11),
+    )
+
+    prompt_latents = torch.randn(2, 2, 2, 8).clamp(-1., 1.)
+    prompt_proprio = torch.randn(2, 2, 3) if has_proprio else None
+    prompt_discrete_actions = torch.randint(0, 4, (2, 1, 1)) if not use_continuous_actions else None
+    prompt_continuous_actions = torch.randn(2, 1, 2).sigmoid() if use_continuous_actions else None
+    prompt_rewards = torch.randn(2, 1)
+
+    generate_kwargs = dict(
+        time_steps = 5,
+        num_steps = 2,
+        batch_size = 2,
+        return_decoded_video = False,
+        return_rewards_per_frame = True,
+        return_agent_actions = True,
+        return_log_probs_and_values = True,
+        return_terminals = False,
+        use_time_cache = use_time_cache,
+        prompt_latents = prompt_latents,
+        prompt_proprio = prompt_proprio,
+        prompt_discrete_actions = prompt_discrete_actions,
+        prompt_continuous_actions = prompt_continuous_actions,
+        prompt_rewards = prompt_rewards,
+    )
+    generate_kwargs = {key: value for key, value in generate_kwargs.items() if value is not None}
+
+    def assert_matching_tensor(preallocated_tensor, eager_tensor):
+        assert exists(preallocated_tensor) == exists(eager_tensor)
+
+        if not exists(preallocated_tensor):
+            return
+
+        assert preallocated_tensor.dtype == eager_tensor.dtype
+
+        if preallocated_tensor.is_floating_point():
+            assert torch.allclose(preallocated_tensor, eager_tensor)
+        else:
+            assert torch.equal(preallocated_tensor, eager_tensor)
+
+    def assert_preallocated_matches_eager(**kwargs):
+        autocast = torch.autocast('cpu', dtype = autocast_dtype) if exists(autocast_dtype) else nullcontext()
+
+        with torch.no_grad(), autocast:
+            torch.manual_seed(123)
+            eager = dynamics.generate(**kwargs)
+
+            torch.manual_seed(123)
+            preallocated = dynamics.generate(**kwargs, preallocate_outputs = True)
+
+        for preallocated_tensor, eager_tensor in (
+            (preallocated.latents, eager.latents),
+            (preallocated.proprio, eager.proprio),
+            (preallocated.rewards, eager.rewards),
+            (preallocated.agent_embed, eager.agent_embed),
+            (preallocated.policy_input, eager.policy_input),
+            (preallocated.actions.discrete, eager.actions.discrete),
+            (preallocated.actions.continuous, eager.actions.continuous),
+            (preallocated.log_probs.discrete, eager.log_probs.discrete),
+            (preallocated.log_probs.continuous, eager.log_probs.continuous),
+            (preallocated.values, eager.values),
+        ):
+            assert_matching_tensor(preallocated_tensor, eager_tensor)
+
+    assert_preallocated_matches_eager(**generate_kwargs)
+
+    no_prompt_generate_kwargs = dict(generate_kwargs)
+    for key in (
+        'prompt_latents',
+        'prompt_proprio',
+        'prompt_discrete_actions',
+        'prompt_continuous_actions',
+        'prompt_rewards',
+    ):
+        no_prompt_generate_kwargs.pop(key, None)
+
+    assert_preallocated_matches_eager(**no_prompt_generate_kwargs)
+
+    no_generate_kwargs = dict(generate_kwargs, time_steps = prompt_latents.shape[1])
+
+    with torch.no_grad():
+        eager = dynamics.generate(**no_generate_kwargs)
+        preallocated = dynamics.generate(**no_generate_kwargs, preallocate_outputs = True)
+
+    assert preallocated.agent_embed is eager.agent_embed is None
+    assert preallocated.policy_input is eager.policy_input is None
+    assert preallocated.values is eager.values is None
+    assert_matching_tensor(preallocated.actions.discrete, eager.actions.discrete)
+    assert_matching_tensor(preallocated.actions.continuous, eager.actions.continuous)
 
 def test_action_embedder():
     from dreamer4.dreamer4 import ActionEmbedder

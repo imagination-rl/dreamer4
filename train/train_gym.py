@@ -20,9 +20,13 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
+from contextlib import nullcontext
 from copy import deepcopy
+from contextvars import ContextVar
+from functools import wraps
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, Literal
@@ -70,11 +74,52 @@ from .compile_runtime import (
     record_timed_block,
     synchronize_if_cuda,
 )
+from .profiling import PROFILE_TOTAL_STEPS, TrainingProfiler
+
+
+_runtime_cleanups = ContextVar("runtime_cleanups", default = None)
+
+
+def close_runtime_resources(fn):
+    """Ensure resources registered by a training run close on every exit path."""
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        cleanups = []
+        token = _runtime_cleanups.set(cleanups)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            for cleanup in reversed(cleanups):
+                cleanup()
+            _runtime_cleanups.reset(token)
+
+    return wrapped
+
+
+def register_runtime_cleanup(cleanup):
+    cleanups = _runtime_cleanups.get()
+    if cleanups is not None:
+        cleanups.append(cleanup)
+
 
 def cycle(dl):
     while True:
         for data in dl:
             yield data
+
+
+def repeat_batch_to_size(batch, size: int):
+    tensor = next((value for value in batch.values() if torch.is_tensor(value)), None)
+
+    if not exists(tensor) or tensor.shape[0] == size:
+        return batch
+
+    batch_size = tensor.shape[0]
+    assert 0 < batch_size <= size
+
+    indices = torch.arange(size, device = tensor.device) % batch_size
+    return tree_map(lambda value: value.index_select(0, indices) if torch.is_tensor(value) else value, batch)
 
 # tokenizer
 
@@ -153,6 +198,56 @@ class ObservationTokenizer(nn.Module):
 
 # env helpers
 
+VectorizationMode = Literal["async", "sync"]
+
+
+class RolloutTimingWrapper(gym.vector.VectorWrapper):
+    """Accumulate vector-environment reset and step wall time per rollout."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.reset_seconds = 0.
+        self.step_seconds = 0.
+
+    def reset(self, **kwargs):
+        start = perf_counter()
+        try:
+            return self.env.reset(**kwargs)
+        finally:
+            self.reset_seconds += perf_counter() - start
+
+    def step(self, actions):
+        start = perf_counter()
+        try:
+            return self.env.step(actions)
+        finally:
+            self.step_seconds += perf_counter() - start
+
+    def pop_timings(self):
+        timings = self.reset_seconds, self.step_seconds
+        self.reset_seconds = 0.
+        self.step_seconds = 0.
+        return timings
+
+
+def pop_rollout_env_timings(env):
+    current = env
+
+    while current is not None:
+        if isinstance(current, RolloutTimingWrapper):
+            return current.pop_timings()
+        current = getattr(current, "env", None)
+
+    return 0., 0.
+
+
+def available_cpu_count():
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
 def make_env(
     env_name: str,
     seed: int | None,
@@ -160,9 +255,20 @@ def make_env(
     vectorized = True,
     num_envs = 8,
     episode_stats_buffer_length = 100,
+    env_vectorization_mode: VectorizationMode = "async",
 ):
+    if env_vectorization_mode not in ("async", "sync"):
+        raise ValueError(f"env_vectorization_mode must be 'async' or 'sync', got {env_vectorization_mode!r}")
+
     if vectorized:
-        env = gym.make_vec(env_name, num_envs = num_envs)
+        vector_kwargs = {"context": "spawn"} if env_vectorization_mode == "async" else None
+        env = gym.make_vec(
+            env_name,
+            num_envs = num_envs,
+            vectorization_mode = env_vectorization_mode,
+            vector_kwargs = vector_kwargs,
+        )
+        env = RolloutTimingWrapper(env)
         env = gym.wrappers.vector.RecordEpisodeStatistics(env, buffer_length = episode_stats_buffer_length)
     else:
         env = gym.make(env_name)
@@ -243,8 +349,15 @@ def collect_random_observations(
     num_steps = 4096,
     num_envs = 8,
     seed = 42,
+    env_vectorization_mode: VectorizationMode = "async",
 ):
-    env = make_env(env_name, seed, vectorized = True, num_envs = num_envs)
+    env = make_env(
+        env_name,
+        seed,
+        vectorized = True,
+        num_envs = num_envs,
+        env_vectorization_mode = env_vectorization_mode,
+    )
     obs = reset_env(env, seed = seed)
 
     observations = [obs_array(obs)]
@@ -277,6 +390,25 @@ def obs_to_latents_fn(tokenizer: ObservationTokenizer):
         return latents, time_cache
 
     return inner
+
+
+def experience_to_cpu(exp: Experience):
+    if not isinstance(exp, Experience) or exp.payload.device.type != "cuda":
+        return exp.cpu()
+
+    device = exp.payload.device
+
+    def copy_to_pinned_cpu(tensor: Tensor):
+        if tensor.device.type != "cuda":
+            return tensor.cpu()
+
+        cpu_tensor = torch.empty_like(tensor, device = "cpu", pin_memory = True)
+        cpu_tensor.copy_(tensor, non_blocking = True)
+        return cpu_tensor
+
+    values = tree_map_tensor(copy_to_pinned_cpu, vars(exp))
+    torch.cuda.current_stream(device).synchronize()
+    return Experience(**values)
 
 
 # training helpers
@@ -661,6 +793,7 @@ def train_tokenizer(
     max_grad_norm: float,
     device: torch.device,
     writer: SummaryWriter | None,
+    training_profiler: TrainingProfiler | None = None,
 ):
     tokenizer.to(device)
     observations = observations.to(device)
@@ -678,18 +811,29 @@ def train_tokenizer(
     pbar = tqdm(range(steps), desc = "tokenizer")
 
     for step in pbar:
-        batch = next(iterator)[0]
+        profiler = training_profiler
+        record = profiler.record if exists(profiler) else lambda *_, **__: nullcontext()
 
-        loss = tokenizer(batch)
-        loss.backward()
+        with record("tokenizer/data/load_batch"):
+            batch = next(iterator)[0]
 
-        clip_grad_norm_(tokenizer.parameters(), max_grad_norm)
-        optimizer.step()
-        optimizer.zero_grad()
+        with record("tokenizer/model/forward", cuda = True):
+            loss = tokenizer(batch)
+        with record("tokenizer/model/backward", cuda = True):
+            loss.backward()
+
+        with record("tokenizer/optimization/grad_clip", cuda = True):
+            clip_grad_norm_(tokenizer.parameters(), max_grad_norm)
+        with record("tokenizer/optimization/optimizer_step", cuda = True):
+            optimizer.step()
+            optimizer.zero_grad()
 
         last_loss = loss.item()
         pbar.set_postfix(loss = f"{last_loss:.4f}")
         log_scalars(writer, {"tokenizer/recon_loss": last_loss}, step)
+
+    if exists(training_profiler):
+        training_profiler.flush_timings()
 
     return last_loss
 
@@ -741,9 +885,11 @@ def train_world_model(
     steps: int,
     batch_size: int,
     sequence_length: int | None,
+    static_batch_shape: bool,
     max_grad_norm: float,
     global_step: int,
     writer: SummaryWriter | None,
+    training_profiler: TrainingProfiler | None,
     shortcut_train_mode: ShortcutTrainMode,
     desc: str,
 ):
@@ -771,65 +917,83 @@ def train_world_model(
     pbar = tqdm(range(steps), desc = desc, dynamic_ncols = True)
 
     for step in pbar:
+        profiler = training_profiler
+        record = profiler.record if exists(profiler) else lambda *_, **__: nullcontext()
+        model_step = profiler.step if exists(profiler) else lambda *_, **__: nullcontext()
+
         if exists(world_model_step_timing):
             synchronize_if_cuda(world_model.device)
             step_start = perf_counter()
 
-        batch = next(dataloader_iter)
+        with model_step("world_model/step", cuda = True):
+            with record("world_model/data/load_batch"):
+                batch = next(dataloader_iter)
 
-        exp = Experience.from_buffer_dict(batch)
-        exp.lens = batch.get('_lens')
-        exp = exp.to(world_model.device)
+                if static_batch_shape:
+                    batch = repeat_batch_to_size(batch, batch_size)
 
-        # Mask terminals and is_truncated based on whether the window reaches the episode end
-        reaches_episode_end = batch.get('_reaches_episode_end')
-        if exists(reaches_episode_end):
-            reaches_episode_end = reaches_episode_end.to(world_model.device)
-            if exists(exp.terminals): exp.terminals = exp.terminals & reaches_episode_end
-            if exists(exp.is_truncated): exp.is_truncated = exp.is_truncated & reaches_episode_end.to(world_model.device)
+            with record("world_model/data/prepare_experience", cuda = True):
+                exp = Experience.from_buffer_dict(batch)
+                exp.lens = batch.get('_lens')
+                exp = exp.to(world_model.device)
 
-        def forward_backward():
-            loss, losses = world_model_loss_fn(
-                exp.latents,
-                exp.rewards,
-                exp.terminals,
-                exp.actions.continuous if exists(exp.actions) else None,
-                exp.lens,
-                shortcut_train_mode,
-            )
+                # Mask episode flags when the sampled window does not reach its end.
+                reaches_episode_end = batch.get('_reaches_episode_end')
+                if exists(reaches_episode_end):
+                    reaches_episode_end = reaches_episode_end.to(world_model.device)
+                    if exists(exp.terminals): exp.terminals = exp.terminals & reaches_episode_end
+                    if exists(exp.is_truncated): exp.is_truncated = exp.is_truncated & reaches_episode_end
 
-            loss.backward()
-            return loss, losses
+            def forward_backward():
+                with record("world_model/model/forward", cuda = True):
+                    loss, losses = world_model_loss_fn(
+                        exp.latents,
+                        exp.rewards,
+                        exp.terminals,
+                        exp.actions.continuous if exists(exp.actions) else None,
+                        exp.lens,
+                        shortcut_train_mode,
+                    )
 
-        loss, losses = record_timed_block(world_model_loss_timing, world_model.device, forward_backward)
+                with record("world_model/model/backward", cuda = True):
+                    loss.backward()
+                return loss, losses
 
-        norm, grad_metrics = clip_grad_norm_by_group(grad_clip_groups, max_grad_norm)
-        optimizer.step()
-        optimizer.zero_grad()
+            loss, losses = record_timed_block(world_model_loss_timing, world_model.device, forward_backward)
 
-        last_metrics = {
-            "world_model/loss": loss.item(),
-            "world_model/flow_loss": losses.flow.item(),
-            "world_model/shortcut_loss": losses.shortcut.item(),
-            "world_model/reward_loss": (losses.agent_embed_reward.mean() + losses.latent_state_reward.mean()).item(),
-            "world_model/terminal_loss": (losses.agent_embed_terminal.mean() + losses.latent_state_terminal.mean()).item(),
-            "world_model/agent_state_pred_loss": losses.agent_state_pred.item(),
-            "world_model/grad_norm": float(norm),
-        }
-        last_metrics.update({
-            f"world_model/{key}": value
-            for key, value in grad_metrics.items()
-        })
+            with record("world_model/optimization/grad_clip", cuda = True):
+                norm, grad_metrics = clip_grad_norm_by_group(grad_clip_groups, max_grad_norm)
+            with record("world_model/optimization/optimizer_step", cuda = True):
+                optimizer.step()
+                optimizer.zero_grad()
 
-        log_scalars(writer, last_metrics, global_step)
-        pbar.set_postfix(loss = f"{last_metrics['world_model/loss']:.3f}")
-        global_step += 1
+            with record("world_model/metrics", cuda = True):
+                last_metrics = {
+                    "world_model/loss": loss.item(),
+                    "world_model/flow_loss": losses.flow.item(),
+                    "world_model/shortcut_loss": losses.shortcut.item(),
+                    "world_model/reward_loss": (losses.agent_embed_reward.mean() + losses.latent_state_reward.mean()).item(),
+                    "world_model/terminal_loss": (losses.agent_embed_terminal.mean() + losses.latent_state_terminal.mean()).item(),
+                    "world_model/agent_state_pred_loss": losses.agent_state_pred.item(),
+                    "world_model/grad_norm": float(norm),
+                }
+                last_metrics.update({
+                    f"world_model/{key}": value
+                    for key, value in grad_metrics.items()
+                })
 
-        if exists(world_model_step_timing):
-            synchronize_if_cuda(world_model.device)
-            world_model_step_timing.record(perf_counter() - step_start)
+                log_scalars(writer, last_metrics, global_step)
+                pbar.set_postfix(loss = f"{last_metrics['world_model/loss']:.3f}")
+                global_step += 1
 
-        del exp, loss, losses, grad_metrics
+            if exists(world_model_step_timing):
+                synchronize_if_cuda(world_model.device)
+                world_model_step_timing.record(perf_counter() - step_start)
+
+            del exp, loss, losses, grad_metrics
+
+    if exists(training_profiler):
+        training_profiler.flush_timings()
 
     return global_step, last_metrics
 
@@ -849,12 +1013,14 @@ def train_agent_in_imagination(
     horizon: int,
     prompt_length: int,
     prompt_probability: float,
+    static_generate_shape: bool,
     generate_steps: int,
     max_grad_norm: float,
     objective: Literal["ppo", "pmpo", "spo"],
     use_delight_gating: bool,
     global_step: int,
     writer: SummaryWriter | None,
+    training_profiler: TrainingProfiler | None,
 ):
     if steps <= 0:
         return global_step, {}
@@ -868,6 +1034,9 @@ def train_agent_in_imagination(
         window_length = prompt_length,
     )
 
+    if static_generate_shape and prompt_length > 0 and prompt_probability != 1.:
+        raise ValueError("static compiled generation requires prompt_probability=1.0 when prompt_length > 0")
+
     prompt_dataloader = DataLoader(
         prompt_dataset,
         batch_size = batch_size,
@@ -877,27 +1046,39 @@ def train_agent_in_imagination(
 
     prompt_iterator = cycle(prompt_dataloader) if prompt_length > 0 and len(prompt_dataloader) > 0 else None
 
+    if static_generate_shape and prompt_length > 0 and not exists(prompt_iterator):
+        raise ValueError("static compiled generation requires at least one prompt window")
+
     for _ in pbar:
+        profiler = training_profiler
+        record = profiler.record if exists(profiler) else lambda *_, **__: nullcontext()
+        if exists(profiler):
+            profiler.start_step()
+
         if exists(imagination_step_timing):
             synchronize_if_cuda(world_model.device)
             step_start = perf_counter()
 
         with torch.no_grad():
-            use_prompt = random.random() < prompt_probability
+            use_prompt = prompt_length > 0 and (static_generate_shape or random.random() < prompt_probability)
             prompts = None
 
             if use_prompt and exists(prompt_iterator):
-                prompt_batch = next(prompt_iterator)
+                with record("imagination/data/load_prompt", cuda = True):
+                    prompt_batch = next(prompt_iterator)
 
-                prompt_batch = tree_map(lambda t: t.to(world_model.device) if torch.is_tensor(t) else t, prompt_batch)
+                    prompt_batch = tree_map(lambda t: t.to(world_model.device) if torch.is_tensor(t) else t, prompt_batch)
 
-                prompts = dict(
-                    prompt_latents = prompt_batch.get('latents'),
-                    prompt_proprio = prompt_batch.get('proprio'),
-                    prompt_discrete_actions = prompt_batch.get('actions_discrete'),
-                    prompt_continuous_actions = prompt_batch.get('actions_continuous'),
-                    prompt_rewards = prompt_batch.get('rewards')[:, :-1] if exists(prompt_batch.get('rewards')) else None,
-                )
+                    if static_generate_shape:
+                        prompt_batch = repeat_batch_to_size(prompt_batch, batch_size)
+
+                    prompts = dict(
+                        prompt_latents = prompt_batch.get('latents'),
+                        prompt_proprio = prompt_batch.get('proprio'),
+                        prompt_discrete_actions = prompt_batch.get('actions_discrete'),
+                        prompt_continuous_actions = prompt_batch.get('actions_continuous'),
+                        prompt_rewards = prompt_batch.get('rewards')[:, :-1] if exists(prompt_batch.get('rewards')) else None,
+                    )
 
             generation_horizon = horizon + prompt_length if exists(prompts) else horizon
             actual_batch_size = prompt_batch.get('latents').shape[0] if exists(prompts) else batch_size
@@ -908,51 +1089,56 @@ def train_agent_in_imagination(
             if exists(getattr(generate_rollout_fn, "timing", None)) and generate_rollout_fn.timing.cuda_graphs:
                 cudagraph_mark_step_begin()
 
-            dream = generate_rollout_fn(
-                generation_horizon,
-                actual_batch_size,
-                prompts.get("prompt_latents"),
-                prompts.get("prompt_proprio"),
-                prompts.get("prompt_discrete_actions"),
-                prompts.get("prompt_continuous_actions"),
-                prompts.get("prompt_rewards"),
-            )
+            with record("imagination/model/generate", cuda = True):
+                dream = generate_rollout_fn(
+                    generation_horizon,
+                    actual_batch_size,
+                    prompts.get("prompt_latents"),
+                    prompts.get("prompt_proprio"),
+                    prompts.get("prompt_discrete_actions"),
+                    prompts.get("prompt_continuous_actions"),
+                    prompts.get("prompt_rewards"),
+                )
 
             if has_prompt:
-                dream = trim_prompt_from_dream(dream, prompt_length, horizon)
+                with record("imagination/data/trim_prompt", cuda = True):
+                    dream = trim_prompt_from_dream(dream, prompt_length, horizon)
 
             if objective == "pmpo" and exists(policy_prior):
-                dream = attach_policy_prior_unembeds(dream, policy_prior)
+                with record("imagination/model/policy_prior", cuda = True):
+                    dream = attach_policy_prior_unembeds(dream, policy_prior)
 
         dream_actions = action_pair_or_empty(dream.actions)
         dream_log_probs = action_pair_or_empty(dream.log_probs)
         dream_old_action_unembeds = action_pair_or_empty(dream.old_action_unembeds)
 
         def forward_backward():
-            policy_loss, value_loss, value_diagnostics = learn_from_dream_fn(
-                dream.latents,
-                dream.proprio,
-                dream.critic_state,
-                dream.agent_embed,
-                dream.policy_input,
-                dream.rewards,
-                dream.terminals,
-                dream_actions.discrete,
-                dream_actions.continuous,
-                dream_log_probs.discrete,
-                dream_log_probs.continuous,
-                dream_old_action_unembeds.discrete,
-                dream_old_action_unembeds.continuous,
-                dream.values,
-                dream.step_size,
-                dream.lens,
-                dream.is_truncated,
-                dream.is_from_world_model,
-                dream.episode_return,
-            )
+            with record("imagination/model/learn_forward", cuda = True):
+                policy_loss, value_loss, value_diagnostics = learn_from_dream_fn(
+                    dream.latents,
+                    dream.proprio,
+                    dream.critic_state,
+                    dream.agent_embed,
+                    dream.policy_input,
+                    dream.rewards,
+                    dream.terminals,
+                    dream_actions.discrete,
+                    dream_actions.continuous,
+                    dream_log_probs.discrete,
+                    dream_log_probs.continuous,
+                    dream_old_action_unembeds.discrete,
+                    dream_old_action_unembeds.continuous,
+                    dream.values,
+                    dream.step_size,
+                    dream.lens,
+                    dream.is_truncated,
+                    dream.is_from_world_model,
+                    dream.episode_return,
+                )
 
             loss = policy_loss + value_loss
-            loss.backward()
+            with record("imagination/model/backward", cuda = True):
+                loss.backward()
             return policy_loss, value_loss, value_diagnostics, loss
 
         policy_loss, value_loss, value_diagnostics, loss = record_timed_block(
@@ -961,15 +1147,18 @@ def train_agent_in_imagination(
             forward_backward,
         )
 
-        norm, grad_metrics = clip_grad_norm_by_group(grad_clip_groups, max_grad_norm)
-        optimizer.step()
-        optimizer.zero_grad()
+        with record("imagination/optimization/grad_clip", cuda = True):
+            norm, grad_metrics = clip_grad_norm_by_group(grad_clip_groups, max_grad_norm)
+        with record("imagination/optimization/optimizer_step", cuda = True):
+            optimizer.step()
+            optimizer.zero_grad()
 
-        agent_metrics = agent_approx_kl_metrics(world_model, dream)
-        if objective == "pmpo" and exists(policy_prior):
-            agent_metrics.update(agent_prior_kl_metrics(world_model, dream, policy_prior))
+        with record("imagination/metrics", cuda = True):
+            agent_metrics = agent_approx_kl_metrics(world_model, dream)
+            if objective == "pmpo" and exists(policy_prior):
+                agent_metrics.update(agent_prior_kl_metrics(world_model, dream, policy_prior))
 
-        raw_reward_sum_mean = dream.episode_return.mean().item() if exists(dream.episode_return) else 0.
+        dream_return = dream.episode_return.mean().item() if exists(dream.episode_return) else 0.
         dream_len = dream.lens.float().mean().item() if exists(dream.lens) else horizon
         action_std = dream.actions.continuous.std().item() if exists(dream.actions) and exists(dream.actions.continuous) else 0.
 
@@ -977,7 +1166,7 @@ def train_agent_in_imagination(
             "imagination/loss": loss.item(),
             "imagination/policy_loss": policy_loss.item(),
             "imagination/value_loss": value_loss.item(),
-            "imagination/raw_reward_sum_mean": raw_reward_sum_mean,
+            "imagination/dream_return": dream_return,
             "imagination/dream_length": dream_len,
             "imagination/action_std": action_std,
             "imagination/prompt_length": prompt_length if has_prompt else 0,
@@ -999,12 +1188,15 @@ def train_agent_in_imagination(
         })
 
         log_scalars(writer, last_metrics, global_step)
-        pbar.set_postfix(raw_reward = f"{raw_reward_sum_mean:.1f}", loss = f"{loss.item():.3f}")
+        pbar.set_postfix(dream_return = f"{dream_return:.1f}", loss = f"{loss.item():.3f}")
         global_step += 1
 
         if exists(imagination_step_timing):
             synchronize_if_cuda(world_model.device)
             imagination_step_timing.record(perf_counter() - step_start)
+
+        if exists(profiler):
+            profiler.advance()
 
         # dream tensors can live in the compiled generate path's CUDA Graph pool
         # and must not outlive this iteration - the next replay overwrites them
@@ -1013,6 +1205,9 @@ def train_agent_in_imagination(
         del agent_metrics, grad_metrics
         del dream_actions, dream_log_probs, dream_old_action_unembeds
         del policy_loss, value_loss, value_diagnostics, loss
+
+    if exists(training_profiler):
+        training_profiler.flush_timings()
 
     return global_step, last_metrics
 
@@ -1083,12 +1278,14 @@ def serialize_hyperparameters(hyperparameters: dict):
     return "```json\n" + json.dumps(hyperparameters, indent = 2, sort_keys = True, default = str) + "\n```"
 
 
+@close_runtime_resources
 def main(
     *,
     env_name: str,
     num_loops: int,
     rollouts_per_loop: int,
     num_envs: int,
+    env_vectorization_mode: VectorizationMode,
     max_timesteps: int,
     replay_size: int,
     seed: int,
@@ -1143,7 +1340,8 @@ def main(
     checkpoint_path: str | None,
     clear_log_dir: bool,
     unique_log_dir: bool,
-    compile: bool,
+    compile: bool | None,
+    compile_interact: bool,
     compile_world_model: bool,
     compile_generate: bool,
     compile_learn: bool,
@@ -1151,10 +1349,18 @@ def main(
     compile_mode: str | None,
     compile_fullgraph: bool,
     compile_dynamic: bool | None,
+    compile_generate_cudagraphs: bool,
+    optimize_generate_compilation: bool,
     track_compile_performance: bool,
     allow_tf32: bool,
     require_cuda: bool,
     return_compile_timings: bool,
+    collect_timings: bool,
+    profile: bool,
+    profile_memory: bool,
+    profile_record_shapes: bool,
+    profile_with_stack: bool,
+    profile_with_flops: bool,
 ):
     hyperparameters = dict(locals())
 
@@ -1163,6 +1369,20 @@ def main(
 
     if exists(checkpoint_path) and clear_log_dir:
         raise ValueError("clear_log_dir must be false when checkpoint_path is set, otherwise resume state would be deleted")
+
+    configured_profile_steps = (
+        (
+            pretrain_world_model_finetune_steps + pretrain_world_model_combined_steps
+            if not exists(checkpoint_path) and num_loops > 0
+            else 0
+        )
+        + num_loops * (world_model_train_steps + imagination_train_steps)
+    )
+    if profile and configured_profile_steps < PROFILE_TOTAL_STEPS:
+        raise ValueError(
+            f"profile mode requires at least {PROFILE_TOTAL_STEPS} configured world-model/imagination steps "
+            f"(5 warmup + 4 active), but this run has {configured_profile_steps}"
+        )
 
     compile_mode = normalize_compile_mode(compile_mode)
     obs_dim, action_dim, action_range = inspect_env_spaces(env_name, obs_dim)
@@ -1173,8 +1393,21 @@ def main(
 
     device = torch.device("cpu" if cpu or not torch.cuda.is_available() else "cuda")
 
+    if compile is None:
+        compile = device.type == "cuda"
+
     if require_cuda and device.type != "cuda":
         raise RuntimeError("CUDA was required for this run, but no CUDA device is available")
+
+    if env_vectorization_mode not in ("async", "sync"):
+        raise ValueError(f"env_vectorization_mode must be 'async' or 'sync', got {env_vectorization_mode!r}")
+
+    allocated_cpus = available_cpu_count()
+    if env_vectorization_mode == "async" and num_envs > allocated_cpus:
+        print(
+            f"warning: async vectorization requested {num_envs} environment workers, "
+            f"but this process can use only {allocated_cpus} CPUs"
+        )
 
     if allow_tf32 and device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -1203,7 +1436,22 @@ def main(
     if clear_log_dir:
         shutil.rmtree(run_log_dir, ignore_errors = True)
 
-    writer = SummaryWriter(str(run_log_dir)) if use_tensorboard else None
+    event_writer = SummaryWriter(str(run_log_dir)) if use_tensorboard or collect_timings else None
+    writer = event_writer if use_tensorboard else None
+    if exists(event_writer):
+        register_runtime_cleanup(event_writer.close)
+    training_profiler = TrainingProfiler(
+        run_log_dir,
+        device,
+        writer = event_writer,
+        collect_timings = collect_timings,
+        profile = profile,
+        profile_memory = profile_memory,
+        profile_record_shapes = profile_record_shapes,
+        profile_with_stack = profile_with_stack,
+        profile_with_flops = profile_with_flops,
+    )
+    register_runtime_cleanup(training_profiler.close)
     if exists(writer):
         writer.add_text("run/details", run_details, 0)
         writer.add_text("run/hyperparameters", serialize_hyperparameters(hyperparameters), 0)
@@ -1222,6 +1470,7 @@ def main(
             num_steps = max(1, pretrain_tokenizer_observations // num_envs),
             num_envs = num_envs,
             seed = seed,
+            env_vectorization_mode = env_vectorization_mode,
         )[:pretrain_tokenizer_observations]
 
         assert pretrain_obs.shape[-1] == obs_dim, f"{env_name} produced obs dim {pretrain_obs.shape[-1]}, expected {obs_dim}"
@@ -1235,6 +1484,7 @@ def main(
             max_grad_norm = max_grad_norm,
             device = device,
             writer = writer,
+            training_profiler = training_profiler,
         )
 
     tokenizer.eval()
@@ -1247,7 +1497,9 @@ def main(
         vectorized = True,
         num_envs = num_envs,
         episode_stats_buffer_length = max(100, num_envs * max_timesteps),
+        env_vectorization_mode = env_vectorization_mode,
     )
+    register_runtime_cleanup(env.close)
 
     reward_range = (-4., 4.)
     value_range = (-10., 10.)
@@ -1316,14 +1568,35 @@ def main(
         load_optimizer_state_if_compatible(agent_optimizer, pkg["agent_optimizer"], "agent")
         start_loop = int(pkg.get("loop", 0)) + 1
 
+    remaining_profile_steps = (
+        (
+            pretrain_world_model_finetune_steps + pretrain_world_model_combined_steps
+            if start_loop == 0 and num_loops > 0
+            else 0
+        )
+        + max(0, num_loops - start_loop) * (world_model_train_steps + imagination_train_steps)
+    )
+    if profile and remaining_profile_steps < PROFILE_TOTAL_STEPS:
+        raise ValueError(
+            f"profile mode requires {PROFILE_TOTAL_STEPS} remaining world-model/imagination steps, "
+            f"but the loaded run has {remaining_profile_steps}"
+        )
+
     policy_prior = FrozenPolicyPrior(world_model).to(device) if objective == "pmpo" else None
+    compile_interact = compile or compile_interact
     compile_world_model = compile or compile_world_model
     compile_generate = compile or compile_generate
     compile_learn = compile or compile_learn
+    static_compile_shapes = compile_dynamic is False
+
+    if compile_generate and static_compile_shapes and imagination_prompt_length > 0 and imagination_prompt_probability != 1.:
+        raise ValueError("compile_generate requires imagination_prompt_probability=1.0 when imagination_prompt_length > 0")
 
     compile_runtime = build_compile_runtime(
         world_model,
         device = device,
+        compile_interact = compile_interact,
+        interact_max_timesteps = max_timesteps,
         compile_world_model = compile_world_model,
         compile_generate = compile_generate,
         compile_learn = compile_learn,
@@ -1331,6 +1604,8 @@ def main(
         compile_mode = compile_mode,
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = compile_dynamic,
+        compile_generate_cudagraphs = compile_generate_cudagraphs,
+        optimize_generate_compilation = optimize_generate_compilation,
         track_compile_performance = track_compile_performance,
         imagination_generate_steps = imagination_generate_steps,
         imagination_use_time_cache = imagination_use_time_cache,
@@ -1353,11 +1628,16 @@ def main(
     did_world_model_pretrain = start_loop > 0
 
     print(f"training {env_name} from {obs_dim} raw observations on {device}")
-    print(f"tensorboard log dir: {run_log_dir.absolute()}" if use_tensorboard else "tensorboard disabled")
-    if compile_world_model or compile_generate or compile_learn:
+    print(f"tensorboard log dir: {run_log_dir.absolute()}" if exists(event_writer) else "tensorboard disabled")
+    if collect_timings:
+        print(f"timing log dir: {training_profiler.log_dir.absolute()}")
+    if profile:
+        print("profile mode: 5 warmup steps, 4 measured steps, then exit")
+    if compile_interact or compile_world_model or compile_generate or compile_learn:
         compiled_paths = [
             name
             for name, enabled in (
+                ("interact_forward", compile_interact),
                 ("world_model_loss", compile_world_model),
                 ("imagination_generate", compile_generate),
                 ("imagination_learn", compile_learn),
@@ -1365,18 +1645,21 @@ def main(
             if enabled
         ]
         print(f"torch.compile enabled for: {', '.join(compiled_paths)}")
-        if device.type == "cuda" and compile_mode_uses_cuda_graphs(compile_mode):
-            cuda_graph_paths = [
-                name
-                for name, enabled in (
-                    ("imagination_generate", compile_generate),
-                )
-                if enabled
-            ]
+        if device.type == "cuda":
+            cuda_graph_paths = [timing.name for timing in compile_runtime.timings if timing.cuda_graphs]
 
             if len(cuda_graph_paths) > 0:
                 print(f"CUDA Graph capture enabled for: {', '.join(cuda_graph_paths)}")
-                print("CUDA Graph capture disabled for autograd training losses")
+            elif compile_mode_uses_cuda_graphs(compile_mode):
+                print("CUDA Graph capture disabled for compiled paths")
+
+        fallback_paths = [
+            f"{timing.name}:{compile_mode}->{timing.compile_mode}"
+            for timing in compile_runtime.timings
+            if timing.compiled and exists(timing.compile_mode) and timing.compile_mode != compile_mode
+        ]
+        if len(fallback_paths) > 0:
+            print(f"torch.compile mode fallback for: {', '.join(fallback_paths)}")
     if exists(tokenizer_loss):
         print(f"tokenizer pretrain recon loss: {tokenizer_loss:.4f}")
 
@@ -1392,22 +1675,36 @@ def main(
             for rollout_idx in range(rollouts_per_loop):
                 start_episode_count = get_episode_count(env)
 
-                exp = world_model.interact_with_env(
-                    env,
-                    seed = seed if loop == 0 and rollout_idx == 0 else None,
-                    max_timesteps = max_timesteps,
-                    env_is_vectorized = True,
-                    store_agent_embed = False,
-                    store_old_action_unembeds = False,
-                    obs_to_latents_fn = obs_to_latents_fn(tokenizer),
+                rollout_start = perf_counter()
+                with training_profiler.record("rollout/model/interact_with_env"):
+                    exp = world_model.interact_with_env(
+                        env,
+                        seed = seed if loop == 0 and rollout_idx == 0 else None,
+                        max_timesteps = max_timesteps,
+                        env_is_vectorized = True,
+                        store_agent_embed = False,
+                        store_old_action_unembeds = False,
+                        obs_to_latents_fn = obs_to_latents_fn(tokenizer),
+                        forward_fn = compile_runtime.interact_forward,
+                    )
+
+                rollout_seconds = perf_counter() - rollout_start
+                reset_seconds, env_step_seconds = pop_rollout_env_timings(env)
+                training_profiler.log_timing("rollout/environment/reset", reset_seconds * 1000.)
+                training_profiler.log_timing("rollout/environment/step_total", env_step_seconds * 1000.)
+                training_profiler.log_timing(
+                    "rollout/model_and_orchestration",
+                    max(rollout_seconds - reset_seconds - env_step_seconds, 0.) * 1000.,
                 )
+                training_profiler.flush_timings()
 
                 if tokenizer_eval_every > 0 and divisible_by(loop, tokenizer_eval_every):
-                    tokenizer_eval_loss = eval_tokenizer_on_experience(
-                        tokenizer,
-                        exp,
-                        max_samples = tokenizer_eval_batch_size,
-                    )
+                    with training_profiler.record("rollout/tokenizer/evaluate", cuda = True):
+                        tokenizer_eval_loss = eval_tokenizer_on_experience(
+                            tokenizer,
+                            exp,
+                            max_samples = tokenizer_eval_batch_size,
+                        )
 
                     if exists(tokenizer_eval_loss):
                         loss, sample_count = tokenizer_eval_loss
@@ -1423,19 +1720,21 @@ def main(
                         circular = True,
                     )
 
-                for single_exp in exp.unbind():
-                    data, meta = single_exp.cpu().to_buffer_dict()
-                    data, meta = tree_map_tensor(lambda t: rearrange(t, '1 ... -> ...'), (data, meta))
-                    replay.store_episode(**data, **meta)
+                with training_profiler.record("rollout/replay/store"):
+                    cpu_exp = experience_to_cpu(exp)
+                    for single_exp in cpu_exp.unbind():
+                        data, meta = single_exp.to_buffer_dict()
+                        data, meta = tree_map_tensor(lambda t: rearrange(t, '1 ... -> ...'), (data, meta))
+                        replay.store_episode(**data, **meta)
 
-                rollout_horizon_returns.extend(exp.episode_return.detach().cpu().tolist())
+                rollout_horizon_returns.extend(cpu_exp.episode_return.tolist())
 
-                rollout_steps = exp.rewards.shape[1]
-                has_bootstrap_padding = exists(exp.is_truncated) and exists(exp.terminals) and (exp.is_truncated & ~exp.terminals).any()
+                rollout_steps = cpu_exp.rewards.shape[1]
+                has_bootstrap_padding = exists(cpu_exp.is_truncated) and exists(cpu_exp.terminals) and (cpu_exp.is_truncated & ~cpu_exp.terminals).any()
                 if has_bootstrap_padding:
                     rollout_steps -= 1
 
-                env_step += rollout_steps * exp.rewards.shape[0]
+                env_step += rollout_steps * cpu_exp.rewards.shape[0]
 
                 completed_returns, completed_lengths = get_completed_episode_stats(env, start_episode_count)
 
@@ -1481,9 +1780,11 @@ def main(
                 steps = pretrain_world_model_finetune_steps,
                 batch_size = world_model_batch_size,
                 sequence_length = world_model_train_sequence_length,
+                static_batch_shape = compile_world_model and static_compile_shapes,
                 max_grad_norm = max_grad_norm,
                 global_step = wm_step,
                 writer = writer,
+                training_profiler = training_profiler,
                 shortcut_train_mode = "finetune",
                 desc = "world model pretrain finetune",
             )
@@ -1498,9 +1799,11 @@ def main(
                 steps = pretrain_world_model_combined_steps,
                 batch_size = world_model_batch_size,
                 sequence_length = world_model_train_sequence_length,
+                static_batch_shape = compile_world_model and static_compile_shapes,
                 max_grad_norm = max_grad_norm,
                 global_step = wm_step,
                 writer = writer,
+                training_profiler = training_profiler,
                 shortcut_train_mode = "combined",
                 desc = "world model pretrain combined",
             )
@@ -1517,9 +1820,11 @@ def main(
             steps = world_model_train_steps,
             batch_size = world_model_batch_size,
             sequence_length = world_model_train_sequence_length,
+            static_batch_shape = compile_world_model and static_compile_shapes,
             max_grad_norm = max_grad_norm,
             global_step = wm_step,
             writer = writer,
+            training_profiler = training_profiler,
             shortcut_train_mode = "combined",
             desc = "world model",
         )
@@ -1542,12 +1847,14 @@ def main(
             horizon = imagination_horizon,
             prompt_length = imagination_prompt_length,
             prompt_probability = imagination_prompt_probability,
+            static_generate_shape = compile_generate and static_compile_shapes,
             generate_steps = imagination_generate_steps,
             max_grad_norm = max_grad_norm,
             objective = objective,
             use_delight_gating = use_delight_gating,
             global_step = imagination_step,
             writer = writer,
+            training_profiler = training_profiler,
         )
 
         postfix_return = avg_return if exists(avg_return) else avg_horizon_return
@@ -1555,25 +1862,26 @@ def main(
         if wm_metrics:
             postfix["wm"] = f"{wm_metrics['world_model/loss']:.2f}"
         if imagination_metrics:
-            postfix["dream"] = f"{imagination_metrics['imagination/raw_reward_sum_mean']:.1f}"
+            postfix["dream"] = f"{imagination_metrics['imagination/dream_return']:.1f}"
         pbar.set_postfix(postfix)
 
         if checkpoint_every > 0 and divisible_by(loop + 1, checkpoint_every):
-            save_checkpoint(
-                checkpoint_root / f"loop_{loop + 1}.pt",
-                loop = loop,
-                tokenizer = tokenizer,
-                world_model = world_model,
-                world_optimizer = world_optimizer,
-                agent_optimizer = agent_optimizer,
-            )
+            with training_profiler.record("checkpoint/save"):
+                save_checkpoint(
+                    checkpoint_root / f"loop_{loop + 1}.pt",
+                    loop = loop,
+                    tokenizer = tokenizer,
+                    world_model = world_model,
+                    world_optimizer = world_optimizer,
+                    agent_optimizer = agent_optimizer,
+                )
 
-    env.close()
+        training_profiler.flush_timings(flush_writer = True)
+
     print_compile_timing_report(compile_runtime.timings)
 
-    if exists(writer):
-        writer.flush()
-        writer.close()
+    if exists(event_writer):
+        event_writer.flush()
 
     if return_compile_timings:
         return compile_runtime.timings

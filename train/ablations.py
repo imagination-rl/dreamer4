@@ -28,7 +28,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 GYM_LOG_ROOT = Path("runs/gym_imagination")
 
 ABLATIONS = [
-    {"run_name": "baseline", "run_details": "baseline, with the symexp changes and new script"},
+    {"run_name": "faster_compile", "run_details": "750 env steps; compiled interact KV/time dynamic no graphs; fewer CPU-GPU syncs; 32 WM updates; 10 imagination updates; still has symexp"},
 ]
 
 
