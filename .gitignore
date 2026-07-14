@@ -5,6 +5,8 @@ logs_*/
 logs/
 runs/
 
+AGENTS.md
+
 # slurm
 *.out
 
