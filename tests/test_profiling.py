@@ -223,8 +223,9 @@ class FakeSingleExperience:
 class FakeExperience:
     episode_return = torch.zeros(1)
     rewards = torch.zeros(1, 1)
-    terminals = torch.zeros(1, 1, dtype = torch.bool)
-    is_truncated = torch.zeros(1, 1, dtype = torch.bool)
+    lens = torch.ones(1, dtype = torch.long)
+    terminals = torch.zeros(1, dtype = torch.bool)
+    is_truncated = torch.zeros(1, dtype = torch.bool)
 
     def cpu(self):
         return self
@@ -283,8 +284,6 @@ def install_fake_main_runtime(monkeypatch):
     monkeypatch.setattr(train_gym, "DynamicsWorldModel", FakeWorldModel)
     monkeypatch.setattr(train_gym, "make_optimizer", lambda *args, **kwargs: object())
     monkeypatch.setattr(train_gym, "make_env", lambda *args, **kwargs: environment)
-    monkeypatch.setattr(train_gym, "get_episode_count", lambda env: 0)
-    monkeypatch.setattr(train_gym, "get_completed_episode_stats", lambda *args: ([], []))
     monkeypatch.setattr(train_gym.Experience, "create_memmap_replay_buffer", lambda *args, **kwargs: replay)
     monkeypatch.setattr(train_gym, "train_world_model", fake_train_world_model)
     monkeypatch.setattr(

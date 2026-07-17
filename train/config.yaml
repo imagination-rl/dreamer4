@@ -1,6 +1,6 @@
 # Environment and device setup
 env_name: HalfCheetah-v4
-seed: 42
+seed: 4
 cpu: false
 require_cuda: true
 allow_tf32: true
@@ -17,43 +17,72 @@ time_block_every: 2
 final_special_cross_attn: false
 reward_encoder_type: hl_gauss
 prob_shortcut_train: null
-policy_all_tokens: false
+policy_all_tokens: true
+
+# Old settings added
+spatial_flex_attention_backend: AUTO
+reward_encoder_num_bins: 255
+value_encoder_num_bins: 255
+reward_use_symlog: false
+value_use_symlog: false
+reward_decode_symlog_expected_raw: false
+value_decode_symlog_expected_raw: false
+normalize_advantages: false
+add_action_embed_to_agent_token: true
+old_continuous_action_encoder: true
+old_reward_shifting: true
+old_pmpo: true
+old_reward_head: true
+old_terminal_head: true
+old_state_tokenizer: true
+old_dynamics_ff: true
+old_policy_head: true
+old_value_head: true
+old_replay_sampling: true
+old_embedding_init: true
+reward_range: [-20.0, 20.0]
+reward_encoder_sigma_to_bin_ratio: 2.0
+reward_min_max_value_on_bin_center: false
+value_range: [-1200.0, 1200.0]
+value_encoder_sigma_to_bin_ratio: 0.75
+value_min_max_value_on_bin_center: false
+value_head_init_value: 0.0
 
 # Tokenizer pretraining
-pretrain_tokenizer_steps: 1000
-pretrain_tokenizer_observations: 8192
-tokenizer_batch_size: 256
-tokenizer_learning_rate: 0.0003
+pretrain_tokenizer_steps: 2000
+pretrain_tokenizer_observations: 16384
+tokenizer_batch_size: 1024
+tokenizer_learning_rate: 0.0006
 tokenizer_eval_every: 10
 tokenizer_eval_batch_size: 2048
 
 # Environment rollout collection
 num_loops: 500
 rollouts_per_loop: 1
-num_envs: 32
+num_envs: 64
 env_vectorization_mode: async
-max_timesteps: 750
+max_timesteps: 1000
 replay_size: 256
 
 # World model training
-world_model_batch_size: 32
-pretrain_world_model_finetune_steps: 64
-pretrain_world_model_combined_steps: 256
-world_model_train_steps: 32
+world_model_batch_size: 128
+pretrain_world_model_finetune_steps: 0
+pretrain_world_model_combined_steps: 250
+world_model_train_steps: 13
 world_model_train_sequence_length: 200
-world_model_learning_rate: 0.0003
+world_model_learning_rate: 0.0006
 
 # Imagination rollout generation
-imagination_batch_size: 128
+imagination_batch_size: 512
 imagination_horizon: 32
 imagination_prompt_length: 8
 imagination_prompt_probability: 1.0
-imagination_train_steps: 10
+imagination_train_steps: 3
 imagination_generate_steps: 4
 imagination_use_time_cache: true
 
 # Agent learning in imagination
-agent_learning_rate: 0.0003
+agent_learning_rate: 0.0006
 objective: pmpo
 pmpo_pos_to_neg_weight: 0.5
 pmpo_kl_div_loss_weight: 0.3
@@ -77,9 +106,12 @@ compile_mode: reduce-overhead
 compile_fullgraph: false
 compile_dynamic: false
 compile_generate_cudagraphs: true
-optimize_generate_compilation: true
+optimize_generate_compilation: false
+compile_generate_with_time_cache: true
 track_compile_performance: false
 return_compile_timings: false
+# Selective activation recomputation: 0 recomputes most; 1 is torch.compile's default.
+activation_memory_budget: 0.9
 
 # Profiling. Lightweight record_function timings are enabled by default.
 # Full profile mode always exits after 5 warmup + 4 measured model steps.

@@ -117,6 +117,30 @@ def compile_mode_uses_cuda_graphs(mode: str | None):
     return normalize_compile_mode(mode) in ("reduce-overhead", "max-autotune")
 
 
+def configure_sac(activation_memory_budget: float):
+    """Configure torch.compile's selective activation recomputation budget."""
+    try:
+        activation_memory_budget = float(activation_memory_budget)
+    except (TypeError, ValueError) as error:
+        raise ValueError("activation_memory_budget must be a number between 0 and 1") from error
+
+    if not 0. <= activation_memory_budget <= 1.:
+        raise ValueError("activation_memory_budget must be between 0 and 1")
+
+    # Importing Dynamo first initializes the compiler config modules before the
+    # private functorch config is updated. Keep this compatible with PyTorch
+    # builds that do not expose functorch by treating SAC as unavailable.
+    _ = torch._dynamo
+    try:
+        from torch._functorch import config as functorch_config
+    except ImportError:
+        return False
+
+    functorch_config.activation_memory_budget = activation_memory_budget
+    functorch_config.activation_offload_cpu_gpu_bw = 300
+    return True
+
+
 def cudagraph_mark_step_begin():
     mark_step_begin = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
 
@@ -237,6 +261,7 @@ class ImaginationGenerateRollout(nn.Module):
         use_time_cache: bool,
         preallocate_outputs: bool,
         optimize_generate_compilation: bool = False,
+        forward_for_generate: Callable | None = None,
     ):
         super().__init__()
         self.world_model = world_model
@@ -245,6 +270,7 @@ class ImaginationGenerateRollout(nn.Module):
         self.use_time_cache = use_time_cache
         self.preallocate_outputs = preallocate_outputs
         self.optimize_generate_compilation = optimize_generate_compilation
+        self.forward_for_generate = forward_for_generate
 
     def forward(
         self,
@@ -270,6 +296,7 @@ class ImaginationGenerateRollout(nn.Module):
             store_old_action_unembeds = self.store_old_action_unembeds,
             preallocate_outputs = self.preallocate_outputs,
             optimize_generate_compilation = self.optimize_generate_compilation,
+            forward_for_generate = self.forward_for_generate,
             prompt_latents = prompt_latents,
             prompt_proprio = prompt_proprio,
             prompt_discrete_actions = prompt_discrete_actions,
@@ -467,9 +494,11 @@ def build_compile_runtime(
     compile_dynamic: bool | None,
     compile_generate_cudagraphs: bool,
     optimize_generate_compilation: bool = False,
+    compile_generate_with_time_cache: bool = False,
     track_compile_performance: bool,
     imagination_generate_steps: int,
     imagination_use_time_cache: bool,
+    imagination_max_timesteps: int = 64,
     objective: Literal["ppo", "pmpo", "spo"],
     use_delight_gating: bool,
     store_old_action_unembeds: bool,
@@ -477,6 +506,15 @@ def build_compile_runtime(
     interact_max_timesteps: int = 16,
 ) -> CompileRuntime:
     timings = []
+
+    if compile_generate_with_time_cache and optimize_generate_compilation:
+        raise ValueError(
+            "compile_generate_with_time_cache and optimize_generate_compilation "
+            "select different generation implementations and cannot both be enabled"
+        )
+
+    if compile_generate_with_time_cache and not imagination_use_time_cache:
+        raise ValueError("compile_generate_with_time_cache requires imagination_use_time_cache=true")
 
     interact_forward, timing = maybe_compile_and_time(
         InteractWithEnvForward(world_model),
@@ -514,6 +552,30 @@ def build_compile_runtime(
     world_model_loss_timing = timing if track_compile_performance else None
     timings.append(timing)
 
+    cached_generate_forward = None
+    if compile_generate and compile_generate_with_time_cache:
+        cached_generate_forward, timing = maybe_compile_and_time(
+            world_model._forward_for_generate_impl,
+            name = "imagination_generate_forward_cached",
+            enabled = True,
+            track_timing = False,
+            device = device,
+            compile_backend = compile_backend,
+            compile_mode = compile_mode,
+            compile_fullgraph = compile_fullgraph,
+            # The KV cache grows on every generated state. A dynamic inner
+            # forward specializes once for the empty-cache case and then reuses
+            # its cached graphs instead of compiling the Python rollout loop.
+            compile_dynamic = True,
+            compile_cudagraphs = False,
+            wrap_timing = False,
+        )
+        cached_generate_forward = DynamicTimeCacheCallable(
+            cached_generate_forward,
+            max_time = imagination_max_timesteps,
+        )
+        timings.append(timing)
+
     generate_rollout_module = ImaginationGenerateRollout(
         world_model,
         generate_steps = imagination_generate_steps,
@@ -521,12 +583,17 @@ def build_compile_runtime(
         use_time_cache = imagination_use_time_cache,
         preallocate_outputs = compile_generate or optimize_generate_compilation,
         optimize_generate_compilation = optimize_generate_compilation,
+        forward_for_generate = cached_generate_forward,
     )
 
     generate_rollout, timing = maybe_compile_and_time(
         generate_rollout_module,
         name = "imagination_generate",
-        enabled = compile_generate and not optimize_generate_compilation,
+        enabled = (
+            compile_generate and
+            not optimize_generate_compilation and
+            not compile_generate_with_time_cache
+        ),
         track_timing = track_compile_performance,
         device = device,
         compile_backend = compile_backend,

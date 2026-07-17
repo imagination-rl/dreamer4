@@ -14,6 +14,7 @@ from train.compile_runtime import (
     ImaginationGenerateRollout,
     InteractWithEnvForward,
     build_compile_runtime,
+    configure_sac,
     reset_torch_compile_state,
 )
 
@@ -75,6 +76,12 @@ class InvocationTracker:
         finally:
             self.backend.phase = None
             self.backend.invocation = None
+
+
+@pytest.mark.parametrize("budget", (-0.1, 1.1, float("nan"), "invalid"))
+def test_configure_sac_rejects_invalid_memory_budget(budget):
+    with pytest.raises(ValueError, match = "activation_memory_budget"):
+        configure_sac(budget)
 
 
 def make_tiny_world_model(*, dim = 8, attn_dim_head = 8, **kwargs):
@@ -293,6 +300,42 @@ def test_interact_forward_dynamic_cache_compilation_plateaus(reset_compile_after
     assert compiled_cache.main.next_kv_cache.shape[-2] == 5
 
 
+def test_compiled_interact_preserves_legacy_action_time_axis(reset_compile_after_test):
+    model = make_tiny_world_model(
+        old_continuous_action_encoder = True,
+        add_action_embed_to_agent_token = True,
+    ).eval()
+    eager_model = deepcopy(model).eval()
+    compiled = torch.compile(
+        InteractWithEnvForward(model),
+        backend = "eager",
+        dynamic = True,
+    )
+    kwargs = dict(
+        latents = torch.randn(2, 1, 1, 1, 4),
+        signal_levels = 7,
+        step_sizes = 2,
+        rewards = None,
+        discrete_actions = None,
+        continuous_actions = torch.rand(2, 1, 2),
+        proprio = None,
+        time_cache = None,
+        latent_is_noised = True,
+        latent_has_view_dim = True,
+        return_pred_only = True,
+        return_intermediates = True,
+    )
+
+    with torch.no_grad():
+        compiled_pred, (compiled_embeds, _) = compiled(**kwargs)
+        eager_pred, (eager_embeds, _) = InteractWithEnvForward(eager_model)(**kwargs)
+
+    assert compiled_pred.flow.shape == (2, 1, 1, 1, 4)
+    assert compiled_embeds.agent.shape == (2, 1, 1, 8)
+    assert torch.allclose(compiled_pred.flow, eager_pred.flow)
+    assert torch.allclose(compiled_embeds.agent, eager_embeds.agent)
+
+
 def test_attention_softclamp_is_a_nonpersistent_scalar_buffer():
     model = make_tiny_world_model(attn_softclamp_value = 50.)
     softclamp = model.transformer.attn_softclamp_value
@@ -472,6 +515,193 @@ def test_optimized_generate_skips_outer_runtime_compile(monkeypatch):
     assert len(compile_calls) == 1
     assert compile_calls[0][0].__name__ == "_forward_for_generate_impl"
     assert compile_calls[0][1] == {"dynamic": True, "fullgraph": False}
+
+
+def test_cached_generate_inner_compile_matches_eager_and_plateaus(reset_compile_after_test):
+    backend = CompileCounterBackend()
+    model = make_tiny_world_model().eval()
+    runtime = build_compile_runtime(
+        model,
+        device = torch.device("cpu"),
+        compile_world_model = False,
+        compile_generate = True,
+        compile_learn = False,
+        compile_backend = backend,
+        compile_mode = None,
+        compile_fullgraph = False,
+        compile_dynamic = False,
+        compile_generate_cudagraphs = False,
+        optimize_generate_compilation = False,
+        compile_generate_with_time_cache = True,
+        track_compile_performance = False,
+        imagination_generate_steps = 2,
+        imagination_use_time_cache = True,
+        imagination_max_timesteps = 5,
+        objective = "ppo",
+        use_delight_gating = False,
+        store_old_action_unembeds = False,
+    )
+    kwargs = generate_kwargs(time_steps = 5)
+    cumulative_compilations = []
+
+    with torch.no_grad():
+        torch.manual_seed(123)
+        eager = model.generate(**kwargs)
+
+        for invocation in range(1, 4):
+            backend.phase = "generate"
+            backend.invocation = invocation
+            torch.manual_seed(123)
+            actual = runtime.generate_rollout(5, 2)
+            backend.phase = backend.invocation = None
+            assert_matching_experience(actual, eager)
+            cumulative_compilations.append(len(backend.events))
+
+    # An empty-cache graph and cached graph fragments are expected on the cold
+    # rollout. Repeating the same outer training loop must not compile again.
+    assert cumulative_compilations[-1] == cumulative_compilations[-2]
+    assert backend.counts_by_invocation("generate").keys() == {1}
+
+
+def test_cached_generate_inner_compile_matches_eager_forward_and_backward(
+    reset_compile_after_test,
+):
+    torch.manual_seed(5)
+    eager_model = make_tiny_world_model().eval()
+    compiled_model = deepcopy(eager_model).eval()
+
+    torch.manual_seed(11)
+    latents = torch.randn(2, 3, 1, 1, 4)
+    signal_levels = torch.full((2, 3), 7, dtype = torch.long)
+    continuous_actions = torch.rand(2, 3, 2)
+    rewards = torch.randn(2, 3)
+
+    def call(fn, time, cache = None):
+        return fn(
+            latents = latents[:, :time],
+            signal_levels = signal_levels[:, :time],
+            step_sizes = 2,
+            rewards = rewards[:, :time],
+            tasks = None,
+            latent_gene_ids = None,
+            discrete_actions = None,
+            continuous_actions = continuous_actions[:, :time],
+            proprio = None,
+            time_cache = cache,
+            aug_id = False,
+            latent_is_noised = True,
+            latent_has_view_dim = True,
+            return_pred_only = True,
+            return_intermediates = True,
+        )
+
+    def output_loss(output):
+        prediction, (embeds, cache) = output
+        tensors = (prediction.flow, embeds.agent, embeds.actor, embeds.critic)
+        loss = sum(tensor.float().square().mean() for tensor in tensors if tensor is not None)
+        return prediction, embeds, cache, loss
+
+    # Reference one full causal forward against a compiled incremental forward.
+    # Restrict the loss to the newly processed state so their backward contracts
+    # are the same even though the cached route first materializes the prefix.
+    eager_prediction, eager_embeds, _, _ = output_loss(
+        call(eager_model._forward_for_generate_impl, 3)
+    )
+    eager_tensors = (
+        eager_prediction.flow,
+        eager_embeds.agent,
+        eager_embeds.actor,
+        eager_embeds.critic,
+    )
+    eager_loss = sum(
+        tensor[:, -1:].float().square().mean()
+        for tensor in eager_tensors
+        if tensor is not None
+    )
+    eager_loss.backward()
+
+    compiled_forward = torch.compile(
+        compiled_model._forward_for_generate_impl,
+        backend = "eager",
+        dynamic = True,
+        fullgraph = False,
+    )
+    compiled_forward = DynamicTimeCacheCallable(compiled_forward, max_time = 3)
+    _, _, compiled_cache, _ = output_loss(call(compiled_forward, 2))
+    compiled_prediction, compiled_embeds, _, _ = output_loss(
+        call(compiled_forward, 3, compiled_cache)
+    )
+    compiled_tensors = (
+        compiled_prediction.flow,
+        compiled_embeds.agent,
+        compiled_embeds.actor,
+        compiled_embeds.critic,
+    )
+    compiled_loss = sum(
+        tensor[:, -1:].float().square().mean()
+        for tensor in compiled_tensors
+        if tensor is not None
+    )
+    compiled_loss.backward()
+
+    assert torch.allclose(
+        compiled_prediction.flow[:, -1:],
+        eager_prediction.flow[:, -1:],
+    )
+    for compiled_tensor, eager_tensor in zip(compiled_embeds, eager_embeds):
+        if compiled_tensor is not None:
+            assert torch.allclose(compiled_tensor[:, -1:], eager_tensor[:, -1:])
+    assert torch.allclose(compiled_loss, eager_loss)
+
+    for (eager_name, eager_parameter), (compiled_name, compiled_parameter) in zip(
+        eager_model.named_parameters(),
+        compiled_model.named_parameters(),
+    ):
+        assert compiled_name == eager_name
+        assert (compiled_parameter.grad is None) == (eager_parameter.grad is None)
+        if compiled_parameter.grad is not None:
+            assert torch.allclose(
+                compiled_parameter.grad,
+                eager_parameter.grad,
+                atol = 2e-4,
+                rtol = 2e-5,
+            ), eager_name
+
+
+def test_cached_generate_compile_rejects_incompatible_modes():
+    model = make_tiny_world_model()
+    common = dict(
+        world_model = model,
+        device = torch.device("cpu"),
+        compile_world_model = False,
+        compile_generate = True,
+        compile_learn = False,
+        compile_backend = "eager",
+        compile_mode = None,
+        compile_fullgraph = False,
+        compile_dynamic = False,
+        compile_generate_cudagraphs = False,
+        compile_generate_with_time_cache = True,
+        track_compile_performance = False,
+        imagination_generate_steps = 2,
+        objective = "ppo",
+        use_delight_gating = False,
+        store_old_action_unembeds = False,
+    )
+
+    with pytest.raises(ValueError, match = "cannot both be enabled"):
+        build_compile_runtime(
+            **common,
+            optimize_generate_compilation = True,
+            imagination_use_time_cache = True,
+        )
+
+    with pytest.raises(ValueError, match = "requires imagination_use_time_cache"):
+        build_compile_runtime(
+            **common,
+            optimize_generate_compilation = False,
+            imagination_use_time_cache = False,
+        )
 
 
 def test_cpu_imagination_compilations_do_not_scale_with_config_values(monkeypatch, reset_compile_after_test):

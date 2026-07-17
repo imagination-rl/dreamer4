@@ -122,7 +122,7 @@ VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses
 
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'flow_recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ortho', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net', 'byol'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'agent_embed_reward', 'latent_state_reward', 'agent_embed_terminal', 'latent_state_terminal', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem', 'h_net'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'agent_embed_reward', 'latent_state_reward', 'agent_embed_terminal', 'latent_state_terminal', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem', 'h_net', 'reward_mae'), defaults = (None,))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
@@ -1263,11 +1263,13 @@ class ActionEmbedder(Module):
         continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'beta',
         continuous_dist_kwargs: dict = dict(),
         continuous_target_action_range: tuple[float, float] | None = None,
+        old_continuous_action_encoder = False,
         beta_log_prob_eps = 1e-5,
         can_unembed = False,
         unembed_dim = None,
         num_unembed_preds = 1,
         squeeze_unembed_preds = True, # will auto-squeeze if prediction is just 1
+        unembed_init_eps = 1e-3,
     ):
         super().__init__()
 
@@ -1291,7 +1293,27 @@ class ActionEmbedder(Module):
         # continuous actions
 
         self.num_continuous_action_types = num_continuous_actions
-        self.continuous_action_embed = Embedding(num_continuous_actions, dim)
+        self.old_continuous_action_encoder = old_continuous_action_encoder
+
+        # The current action encoder keeps a separate learned vector for each
+        # action type and scales that vector by the corresponding scalar
+        # action.  The historical encoder instead projected the complete
+        # continuous action vector jointly.  Keep both implementations behind
+        # an explicit opt-in so existing checkpoints and callers retain the
+        # current behavior by default.
+        self.continuous_action_embed = None
+        self.continuous_action_embed_scale = None
+
+        if self.old_continuous_action_encoder:
+            if self.num_continuous_action_types > 0:
+                self.continuous_action_embed = Linear(num_continuous_actions, dim, bias = False)
+                nn.init.normal_(self.continuous_action_embed.weight, std = (num_continuous_actions * dim) ** -0.5)
+                self.continuous_action_embed_scale = Parameter(tensor(1.))
+        else:
+            # Preserve the modern module (including the empty embedding when
+            # no continuous actions are configured) exactly when the legacy
+            # flag is disabled.
+            self.continuous_action_embed = Embedding(num_continuous_actions, dim)
 
         self.continuous_need_norm = exists(continuous_norm_stats)
 
@@ -1355,7 +1377,7 @@ class ActionEmbedder(Module):
 
         # discrete action unembed
 
-        self.discrete_action_unembed = EmbeddingSmallInit((total_discrete_actions, num_unembed_preds, unembed_dim,))
+        self.discrete_action_unembed = EmbeddingSmallInit((total_discrete_actions, num_unembed_preds, unembed_dim,), eps = unembed_init_eps)
 
         if self.has_discrete_actions:
 
@@ -1373,10 +1395,18 @@ class ActionEmbedder(Module):
 
         # continuous action unembed
 
-        self.continuous_action_unembed = EmbeddingSmallInit((num_continuous_actions, num_unembed_preds, unembed_dim, 2,))
+        self.continuous_action_unembed = EmbeddingSmallInit((num_continuous_actions, num_unembed_preds, unembed_dim, 2,), eps = unembed_init_eps)
 
     def embed_parameters(self):
-        return set([*self.discrete_action_embed.parameters(), *self.continuous_action_embed.parameters()])
+        params = [*self.discrete_action_embed.parameters()]
+
+        if exists(self.continuous_action_embed):
+            params.extend(self.continuous_action_embed.parameters())
+
+        if exists(self.continuous_action_embed_scale):
+            params.append(self.continuous_action_embed_scale)
+
+        return set(params)
 
     def unembed_parameters(self):
         return set([self.discrete_action_unembed, self.continuous_action_unembed])
@@ -1408,6 +1438,54 @@ class ActionEmbedder(Module):
             action_types = tensor(action_types, device = self.device)
 
         return action_types
+
+    def condition_continuous_actions(
+        self,
+        continuous_actions,
+        continuous_action_types
+    ):
+        """Condition legacy continuous action inputs before projection.
+
+        Replay stores Beta-distributed actions in their native ``[0, 1]``
+        range, while the historical action encoder consumed actions in the
+        configured environment range (normally ``[-1, 1]``).  Normalization,
+        when configured, is applied after this range conversion and only to
+        the selected action types.
+        """
+        if exists(self.continuous_target_action_range):
+            native_range = (0., 1.) if self.continuous_dist_type == 'beta' else (-1., 1.)
+            continuous_actions = rescale(continuous_actions, native_range, self.continuous_target_action_range)
+
+        if self.continuous_need_norm:
+            norm_mean, norm_std = self.continuous_norm_stats[continuous_action_types].unbind(dim = -1)
+            continuous_actions = (continuous_actions - norm_mean) / norm_std.clamp(min = 1e-6)
+
+        return continuous_actions
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        # Legacy continuous projections used a Linear weight with shape
+        # ``(dim, num_actions)``.  Modern checkpoints store the action-type
+        # embedding as ``(num_actions, dim)``.  Permit loading the latter into
+        # an explicitly legacy model without changing modern-default loading.
+        if self.old_continuous_action_encoder and exists(self.continuous_action_embed):
+            continuous_embed_key = prefix + 'continuous_action_embed.weight'
+            continuous_scale_key = prefix + 'continuous_action_embed_scale'
+
+            is_modern_checkpoint = continuous_scale_key not in state_dict
+
+            if is_modern_checkpoint and continuous_embed_key in state_dict:
+                loaded_weight = state_dict[continuous_embed_key]
+                current_weight = self.continuous_action_embed.weight
+
+                if loaded_weight.shape == current_weight.T.shape:
+                    state_dict[continuous_embed_key] = loaded_weight.T.contiguous()
+
+            # Checkpoints made before the scalar was introduced should still
+            # load strictly, using the historical initialization of one.
+            if exists(self.continuous_action_embed_scale) and continuous_scale_key not in state_dict:
+                state_dict[continuous_scale_key] = self.continuous_action_embed_scale.detach().clone()
+
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def unembed(
         self,
@@ -1674,17 +1752,36 @@ class ActionEmbedder(Module):
 
             assert continuous_action_types.shape[-1] == continuous_actions.shape[-1], 'mismatched number of continuous actions'
 
-            continuous_action_embed = self.continuous_action_embed(continuous_action_types)
+            if self.old_continuous_action_encoder:
+                # Action types may originate from a CPU default buffer while
+                # action values are on another device (for example, during
+                # generation).  Keep legacy indexing on the action device.
+                continuous_action_types = continuous_action_types.to(device = continuous_actions.device)
+                continuous_actions = self.condition_continuous_actions(continuous_actions, continuous_action_types)
 
-            # maybe normalization
+                continuous_action_weight = self.continuous_action_embed.weight[:, continuous_action_types]
 
-            if self.continuous_need_norm:
-                norm_mean, norm_std = self.continuous_norm_stats.unbind(dim = -1)
-                continuous_actions = (continuous_actions - norm_mean) / norm_std.clamp(min = 1e-6)
+                # The legacy path projected all continuous action dimensions
+                # jointly, then applied a learned scalar.  Preserve the
+                # historical per-action representation when callers request
+                # unpooled embeds (used by a few auxiliary objectives).
+                if return_sum_pooled_embeds:
+                    continuous_embeds = F.linear(continuous_actions, continuous_action_weight) * self.continuous_action_embed_scale
+                else:
+                    continuous_action_embed = rearrange(continuous_action_weight, 'd na -> na d') * self.continuous_action_embed_scale
+                    continuous_embeds = multiply('na d, ... na -> ... na d', continuous_action_embed, continuous_actions)
+            else:
+                continuous_action_embed = self.continuous_action_embed(continuous_action_types)
 
-            # continuous embed is just the selected continuous action type with the scale
+                # maybe normalization
 
-            continuous_embeds = multiply('na d, ... na -> ... na d', continuous_action_embed, continuous_actions)
+                if self.continuous_need_norm:
+                    norm_mean, norm_std = self.continuous_norm_stats.unbind(dim = -1)
+                    continuous_actions = (continuous_actions - norm_mean) / norm_std.clamp(min = 1e-6)
+
+                # continuous embed is just the selected continuous action type with the scale
+
+                continuous_embeds = multiply('na d, ... na -> ... na d', continuous_action_embed, continuous_actions)
 
         # return not pooled
 
@@ -1699,7 +1796,14 @@ class ActionEmbedder(Module):
             pooled = pooled + reduce(discrete_embeds, '... na d -> ... d', 'sum')
 
         if exists(continuous_embeds):
-            pooled = pooled + reduce(continuous_embeds, '... na d -> ... d', 'sum')
+            # The legacy linear path has already projected and summed the
+            # continuous action axis.  Reducing it again would instead remove
+            # the final leading axis (the time axis for ``b t d`` inputs),
+            # turning one-step rollout embeds from ``b 1 d`` into ``b d``.
+            if self.old_continuous_action_encoder:
+                pooled = pooled + continuous_embeds
+            else:
+                pooled = pooled + reduce(continuous_embeds, '... na d -> ... d', 'sum')
 
         return pooled
 
@@ -1975,6 +2079,7 @@ def get_attend_fn(
     num_special_tokens = 0,             # special tokens are latents / agents
     block_size_per_special = None,      # defaults to k_seq_len
     special_attend_only_itself = False, # by default, modality only attends to itself while special sees everything, but if turned True, will be the inverse - special can only attend to itself but modality can attend everything
+    flex_attention_backend = 'AUTO',
     device = None
 ):
     block_size_per_special = default(block_size_per_special, k_seq_len)
@@ -1993,7 +2098,31 @@ def get_attend_fn(
         score_mod = score_mod_softclamp(softclamp_value)
 
         def attend_fn(q, k, v, causal = False):
-            return flex_attention(q, k, v, block_mask = block_mask, score_mod = score_mod, enable_gqa = True)
+            effective_backend = flex_attention_backend
+
+            # PyTorch AUTO selects TRITON_DECODE for queries shorter than 128.
+            # Its CUDA grid is (query_blocks, flattened_batch * kv_heads,
+            # split_kv), but CUDA grid.y is limited to 65535. Axial spatial
+            # attention flattens world_batch * time into the attention batch,
+            # so ordinary training shapes can exceed that limit (for example,
+            # 128 * 200 * 4 = 102400). Fall back to regular Triton attention for
+            # only those AUTO workloads; explicit backend choices remain exact.
+            if (
+                effective_backend == 'AUTO' and
+                q.shape[-2] < 128 and
+                q.shape[0] * k.shape[1] > 65535
+            ):
+                effective_backend = 'TRITON'
+
+            return flex_attention(
+                q,
+                k,
+                v,
+                block_mask = block_mask,
+                score_mod = score_mod,
+                enable_gqa = True,
+                kernel_options = {"BACKEND": effective_backend}
+            )
     else:
         # naive pathway
 
@@ -2397,7 +2526,11 @@ class ActorSPRWrapper(Module):
         self.register_buffer('rollout_loss_weights', rollout_weights / rollout_weights.sum(), persistent = False)
 
         dynamics_hidden_dim = default(dynamics_hidden_dim, dim)
-        action_embed_dim = action_embedder.discrete_action_embed.embedding_dim if action_embedder.has_discrete_actions else action_embedder.continuous_action_embed.embedding_dim
+        if action_embedder.has_discrete_actions:
+            action_embed_dim = action_embedder.discrete_action_embed.embedding_dim
+        else:
+            continuous_action_embed = action_embedder.continuous_action_embed
+            action_embed_dim = continuous_action_embed.embedding_dim if hasattr(continuous_action_embed, 'embedding_dim') else continuous_action_embed.out_features
 
         self.dynamics_mlp = create_mlp(
             dynamics_hidden_dim,
@@ -2932,11 +3065,14 @@ class AxialSpaceTimeTransformer(Module):
         space_attention_use_pope = False,
         use_attn_pool = True,
         mot_temporal = False,
+        spatial_flex_attention_backend = 'AUTO',
         h_net_layer: int | None = None,
-        h_net_kwargs: dict | None = None
+        h_net_kwargs: dict | None = None,
+        final_special_cross_attn: bool | None = None
     ):
         super().__init__()
         self.full_spatial_attn = full_spatial_attn
+        self.spatial_flex_attention_backend = spatial_flex_attention_backend
 
         # attention
 
@@ -3058,7 +3194,15 @@ class AxialSpaceTimeTransformer(Module):
         # special tokens
 
         self.num_special_tokens = num_special_tokens
-        self.should_special_cross_attend = num_special_tokens > 0 and not special_attend_only_itself and not full_spatial_attn
+        base_should_special_cross_attend = num_special_tokens > 0 and not special_attend_only_itself and not full_spatial_attn
+        self.should_special_cross_attend = base_should_special_cross_attend
+
+        # Keep the historical constructor default when omitted, but allow the
+        # dynamics model (and its trainer) to explicitly disable this final
+        # special-token cross attention.  This is intentionally independent of
+        # the regular spatial attention configuration.
+        if exists(final_special_cross_attn):
+            self.should_special_cross_attend = base_should_special_cross_attend and bool(final_special_cross_attn)
 
         self.final_special_cross_attn = self.final_special_ff = None
 
@@ -3133,9 +3277,24 @@ class AxialSpaceTimeTransformer(Module):
 
         num_spatial_special = 0 if self.full_spatial_attn else self.num_special_tokens
 
-        space_attend = get_attend_fn(**attend_kwargs, causal = False, seq_len = space_seq_len, k_seq_len = space_seq_len, num_special_tokens = num_spatial_special, use_flex = use_flex and not self.full_spatial_attn)
+        space_attend = get_attend_fn(
+            **attend_kwargs,
+            causal = False,
+            seq_len = space_seq_len,
+            k_seq_len = space_seq_len,
+            num_special_tokens = num_spatial_special,
+            use_flex = use_flex and not self.full_spatial_attn,
+            flex_attention_backend = self.spatial_flex_attention_backend
+        )
 
-        time_attend = get_attend_fn(**attend_kwargs, causal = True, seq_len = time, k_seq_len = time + token_count, use_flex = use_flex)
+        time_attend = get_attend_fn(
+            **attend_kwargs,
+            causal = True,
+            seq_len = time,
+            k_seq_len = time + token_count,
+            use_flex = use_flex,
+            flex_attention_backend = 'AUTO'
+        )
 
         # prepare cache
 
@@ -5201,6 +5360,7 @@ class DynamicsWorldModel(Module):
         loss_weight_fn: Callable = ramp_weight,
         prob_shortcut_train = None,                  # probability of shortcut training, defaults to 1 - 1 / num_step_sizes
         add_reward_embed_to_agent_token = False,
+        add_action_embed_to_agent_token = False,
         add_reward_embed_dropout = 0.1,
         add_state_pred_head = False,
         state_pred_loss_weight = 0.1,
@@ -5215,6 +5375,7 @@ class DynamicsWorldModel(Module):
         continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'beta',
         continuous_dist_kwargs: dict = dict(),
         continuous_target_action_range: tuple[float, float] | None = None,
+        old_continuous_action_encoder = False,
         multi_token_pred_len = 8,                   # they do multi-token prediction of 8 steps forward
         value_head_mlp_depth = 3,
         policy_head_mlp_depth = 3,
@@ -5247,6 +5408,16 @@ class DynamicsWorldModel(Module):
         gae_use_accelerated = False,
         use_loss_normalization = False,
         policy_all_tokens = False,
+        old_reward_shifting = False,
+        old_pmpo = False,
+        old_reward_head = False,
+        old_terminal_head = False,
+        old_dynamics_ff = False,
+        old_policy_head = False,
+        old_value_head = False,
+        old_embedding_init = False,
+        value_head_init_value = None,
+        final_special_cross_attn = None,
         time_attention_use_pope = False,
         latent_ar_layer: int | tuple[int, int] | None = None,
         latent_ar = False,
@@ -5283,6 +5454,18 @@ class DynamicsWorldModel(Module):
         super().__init__()
         self.dim = dim
         self.depth = depth
+        self.add_action_embed_to_agent_token = add_action_embed_to_agent_token
+        self.old_reward_shifting = old_reward_shifting
+        self.old_pmpo = old_pmpo
+        self.old_reward_head = old_reward_head
+        self.old_terminal_head = old_terminal_head
+        self.old_dynamics_ff = old_dynamics_ff
+        self.old_policy_head = old_policy_head
+        self.old_value_head = old_value_head
+        self.old_embedding_init = old_embedding_init
+        self.old_continuous_action_encoder = old_continuous_action_encoder
+        self.value_head_init_value = value_head_init_value
+        self.final_special_cross_attn = final_special_cross_attn
         self.optimize_generate_compilation = optimize_generate_compilation
         self._compiled_generate_forward_fn = None
 
@@ -5405,7 +5588,9 @@ class DynamicsWorldModel(Module):
         # register tokens
 
         self.num_register_tokens = num_register_tokens
-        self.register_tokens = EmbeddingSmallInit((num_register_tokens, dim,))
+        embedding_init_eps = 1e-2 if old_embedding_init else 1e-3
+        self.embedding_init_eps = embedding_init_eps
+        self.register_tokens = EmbeddingSmallInit((num_register_tokens, dim,), eps = embedding_init_eps)
 
         # signal and step sizes
 
@@ -5455,10 +5640,10 @@ class DynamicsWorldModel(Module):
 
         self.num_agents = num_agents
 
-        self.agent_learned_embed = EmbeddingSmallInit((self.num_agents, dim,))
-        self.action_learned_embed = EmbeddingSmallInit((self.num_agents, dim,))
+        self.agent_learned_embed = EmbeddingSmallInit((self.num_agents, dim,), eps = embedding_init_eps)
+        self.action_learned_embed = EmbeddingSmallInit((self.num_agents, dim,), eps = embedding_init_eps)
 
-        self.reward_learned_embed = EmbeddingSmallInit((self.num_agents, dim,))
+        self.reward_learned_embed = EmbeddingSmallInit((self.num_agents, dim,), eps = embedding_init_eps)
 
         self.num_tasks = num_tasks
         self.task_embed = nn.Embedding(num_tasks, dim)
@@ -5467,19 +5652,28 @@ class DynamicsWorldModel(Module):
 
         self.agent_has_genes = num_latent_genes > 0
         self.num_latent_genes = num_latent_genes
-        self.latent_genes = EmbeddingSmallInit((num_latent_genes, dim,))
+        self.latent_genes = EmbeddingSmallInit((num_latent_genes, dim,), eps = embedding_init_eps)
 
         # policy head
 
         assert not policy_all_tokens or num_agents == 1, '`policy_all_tokens` currently supports a single agent'
         self.policy_all_tokens = policy_all_tokens
 
+        has_discrete_actions_for_policy = any(num_actions > 0 for num_actions in ensure_tuple(num_discrete_actions))
+        has_actions_for_policy = has_discrete_actions_for_policy or num_continuous_actions > 0
+
+        # `policy_all_tokens` consumes a stable, ordered token sequence.  The
+        # action token is present whenever this model has actions, while
+        # spatial tokens include all views packed by the dynamics model.
+        self.policy_num_tokens = 1 + (num_spatial_tokens * num_video_views) + num_register_tokens + int(has_actions_for_policy)
+        policy_dim_in = dim * self.policy_num_tokens if policy_all_tokens else dim
+
         self.policy_head = create_mlp(
-            dim_in = dim,
+            dim_in = policy_dim_in,
             dim = dim * 4,
             dim_out = dim * 4,
             depth = policy_head_mlp_depth,
-            activation = get_activation(policy_head_mlp_activation)
+            activation = get_activation('relu_squared' if old_policy_head else policy_head_mlp_activation)
         )
 
         # aug conditioning
@@ -5498,11 +5692,15 @@ class DynamicsWorldModel(Module):
             continuous_dist_type = continuous_dist_type,
             continuous_dist_kwargs = continuous_dist_kwargs,
             continuous_target_action_range = continuous_target_action_range,
+            old_continuous_action_encoder = old_continuous_action_encoder,
             can_unembed = True,
             unembed_dim = dim * 4,
             num_unembed_preds = multi_token_pred_len,
-            squeeze_unembed_preds = False
+            squeeze_unembed_preds = False,
+            unembed_init_eps = embedding_init_eps
         )
+
+        self.action_embed_to_agent_token_scale = Parameter(torch.ones(())) if add_action_embed_to_agent_token else None
 
         # next latent prediction for actor
 
@@ -5604,10 +5802,22 @@ class DynamicsWorldModel(Module):
 
             return embedder, learned_embed, proj
 
-        self.reward_action_embedder, self.reward_action_learned_embed, self.to_reward_action_embed = create_action_embed_modules(self.action_embedder, 'silu')
+        if old_reward_head:
+            self.reward_action_embedder = None
+            self.reward_action_learned_embed = None
+            self.to_reward_action_embed = None
+        else:
+            self.reward_action_embedder, self.reward_action_learned_embed, self.to_reward_action_embed = create_action_embed_modules(self.action_embedder, 'silu')
 
-        self.to_agent_embed_reward_pred = Ensemble(
-            Sequential(
+        if old_reward_head:
+            # Historical reward prediction was an 8-way MTP ensemble of
+            # lightweight normalized, bias-free linear heads.
+            reward_head = Sequential(
+                RMSNorm(dim),
+                LinearNoBias(dim, self.reward_encoder.num_bins)
+            )
+        else:
+            reward_head = Sequential(
                 RMSNorm(dim),
                 create_mlp(
                     dim_in = dim,
@@ -5616,54 +5826,75 @@ class DynamicsWorldModel(Module):
                     depth = 2,
                     activation = get_activation('silu')
                 )
-            ),
-            multi_token_pred_len
-        )
-
-        self.to_latent_state_reward_pred = Sequential(
-            RMSNorm(dim_latent),
-            create_mlp(
-                dim_in = dim_latent,
-                dim = dim_latent * 4,
-                dim_out = self.reward_encoder.num_bins,
-                depth = 2,
-                activation = get_activation('silu')
             )
-        )
+
+        self.to_agent_embed_reward_pred = Ensemble(reward_head, multi_token_pred_len)
+
+        if old_reward_head:
+            self.to_latent_state_reward_pred = None
+        else:
+            self.to_latent_state_reward_pred = Sequential(
+                RMSNorm(dim_latent),
+                create_mlp(
+                    dim_in = dim_latent,
+                    dim = dim_latent * 4,
+                    dim_out = self.reward_encoder.num_bins,
+                    depth = 2,
+                    activation = get_activation('silu')
+                )
+            )
 
         # terminal prediction
 
         self.predict_terminals = predict_terminals
 
         if predict_terminals:
-            self.terminal_action_embedder, self.terminal_action_learned_embed, self.to_terminal_action_embed = create_action_embed_modules(self.action_embedder, 'silu')
+            if old_terminal_head:
+                # The old terminal objective used only the pooled post-state
+                # representation and a single scalar head.  Keep the action
+                # auxiliary modules absent so no 8-way auxiliary loss can be
+                # accidentally enabled by a caller.
+                self.terminal_action_embedder = None
+                self.terminal_action_learned_embed = None
+                self.to_terminal_action_embed = None
+                self.to_agent_embed_terminal_pred = None
+                self.to_latent_state_terminal_pred = create_mlp(
+                    dim_in = dim_latent,
+                    dim = dim_latent * 4,
+                    dim_out = 1,
+                    depth = predict_terminal_mlp_kwargs.get('depth', 1),
+                    squeeze_out = True,
+                    activation = get_activation('relu_squared')
+                )
+            else:
+                self.terminal_action_embedder, self.terminal_action_learned_embed, self.to_terminal_action_embed = create_action_embed_modules(self.action_embedder, 'silu')
 
-            self.to_agent_embed_terminal_pred = Ensemble(
-                Sequential(
-                    RMSNorm(dim),
+                self.to_agent_embed_terminal_pred = Ensemble(
+                    Sequential(
+                        RMSNorm(dim),
+                        create_mlp(
+                            dim_in = dim,
+                            dim = dim * 4,
+                            dim_out = 1,
+                            depth = max(2, predict_terminal_mlp_kwargs.get('depth', 2)),
+                            squeeze_out = True,
+                            activation = get_activation(state_terminal_pred_mlp_activation)
+                        )
+                    ),
+                    multi_token_pred_len
+                )
+
+                self.to_latent_state_terminal_pred = Sequential(
+                    RMSNorm(dim_latent),
                     create_mlp(
-                        dim_in = dim,
-                        dim = dim * 4,
+                        dim_in = dim_latent,
+                        dim = dim_latent * 4,
                         dim_out = 1,
                         depth = max(2, predict_terminal_mlp_kwargs.get('depth', 2)),
                         squeeze_out = True,
                         activation = get_activation(state_terminal_pred_mlp_activation)
                     )
-                ),
-                multi_token_pred_len
-            )
-
-            self.to_latent_state_terminal_pred = Sequential(
-                RMSNorm(dim_latent),
-                create_mlp(
-                    dim_in = dim_latent,
-                    dim = dim_latent * 4,
-                    dim_out = 1,
-                    depth = max(2, predict_terminal_mlp_kwargs.get('depth', 2)),
-                    squeeze_out = True,
-                    activation = get_activation(state_terminal_pred_mlp_activation)
                 )
-            )
 
         # value head
 
@@ -5672,8 +5903,36 @@ class DynamicsWorldModel(Module):
             dim = dim * 4,
             dim_out = self.value_encoder.num_bins,
             depth = value_head_mlp_depth,
-            activation = get_activation(value_head_mlp_activation)
+            activation = get_activation('relu_squared' if old_value_head else value_head_mlp_activation)
         )
+
+        if old_value_head and exists(value_head_init_value):
+            # Set the final categorical logits to the requested scalar while
+            # leaving all hidden layers inactive.  This gives a deterministic
+            # initial value prediction independent of the encoder's binning
+            # range, and works for both HL-Gauss and two-hot encoders.
+            final_linear = next((m for m in reversed(list(self.value_head.modules())) if isinstance(m, nn.Linear)), None)
+            if exists(final_linear):
+                with torch.no_grad():
+                    init_value = tensor(value_head_init_value, dtype = final_linear.weight.dtype, device = final_linear.weight.device).reshape(1)
+                    init_probs = self.value_encoder(init_value).reshape(-1).clamp(min = 1e-8)
+                    init_logits = init_probs.log()
+                    init_logits = init_logits - init_logits.mean()
+                    final_linear.weight.zero_()
+                    if exists(final_linear.bias):
+                        final_linear.bias.copy_(init_logits)
+
+        # The historical dynamics MLP used a plain expansion-4 ReLU-squared
+        # block rather than the current SiLU GLU.  Keep caller-provided feed
+        # forward options untouched unless that opt-in is requested.
+        dynamics_ff_kwargs = dict(ff_kwargs)
+        if old_dynamics_ff:
+            dynamics_ff_kwargs.update(expansion_factor = 4, activation = 'relu_squared', use_glu = False)
+
+        transformer_kwargs = dict(transformer_kwargs)
+        # The direct constructor flag is the canonical switch.  Avoid a
+        # duplicate keyword if an older caller put it in transformer_kwargs.
+        transformer_kwargs.pop('final_special_cross_attn', None)
 
         # pre encoder and ssl modules
 
@@ -5686,7 +5945,7 @@ class DynamicsWorldModel(Module):
                 attn_dim_head = attn_dim_head,
                 attn_softclamp_value = attn_softclamp_value,
                 attn_kwargs = attn_kwargs,
-                ff_kwargs = ff_kwargs,
+                ff_kwargs = dynamics_ff_kwargs,
                 num_special_tokens = 0,
                 time_block_every = time_block_every,
                 final_norm = False,
@@ -5705,7 +5964,7 @@ class DynamicsWorldModel(Module):
                 attn_dim_head = attn_dim_head,
                 attn_softclamp_value = attn_softclamp_value,
                 attn_kwargs = attn_kwargs,
-                ff_kwargs = ff_kwargs,
+                ff_kwargs = dynamics_ff_kwargs,
                 num_special_tokens = 0,
                 time_block_every = 1,
                 final_norm = False,
@@ -5751,13 +6010,14 @@ class DynamicsWorldModel(Module):
             attn_dim_head = attn_dim_head,
             attn_softclamp_value = attn_softclamp_value,
             attn_kwargs = attn_kwargs,
-            ff_kwargs = ff_kwargs,
+            ff_kwargs = dynamics_ff_kwargs,
             num_special_tokens = num_special_tokens,
             time_block_every = time_block_every,
             mot_temporal = mot_temporal,
             final_norm = False,
             rnn_time = use_time_rnn,
             time_attention_use_pope = time_attention_use_pope,
+            final_special_cross_attn = final_special_cross_attn,
             **transformer_kwargs
         )
 
@@ -5767,13 +6027,14 @@ class DynamicsWorldModel(Module):
             attn_dim_head = attn_dim_head,
             attn_softclamp_value = attn_softclamp_value,
             attn_kwargs = attn_kwargs,
-            ff_kwargs = ff_kwargs,
+            ff_kwargs = dynamics_ff_kwargs,
             num_special_tokens = num_special_tokens,
             time_block_every = time_block_every,
             mot_temporal = mot_temporal,
             final_norm = False,
             rnn_time = use_time_rnn,
             time_attention_use_pope = time_attention_use_pope,
+            final_special_cross_attn = final_special_cross_attn,
             **transformer_kwargs
         )
 
@@ -6739,8 +7000,12 @@ class DynamicsWorldModel(Module):
         # https://arxiv.org/abs/2410.04166v1
 
         if objective == 'pmpo':
-            pos_advantage_mask = advantage >= 0.
-            neg_advantage_mask = ~pos_advantage_mask
+            if self.old_pmpo:
+                pos_advantage_mask = advantage > 0.
+                neg_advantage_mask = advantage < 0.
+            else:
+                pos_advantage_mask = advantage >= 0.
+                neg_advantage_mask = ~pos_advantage_mask
 
         # replay for the action logits and values
         # but only do so if fine tuning the entire world model for RL
@@ -6859,15 +7124,25 @@ class DynamicsWorldModel(Module):
                 pos = pos & mask
                 neg = neg & mask
 
-            scaled_action_log_probs = maybe_gated_log_prob * advantage.tanh().abs()
+            if self.old_pmpo:
+                # Historical PMPO uses only the sign of each advantage and
+                # averages positive and negative groups independently.  Empty
+                # groups safely contribute zero; zero advantages are ignored.
+                pos_loss = masked_mean(maybe_gated_log_prob, pos)
+                neg_loss = masked_mean(maybe_gated_log_prob, neg)
 
-            pos_loss = scaled_action_log_probs.masked_fill(~pos, 0.).sum()
-            neg_loss = scaled_action_log_probs.masked_fill(~neg, 0.).sum()
+                α = self.pmpo_pos_to_neg_weight
+                policy_loss = -α * pos_loss + (1. - α) * neg_loss
+            else:
+                scaled_action_log_probs = maybe_gated_log_prob * advantage.tanh().abs()
 
-            num_advantages = mask.sum().clamp(min = 1).to(scaled_action_log_probs.dtype) if exists(mask) else max(1, advantage.numel())
+                pos_loss = scaled_action_log_probs.masked_fill(~pos, 0.).sum()
+                neg_loss = scaled_action_log_probs.masked_fill(~neg, 0.).sum()
 
-            α = self.pmpo_pos_to_neg_weight
-            policy_loss = -α * (pos_loss - neg_loss) / num_advantages
+                num_advantages = mask.sum().clamp(min = 1).to(scaled_action_log_probs.dtype) if exists(mask) else max(1, advantage.numel())
+
+                α = self.pmpo_pos_to_neg_weight
+                policy_loss = -α * (pos_loss - neg_loss) / num_advantages
 
             # take care of kl
 
@@ -7155,6 +7430,7 @@ class DynamicsWorldModel(Module):
         discrete_temperature = 1.,
         continuous_temperature = 1.,
         optimize_generate_compilation: bool | None = None,
+        forward_for_generate: Callable | None = None,
     ): # (b t n d) | (b c t h w)
 
         optimize_generate_compilation = default(
@@ -7197,10 +7473,18 @@ class DynamicsWorldModel(Module):
         )
 
         if optimize_generate_compilation:
+            if exists(forward_for_generate):
+                raise ValueError(
+                    "forward_for_generate cannot be combined with optimize_generate_compilation"
+                )
+
             if exists(time_cache) or return_time_cache:
                 raise ValueError("optimized generation does not support external time caches")
 
             return self._generate_optimized(None, **generate_kwargs)
+
+        if exists(forward_for_generate):
+            return self._generate_impl(forward_for_generate, **generate_kwargs)
 
         return self._generate_impl(self.forward, **generate_kwargs)
 
@@ -7674,8 +7958,13 @@ class DynamicsWorldModel(Module):
                 one_policy_input = self.select_policy_input(embeds, agent_index)[:, -1:] if self.policy_all_tokens else one_agent_embed
 
             if return_rewards_per_frame:
-                pooled_latents = reduce(denoised_latent, 'b t v n d -> b t d', 'mean')
-                reward_logits = self.to_latent_state_reward_pred(pooled_latents)
+                if self.old_reward_head:
+                    # Old generation reads the first MTP agent-reward head
+                    # from the newly generated post-transition state.
+                    reward_logits = self.to_agent_embed_reward_pred(one_agent_embed)[0]
+                else:
+                    pooled_latents = reduce(denoised_latent, 'b t v n d -> b t d', 'mean')
+                    reward_logits = self.to_latent_state_reward_pred(pooled_latents)
                 pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
 
                 decoded_rewards = grow_sequence(preallocated_rewards, decoded_rewards, pred_reward)
@@ -8270,6 +8559,16 @@ class DynamicsWorldModel(Module):
             action_tokens = empty_token
             next_action_tokens = empty_token
 
+        # Optional historical conditioning: each agent receives the shifted
+        # previous-action token in addition to its learned identity token.
+        # `action_tokens` is already shifted above, so the first state gets the
+        # zero sentinel and subsequent states see the preceding action.
+        if self.add_action_embed_to_agent_token and action_tokens.shape[-2] > 0:
+            action_embed = action_tokens
+            if action_embed.ndim == 4:
+                action_embed = action_embed[..., 0, :]
+            agent_tokens = agent_tokens + self.action_embed_to_agent_token_scale * rearrange(action_embed, 'b t d -> b t 1 d')
+
         # aug conditioning
 
         if self.has_aug_conditioning:
@@ -8389,12 +8688,18 @@ class DynamicsWorldModel(Module):
                 actor_agent_tokens = actor_unpacked_tokens[-1] if self.has_actor_transformer else agent_tokens
 
             if self.policy_all_tokens:
-                actor_non_flow_tokens = tuple(
-                    rearrange(token, 'b t d -> b t 1 d') if token.ndim == 3 else token
-                    for token in actor_unpacked_tokens[1:]
-                )
-                actor_non_flow_tokens = cat(actor_non_flow_tokens, dim = -2)
-                actor_agent_tokens = reduce(actor_non_flow_tokens, 'b t n d -> b t 1 d', 'mean')
+                # Preserve the old ordered policy context exactly: agent,
+                # spatial, register, and action tokens.  Flow, proprio/state,
+                # augmentation, reward, and other empty auxiliaries are not
+                # part of this input.  Flattening the token axis gives the
+                # policy head its statically known `N * dim` input.
+                _, spatial_tokens, _, _, register_tokens, action_tokens, *_ = actor_unpacked_tokens
+
+                def ensure_token_axis(token):
+                    return rearrange(token, 'b t d -> b t 1 d') if token.ndim == 3 else token
+
+                policy_tokens = cat(tuple(map(ensure_token_axis, (actor_agent_tokens, spatial_tokens, register_tokens, action_tokens))), dim = -2)
+                actor_agent_tokens = rearrange(policy_tokens, 'b t n d -> b t (n d)')
 
             critic_agent_tokens = unpack(critic_tokens, packed_tokens_shape, 'b t * d')[-1] if self.has_critic_transformer else agent_tokens
 
@@ -8571,12 +8876,13 @@ class DynamicsWorldModel(Module):
         # handle variable lengths if needed
 
         is_var_len = exists(lens)
-        loss_mask = loss_mask_without_last = None
+        loss_mask = loss_mask_without_last = loss_mask_without_first = None
 
         if is_var_len:
 
             loss_mask = lens_to_mask(lens, time)
             loss_mask_without_last = loss_mask[:, :-1]
+            loss_mask_without_first = loss_mask[:, 1:]
 
             flow_loss = masked_mean(flow_losses, loss_mask)
             shortcut_flow_loss = masked_mean(shortcut_flow_losses, loss_mask) if should_compute_shortcut else self.zero
@@ -8588,6 +8894,8 @@ class DynamicsWorldModel(Module):
         # now take care of the agent token losses
 
         agent_embed_reward_loss = latent_state_reward_loss = self.zero
+        reward_mae = self.zero
+        reward_maes = []
         agent_embed_terminal_loss = latent_state_terminal_loss = self.zero
 
         has_discrete = exists(discrete_actions) and discrete_actions.shape[-1] > 0
@@ -8602,20 +8910,30 @@ class DynamicsWorldModel(Module):
             if encoded_agent_tokens.ndim == 4:
                 encoded_agent_tokens = reduce(encoded_agent_tokens, 'b t g d -> b t d', 'mean')
 
-            agent_tokens_shifted = encoded_agent_tokens[:, :-1]
+            agent_tokens_shifted = encoded_agent_tokens[:, 1:] if self.old_reward_shifting else encoded_agent_tokens[:, :-1]
 
         if exists(rewards):
 
+            reward_prediction_tokens = agent_tokens_shifted
+            reward_target_values = rewards[:, :-1] if self.old_reward_shifting else rewards[:, 1:]
+            reward_target_encoding = two_hot_encoding[:, :-1] if self.old_reward_shifting else two_hot_encoding[:, 1:]
+            reward_target_mask = loss_mask_without_first if self.old_reward_shifting else loss_mask_without_last
+
             # mtp reward prediction with agent action conditioning
 
-            if has_any_actions:
-                agent_action_embed = self.embed_agent_actions(agent_tokens_shifted, discrete_actions, continuous_actions, head = 'reward')
+            should_predict_agent_reward = has_any_actions or self.old_reward_head
+
+            if should_predict_agent_reward:
+                agent_action_embed = (
+                    self.embed_agent_actions(reward_prediction_tokens, discrete_actions, continuous_actions, head = 'reward')
+                    if has_any_actions and not self.old_reward_head else reward_prediction_tokens
+                )
                 reward_pred = self.to_agent_embed_reward_pred(agent_action_embed)
                 reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
                 # mtp targets
 
-                reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, 1:], self.multi_token_pred_len)
+                reward_targets, reward_loss_mask = create_multi_token_prediction_targets(reward_target_encoding, self.multi_token_pred_len)
                 reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
 
                 # ce loss
@@ -8623,25 +8941,47 @@ class DynamicsWorldModel(Module):
                 reward_losses = -(reward_targets * reward_pred.log_softmax(dim = 1)).sum(dim = 1)
                 reward_losses = reward_losses.masked_fill(~reward_loss_mask, 0.)
 
+                with torch.no_grad():
+                    decoded_reward_pred = self.reward_encoder.bins_to_scalar_value(
+                        rearrange(reward_pred.detach(), 'b l t mtp -> b t mtp l')
+                    )
+                    scalar_reward_targets, _ = create_multi_token_prediction_targets(reward_target_values, self.multi_token_pred_len)
+                    reward_mae_mask = reward_loss_mask
+
+                    if is_var_len:
+                        reward_target_lens_mask, _ = create_multi_token_prediction_targets(reward_target_mask, self.multi_token_pred_len)
+                        reward_mae_mask = reward_mae_mask & reward_target_lens_mask
+
+                    reward_maes.append(masked_mean((decoded_reward_pred - scalar_reward_targets).abs(), reward_mae_mask))
+
                 if is_var_len:
-                    agent_embed_reward_loss = masked_mean(reward_losses, loss_mask_without_last, dim = (0, 1))
+                    agent_embed_reward_loss = masked_mean(reward_losses, reward_target_mask, dim = (0, 1))
                 else:
                     agent_embed_reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean')
-            # latent state reward prediction (for generation)
 
-            pooled_latents = reduce(latents[:, 1:], 'b t v n d -> b t d', 'mean')
-            latent_reward_pred = self.to_latent_state_reward_pred(pooled_latents)
-            latent_reward_targets = two_hot_encoding[:, 1:]
+            # The current architecture also trains a pooled-latent reward
+            # head.  The old head is deliberately agent-only; this keeps its
+            # lightweight MTP objective and generation semantics intact.
+            if not self.old_reward_head:
+                pooled_latents = reduce(latents[:, 1:], 'b t v n d -> b t d', 'mean')
+                latent_reward_pred = self.to_latent_state_reward_pred(pooled_latents)
+                latent_reward_targets = two_hot_encoding[:, :-1] if self.old_reward_shifting else two_hot_encoding[:, 1:]
 
-            latent_reward_pred = rearrange(latent_reward_pred, 'b t l -> b l t')
-            latent_reward_targets = rearrange(latent_reward_targets, 'b t l -> b l t')
+                with torch.no_grad():
+                    decoded_reward_pred = self.reward_encoder.bins_to_scalar_value(latent_reward_pred.detach())
+                    reward_maes.append(masked_mean((decoded_reward_pred - reward_target_values).abs(), reward_target_mask))
 
-            latent_state_reward_loss = F.cross_entropy(latent_reward_pred, latent_reward_targets, reduction = 'none')
+                latent_reward_pred = rearrange(latent_reward_pred, 'b t l -> b l t')
+                latent_reward_targets = rearrange(latent_reward_targets, 'b t l -> b l t')
 
-            if is_var_len:
-                latent_state_reward_loss = masked_mean(latent_state_reward_loss, loss_mask_without_last)
-            else:
-                latent_state_reward_loss = latent_state_reward_loss.mean()
+                latent_state_reward_loss = F.cross_entropy(latent_reward_pred, latent_reward_targets, reduction = 'none')
+
+                if is_var_len:
+                    latent_state_reward_loss = masked_mean(latent_state_reward_loss, reward_target_mask)
+                else:
+                    latent_state_reward_loss = latent_state_reward_loss.mean()
+
+            reward_mae = torch.stack(reward_maes).mean()
         # terminal prediction loss
 
         if exists(terminals) and self.predict_terminals:
@@ -8656,7 +8996,7 @@ class DynamicsWorldModel(Module):
 
             # mtp terminal prediction with agent action conditioning
 
-            if has_any_actions:
+            if has_any_actions and not self.old_terminal_head:
                 agent_action_embed = self.embed_agent_actions(agent_tokens_shifted, discrete_actions, continuous_actions, head = 'terminal')
                 terminal_pred = self.to_agent_embed_terminal_pred(agent_action_embed)
                 terminal_pred = rearrange(terminal_pred, 'mtp b t -> b t mtp')
@@ -8747,7 +9087,11 @@ class DynamicsWorldModel(Module):
             num_targets = pred_len - 1 if shift_action_tokens else pred_len
 
             actor_agent_tokens = default(embeds.actor, embeds.agent)
-            encoded_actor_tokens = rearrange(actor_agent_tokens, 'b t 1 d -> b t d')
+            encoded_actor_tokens = (
+                self.select_policy_input(embeds)
+                if self.policy_all_tokens
+                else rearrange(actor_agent_tokens, 'b t 1 d -> b t d')
+            )
             policy_embed = self.policy_head(encoded_actor_tokens[:, :num_targets])
 
             # constitute multi token prediction targets
@@ -8928,7 +9272,7 @@ class DynamicsWorldModel(Module):
             (tem_loss * self.tem_loss_weight)
         )
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, agent_embed_reward_loss, latent_state_reward_loss, agent_embed_terminal_loss, latent_state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss, self.zero)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, agent_embed_reward_loss, latent_state_reward_loss, agent_embed_terminal_loss, latent_state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss, self.zero, reward_mae)
 
         if not (return_all_losses or return_intermediates):
             return total_loss

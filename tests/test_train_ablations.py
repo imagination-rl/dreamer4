@@ -95,3 +95,50 @@ def test_build_ablation_specs_requires_run_name_and_run_details(tmp_path):
             config_path = config_path,
             ablations = [{"run_name": "name-only"}],
         )
+
+
+def test_new_ablation_runs_get_distinct_checkpoint_folders(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    write_config(
+        config_path,
+        {
+            "run_name": "baseline",
+            "run_details": "details",
+            "log_dir": "runs/test",
+            "checkpoint_folder": "checkpoints_gym_imagination",
+            "checkpoint_path": None,
+        },
+    )
+
+    specs = build_ablation_specs(
+        config_path = config_path,
+        ablations = [
+            {"run_name": "first", "run_details": "first run"},
+            {"run_name": "second", "run_details": "second run"},
+        ],
+    )
+
+    assert specs[0].train_kwargs["checkpoint_folder"] == "checkpoints_gym_imagination/first"
+    assert specs[1].train_kwargs["checkpoint_folder"] == "checkpoints_gym_imagination/second"
+
+
+def test_resume_ablation_preserves_explicit_checkpoint_folder(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    write_config(
+        config_path,
+        {
+            "run_name": "baseline",
+            "run_details": "details",
+            "log_dir": "runs/test",
+            "checkpoint_folder": "existing_checkpoints",
+            "checkpoint_path": "existing_checkpoints/loop_25.pt",
+        },
+    )
+
+    spec = build_ablation_specs(
+        config_path = config_path,
+        ablations = [{"run_name": "resume", "run_details": "resume run"}],
+    )[0]
+
+    assert spec.train_kwargs["checkpoint_folder"] == "existing_checkpoints"
+    assert spec.train_kwargs["checkpoint_path"] == "existing_checkpoints/loop_25.pt"

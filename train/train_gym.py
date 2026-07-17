@@ -40,9 +40,10 @@ from tqdm import tqdm
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW, Optimizer
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, RandomSampler, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils._pytree import tree_map
 
@@ -68,6 +69,7 @@ from .compile_runtime import (
     action_pair_or_empty,
     build_compile_runtime,
     compile_mode_uses_cuda_graphs,
+    configure_sac,
     cudagraph_mark_step_begin,
     normalize_compile_mode,
     print_compile_timing_report,
@@ -121,7 +123,114 @@ def repeat_batch_to_size(batch, size: int):
     indices = torch.arange(size, device = tensor.device) % batch_size
     return tree_map(lambda value: value.index_select(0, indices) if torch.is_tensor(value) else value, batch)
 
+
+def resampling_dataloader_iterator(dataloader: DataLoader):
+    """Iterate forever while recreating the loader iterator each epoch.
+
+    ``itertools.cycle`` caches yielded batches, which would freeze the sampled
+    replay windows after the first pass.  The old replay path needs each new
+    optimizer step to call the dataset again so its random window start is
+    resampled.
+    """
+
+    while True:
+        yield from dataloader
+
 # tokenizer
+
+
+def _plain_silu_mlp(
+    dim_in: int,
+    dim_out: int,
+    *,
+    hidden_dim: int,
+    depth: int,
+):
+    """Build the legacy state tokenizer's plain SiLU MLP.
+
+    The current state tokenizer is intentionally transformer-shaped even when
+    temporal attention is disabled.  The old Gym trainer used a small,
+    feed-forward encoder/decoder instead.  Keep this implementation local to
+    the trainer so that the world model's state-tokenizer API remains unchanged.
+    """
+
+    layers = []
+    dim = dim_in
+    for _ in range(max(1, depth)):
+        layers.extend((nn.Linear(dim, hidden_dim), nn.SiLU()))
+        dim = hidden_dim
+    layers.append(nn.Linear(dim, dim_out))
+    return nn.Sequential(*layers)
+
+
+class OldStateTokenizer(nn.Module):
+    """Legacy plain-SiLU MLP state tokenizer.
+
+    It mirrors :class:`StateTokenizer`'s tensor contract while deliberately
+    omitting attention, RMSNorm, and time-cache handling from the modern
+    tokenizer.  All leading dimensions are treated as independent states.
+    """
+
+    def __init__(
+        self,
+        dim_state: int,
+        num_latent_tokens: int = 4,
+        dim_latent: int = 32,
+        dim: int = 256,
+        depth: int = 2,
+    ):
+        super().__init__()
+        self.dim_state = dim_state
+        self.num_latent_tokens = num_latent_tokens
+        self.dim_latent = dim_latent
+        latent_dim = num_latent_tokens * dim_latent
+
+        self.encoder = _plain_silu_mlp(
+            dim_state,
+            latent_dim,
+            hidden_dim = dim,
+            depth = depth,
+        )
+        self.decoder = _plain_silu_mlp(
+            latent_dim,
+            dim_state,
+            hidden_dim = dim,
+            depth = depth,
+        )
+
+    def encode(self, state: Tensor, **_kwargs):
+        shape = state.shape
+        latents = self.encoder(state.reshape(-1, shape[-1]))
+        latents = latents.tanh()
+        return latents.reshape(*shape[:-1], self.num_latent_tokens, self.dim_latent)
+
+    @torch.no_grad()
+    def tokenize(self, state: Tensor, **kwargs):
+        return self.encode(state, **kwargs)
+
+    def decode(self, latents: Tensor, **_kwargs):
+        shape = latents.shape
+        latents = latents.reshape(-1, self.num_latent_tokens * self.dim_latent)
+        recon = self.decoder(latents)
+        return recon.reshape(*shape[:-2], self.dim_state)
+
+    def forward(
+        self,
+        state: Tensor,
+        *,
+        return_latents = False,
+        return_recon = False,
+        **kwargs,
+    ):
+        latents = self.encode(state, **kwargs)
+        if return_latents and not return_recon:
+            return latents
+
+        recon = self.decode(latents, **kwargs)
+        loss = F.mse_loss(recon, state)
+        if return_recon:
+            return loss, recon, latents
+        return loss
 
 class ObservationTokenizer(nn.Module):
     def __init__(
@@ -132,6 +241,7 @@ class ObservationTokenizer(nn.Module):
         hidden_dim: int = 256,
         depth: int = 2,
         eps: float = 1e-5,
+        old_state_tokenizer: bool = False,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -139,15 +249,18 @@ class ObservationTokenizer(nn.Module):
         self.dim_latent = dim_latent
         self.eps = eps
 
-        self.tokenizer = StateTokenizer(
+        tokenizer_cls = OldStateTokenizer if old_state_tokenizer else StateTokenizer
+        tokenizer_kwargs = dict(
             dim_state = obs_dim,
             num_latent_tokens = num_latent_tokens,
             dim_latent = dim_latent,
             dim = hidden_dim,
             depth = depth,
-            attn_every = 0,
-            attn_dim_head = 64
         )
+        if not old_state_tokenizer:
+            tokenizer_kwargs.update(attn_every = 0, attn_dim_head = 64)
+        self.tokenizer = tokenizer_cls(**tokenizer_kwargs)
+        self.old_state_tokenizer = old_state_tokenizer
 
         self.register_buffer("obs_mean", torch.zeros(obs_dim))
         self.register_buffer("obs_std", torch.ones(obs_dim))
@@ -422,31 +535,25 @@ def log_scalars(writer: SummaryWriter | None, scalars: dict[str, float], step: i
             continue
         writer.add_scalar(key, float(value), step)
 
-def get_episode_count(env) -> int:
-    return int(getattr(env, "episode_count", 0))
-
-def get_completed_episode_stats(env, start_episode_count: int):
-    return_queue = getattr(env, "return_queue", None)
-    length_queue = getattr(env, "length_queue", None)
-
-    if return_queue is None or length_queue is None:
+def get_rollout_episode_stats(exp: Experience):
+    """Treat each returned environment trajectory as one fixed-horizon episode."""
+    if not exists(exp.episode_return):
         return [], []
 
-    num_new_episodes = max(get_episode_count(env) - start_episode_count, 0)
+    returns = exp.episode_return
+    lengths = exp.lens
 
-    if num_new_episodes == 0:
-        return [], []
+    if not exists(lengths):
+        lengths = torch.full_like(returns, exp.rewards.shape[1])
 
-    if num_new_episodes > len(return_queue) or num_new_episodes > len(length_queue):
-        raise RuntimeError(
-            f"episode statistics buffer only retained {len(return_queue)} returns and {len(length_queue)} lengths, "
-            f"but {num_new_episodes} episodes completed since the last read"
-        )
+    # interact_with_env appends one bootstrap state to externally truncated
+    # trajectories. It is not an environment transition and should not count
+    # toward the synthetic episode length.
+    if exists(exp.is_truncated) and exists(exp.terminals):
+        has_bootstrap_padding = exp.is_truncated & ~exp.terminals
+        lengths = lengths - has_bootstrap_padding.long()
 
-    returns = list(return_queue)[-num_new_episodes:]
-    lengths = list(length_queue)[-num_new_episodes:]
-
-    return returns, lengths
+    return returns.tolist(), lengths.tolist()
 
 def unique_parameters(params):
     return list(dict.fromkeys(params))
@@ -540,12 +647,23 @@ def clip_grad_norm_by_group(
 
 
 def world_model_clip_groups(world_model: DynamicsWorldModel, optimizer: Optimizer):
+    reward_head = getattr(world_model, "to_reward_pred", None)
+    terminal_head = getattr(world_model, "to_state_terminal_pred", None)
+
+    # The restored legacy heads use the current model's explicit module names.
+    # Keep the historical lookup above as the false/default path so existing
+    # clipping groups and checkpoint behavior remain unchanged.
+    if getattr(world_model, "old_reward_head", False):
+        reward_head = getattr(world_model, "to_agent_embed_reward_pred", reward_head)
+    if getattr(world_model, "old_terminal_head", False):
+        terminal_head = getattr(world_model, "to_latent_state_terminal_pred", terminal_head)
+
     return disjoint_optimizer_param_groups(
         optimizer,
         [
-            ("reward_head", module_parameters(getattr(world_model, "to_reward_pred", None))),
+            ("reward_head", module_parameters(reward_head)),
             ("action_head", module_parameters(getattr(world_model, "action_embedder", None))),
-            ("terminal_head", module_parameters(getattr(world_model, "to_state_terminal_pred", None))),
+            ("terminal_head", module_parameters(terminal_head)),
             ("state_head", module_parameters(getattr(world_model, "to_state_pred", None))),
             ("agent_state_head", module_parameters(getattr(world_model, "to_agent_state_pred", None))),
             ("latent_ar_head", module_parameters(getattr(world_model, "latent_ar", None))),
@@ -892,6 +1010,7 @@ def train_world_model(
     training_profiler: TrainingProfiler | None,
     shortcut_train_mode: ShortcutTrainMode,
     desc: str,
+    old_replay_sampling: bool = False,
 ):
     if len(replay) == 0 or steps <= 0:
         return global_step, {}
@@ -905,14 +1024,32 @@ def train_world_model(
         include_metadata = True
     )
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size = batch_size,
-        shuffle = True,
-        drop_last = len(dataset) >= batch_size
-    )
+    if old_replay_sampling:
+        # Legacy world-model replay consumed a shuffled pass over windows and
+        # kept a short final batch.  In particular, do not pad partial WM
+        # batches back to ``batch_size`` below; this is part of the old
+        # trainer's observable behavior.  Prompt sampling (below) is the path
+        # that intentionally uses replacement.
+        dataloader = DataLoader(
+            dataset,
+            batch_size = batch_size,
+            shuffle = True,
+            drop_last = False,
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size = batch_size,
+            shuffle = True,
+            drop_last = len(dataset) >= batch_size
+        )
 
-    dataloader_iter = cycle(dataloader) if len(dataloader) > 0 else None
+    dataloader_iter = (
+        resampling_dataloader_iterator(dataloader)
+        if old_replay_sampling and len(dataloader) > 0
+        else cycle(dataloader) if len(dataloader) > 0
+        else None
+    )
 
     pbar = tqdm(range(steps), desc = desc, dynamic_ncols = True)
 
@@ -929,7 +1066,7 @@ def train_world_model(
             with record("world_model/data/load_batch"):
                 batch = next(dataloader_iter)
 
-                if static_batch_shape:
+                if static_batch_shape and not old_replay_sampling:
                     batch = repeat_batch_to_size(batch, batch_size)
 
             with record("world_model/data/prepare_experience", cuda = True):
@@ -973,6 +1110,7 @@ def train_world_model(
                     "world_model/flow_loss": losses.flow.item(),
                     "world_model/shortcut_loss": losses.shortcut.item(),
                     "world_model/reward_loss": (losses.agent_embed_reward.mean() + losses.latent_state_reward.mean()).item(),
+                    "world_model/reward_mae": losses.reward_mae.item(),
                     "world_model/terminal_loss": (losses.agent_embed_terminal.mean() + losses.latent_state_terminal.mean()).item(),
                     "world_model/agent_state_pred_loss": losses.agent_state_pred.item(),
                     "world_model/grad_norm": float(norm),
@@ -1021,6 +1159,7 @@ def train_agent_in_imagination(
     global_step: int,
     writer: SummaryWriter | None,
     training_profiler: TrainingProfiler | None,
+    old_replay_sampling: bool = False,
 ):
     if steps <= 0:
         return global_step, {}
@@ -1037,14 +1176,35 @@ def train_agent_in_imagination(
     if static_generate_shape and prompt_length > 0 and prompt_probability != 1.:
         raise ValueError("static compiled generation requires prompt_probability=1.0 when prompt_length > 0")
 
-    prompt_dataloader = DataLoader(
-        prompt_dataset,
-        batch_size = batch_size,
-        shuffle = True,
-        drop_last = len(prompt_dataset) >= batch_size
-    )
+    if old_replay_sampling:
+        # Prompt windows in the legacy trainer were independent draws from
+        # replay (with replacement), rather than a shuffled pass over every
+        # available window.
+        prompt_sampler = RandomSampler(
+            prompt_dataset,
+            replacement = True,
+            num_samples = batch_size,
+        )
+        prompt_dataloader = DataLoader(
+            prompt_dataset,
+            batch_size = batch_size,
+            sampler = prompt_sampler,
+            drop_last = False,
+        )
+    else:
+        prompt_dataloader = DataLoader(
+            prompt_dataset,
+            batch_size = batch_size,
+            shuffle = True,
+            drop_last = len(prompt_dataset) >= batch_size
+        )
 
-    prompt_iterator = cycle(prompt_dataloader) if prompt_length > 0 and len(prompt_dataloader) > 0 else None
+    prompt_iterator = (
+        resampling_dataloader_iterator(prompt_dataloader)
+        if old_replay_sampling and prompt_length > 0 and len(prompt_dataloader) > 0
+        else cycle(prompt_dataloader) if prompt_length > 0 and len(prompt_dataloader) > 0
+        else None
+    )
 
     if static_generate_shape and prompt_length > 0 and not exists(prompt_iterator):
         raise ValueError("static compiled generation requires at least one prompt window")
@@ -1227,20 +1387,45 @@ def save_checkpoint(
             loop = loop,
             tokenizer = tokenizer.state_dict(),
             world_model = world_model.state_dict(),
-            world_optimizer = world_optimizer.state_dict(),
-            agent_optimizer = agent_optimizer.state_dict(),
+            world_optimizer = optimizer_state_dict_for_checkpoint(world_optimizer),
+            agent_optimizer = optimizer_state_dict_for_checkpoint(agent_optimizer),
         ),
         str(path),
     )
 
 
+def optimizer_state_dict_for_checkpoint(optimizer: Optimizer):
+    state_dict = optimizer.state_dict()
+    state_dict["param_groups"] = [
+        {
+            key: value
+            for key, value in group.items()
+            if not callable(value)
+        }
+        for group in state_dict["param_groups"]
+    ]
+    return state_dict
+
+
 def load_optimizer_state_if_compatible(optimizer: Optimizer, state_dict, name: str):
+    callable_group_values = [
+        {
+            key: value
+            for key, value in group.items()
+            if callable(value)
+        }
+        for group in optimizer.param_groups
+    ]
+
     try:
         optimizer.load_state_dict(state_dict)
         return True
     except (KeyError, RuntimeError, ValueError) as exc:
         print(f"skipping {name} optimizer state: {exc}")
         return False
+    finally:
+        for group, callable_values in zip(optimizer.param_groups, callable_group_values):
+            group.update(callable_values)
 
 
 def resolve_log_dir(
@@ -1249,16 +1434,16 @@ def resolve_log_dir(
     run_name: str,
     checkpoint_path: str | None,
     unique_log_dir: bool,
-    checkpoint_folder: str,
+    checkpoint_folder: str | None,
 ):
     if not run_name:
         raise ValueError("run_name is required and must be non-empty")
 
     log_root = Path(log_dir)
 
-    if exists(checkpoint_path):
+    if checkpoint_folder is None and exists(checkpoint_path):
         checkpoint = Path(checkpoint_path)
-        checkpoint_folder_parts = Path(checkpoint_folder).parts
+        checkpoint_folder_parts = Path("checkpoints").parts
 
         if (
             len(checkpoint_folder_parts) > 0 and
@@ -1298,8 +1483,15 @@ def main(
     attn_dim_head: int,
     depth: int,
     time_block_every: int,
+    spatial_flex_attention_backend: str,
     final_special_cross_attn: bool,
     reward_encoder_type: Literal["symexp_two_hot", "hl_gauss"],
+    reward_encoder_num_bins: int,
+    value_encoder_num_bins: int,
+    reward_use_symlog: bool,
+    value_use_symlog: bool,
+    reward_decode_symlog_expected_raw: bool,
+    value_decode_symlog_expected_raw: bool,
     prob_shortcut_train: float | None,
     pretrain_world_model_finetune_steps: int,
     pretrain_world_model_combined_steps: int,
@@ -1335,7 +1527,7 @@ def main(
     log_dir: str,
     run_name: str,
     run_details: str,
-    checkpoint_folder: str,
+    checkpoint_folder: str | None,
     checkpoint_every: int,
     checkpoint_path: str | None,
     clear_log_dir: bool,
@@ -1351,6 +1543,7 @@ def main(
     compile_dynamic: bool | None,
     compile_generate_cudagraphs: bool,
     optimize_generate_compilation: bool,
+    compile_generate_with_time_cache: bool,
     track_compile_performance: bool,
     allow_tf32: bool,
     require_cuda: bool,
@@ -1361,6 +1554,27 @@ def main(
     profile_record_shapes: bool,
     profile_with_stack: bool,
     profile_with_flops: bool,
+    normalize_advantages: bool = True,
+    add_action_embed_to_agent_token: bool = False,
+    old_continuous_action_encoder: bool = False,
+    old_reward_shifting: bool = False,
+    old_pmpo: bool = False,
+    old_reward_head: bool = False,
+    old_terminal_head: bool = False,
+    old_state_tokenizer: bool = False,
+    old_dynamics_ff: bool = False,
+    old_policy_head: bool = False,
+    old_value_head: bool = False,
+    old_replay_sampling: bool = False,
+    old_embedding_init: bool = False,
+    reward_range: tuple[float, float] = (-4., 4.),
+    reward_encoder_sigma_to_bin_ratio: float = 0.75,
+    reward_min_max_value_on_bin_center: bool = True,
+    value_range: tuple[float, float] = (-10., 10.),
+    value_encoder_sigma_to_bin_ratio: float = 0.75,
+    value_min_max_value_on_bin_center: bool = True,
+    value_head_init_value: float | None = None,
+    activation_memory_budget: float = 0.9,
 ):
     hyperparameters = dict(locals())
 
@@ -1396,6 +1610,8 @@ def main(
     if compile is None:
         compile = device.type == "cuda"
 
+    configure_sac(activation_memory_budget)
+
     if require_cuda and device.type != "cuda":
         raise RuntimeError("CUDA was required for this run, but no CUDA device is available")
 
@@ -1414,9 +1630,6 @@ def main(
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-    if Path(checkpoint_folder).is_absolute():
-        raise ValueError("checkpoint_folder must be relative because checkpoints are stored under the log directory")
-
     run_log_dir = resolve_log_dir(
         log_dir,
         run_name = run_name,
@@ -1424,8 +1637,11 @@ def main(
         unique_log_dir = unique_log_dir,
         checkpoint_folder = checkpoint_folder,
     )
-    checkpoint_root = Path(checkpoint_folder)
-    checkpoint_root = run_log_dir / checkpoint_root
+    checkpoint_root = (
+        run_log_dir / "checkpoints"
+        if checkpoint_folder is None
+        else Path(checkpoint_folder)
+    )
 
     if not exists(checkpoint_path) and run_log_dir.exists():
         raise FileExistsError(
@@ -1460,6 +1676,7 @@ def main(
         obs_dim = obs_dim,
         num_latent_tokens = num_latent_tokens,
         dim_latent = dim_latent,
+        old_state_tokenizer = old_state_tokenizer,
     ).to(device)
 
     tokenizer_loss = None
@@ -1501,9 +1718,6 @@ def main(
     )
     register_runtime_cleanup(env.close)
 
-    reward_range = (-4., 4.)
-    value_range = (-10., 10.)
-
     world_model = DynamicsWorldModel(
         dim = model_dim,
         dim_latent = dim_latent,
@@ -1514,13 +1728,17 @@ def main(
         dim_critic_state = obs_dim,
         depth = depth,
         time_block_every = time_block_every,
+        transformer_kwargs = dict(
+            spatial_flex_attention_backend = spatial_flex_attention_backend,
+        ),
+        final_special_cross_attn = final_special_cross_attn,
         num_discrete_actions = 0,
         num_continuous_actions = action_dim,
         continuous_dist_type = "beta",
         continuous_target_action_range = action_range,
         reward_encoder_type = reward_encoder_type,
-        reward_encoder_kwargs = dict(reward_range = reward_range, num_bins = 51, sigma_to_bin_ratio = 0.75, min_max_value_on_bin_center = True, use_symlog = True),
-        value_encoder_kwargs = dict(reward_range = value_range, num_bins = 51, sigma_to_bin_ratio = 0.75, min_max_value_on_bin_center = True, use_symlog = True),
+        reward_encoder_kwargs = dict(reward_range = reward_range, num_bins = reward_encoder_num_bins, sigma_to_bin_ratio = reward_encoder_sigma_to_bin_ratio, min_max_value_on_bin_center = reward_min_max_value_on_bin_center, use_symlog = reward_use_symlog, decode_symlog_expected_raw = reward_decode_symlog_expected_raw),
+        value_encoder_kwargs = dict(reward_range = value_range, num_bins = value_encoder_num_bins, sigma_to_bin_ratio = value_encoder_sigma_to_bin_ratio, min_max_value_on_bin_center = value_min_max_value_on_bin_center, use_symlog = value_use_symlog, decode_symlog_expected_raw = value_decode_symlog_expected_raw),
         predict_terminals = True,
         continuous_action_loss_weight = 0.,
         discrete_action_loss_weight = 0.,
@@ -1532,7 +1750,18 @@ def main(
         pmpo_pos_to_neg_weight = pmpo_pos_to_neg_weight,
         pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight,
         ppo_eps_clip = 0.2,
-        normalize_advantages = True,
+        normalize_advantages = normalize_advantages,
+        add_action_embed_to_agent_token = add_action_embed_to_agent_token,
+        old_continuous_action_encoder = old_continuous_action_encoder,
+        old_reward_shifting = old_reward_shifting,
+        old_pmpo = old_pmpo,
+        old_reward_head = old_reward_head,
+        old_terminal_head = old_terminal_head,
+        old_dynamics_ff = old_dynamics_ff,
+        old_policy_head = old_policy_head,
+        old_value_head = old_value_head,
+        old_embedding_init = old_embedding_init,
+        value_head_init_value = value_head_init_value,
         policy_entropy_weight = 0.01,
         use_loss_normalization = False,
         attn_heads = attn_heads,
@@ -1606,9 +1835,11 @@ def main(
         compile_dynamic = compile_dynamic,
         compile_generate_cudagraphs = compile_generate_cudagraphs,
         optimize_generate_compilation = optimize_generate_compilation,
+        compile_generate_with_time_cache = compile_generate_with_time_cache,
         track_compile_performance = track_compile_performance,
         imagination_generate_steps = imagination_generate_steps,
         imagination_use_time_cache = imagination_use_time_cache,
+        imagination_max_timesteps = imagination_horizon + imagination_prompt_length,
         objective = objective,
         use_delight_gating = use_delight_gating,
         store_old_action_unembeds = objective == "pmpo" and not exists(policy_prior),
@@ -1673,8 +1904,6 @@ def main(
             rollout_horizon_returns = []
 
             for rollout_idx in range(rollouts_per_loop):
-                start_episode_count = get_episode_count(env)
-
                 rollout_start = perf_counter()
                 with training_profiler.record("rollout/model/interact_with_env"):
                     exp = world_model.interact_with_env(
@@ -1727,7 +1956,9 @@ def main(
                         data, meta = tree_map_tensor(lambda t: rearrange(t, '1 ... -> ...'), (data, meta))
                         replay.store_episode(**data, **meta)
 
-                rollout_horizon_returns.extend(cpu_exp.episode_return.tolist())
+                rollout_returns, rollout_lengths = get_rollout_episode_stats(cpu_exp)
+                rollout_horizon_returns.extend(rollout_returns)
+                episodic_returns.extend(rollout_returns)
 
                 rollout_steps = cpu_exp.rewards.shape[1]
                 has_bootstrap_padding = exists(cpu_exp.is_truncated) and exists(cpu_exp.terminals) and (cpu_exp.is_truncated & ~cpu_exp.terminals).any()
@@ -1736,10 +1967,7 @@ def main(
 
                 env_step += rollout_steps * cpu_exp.rewards.shape[0]
 
-                completed_returns, completed_lengths = get_completed_episode_stats(env, start_episode_count)
-
-                for episode_return, episode_length in zip(completed_returns, completed_lengths):
-                    episodic_returns.append(float(episode_return))
+                for episode_return, episode_length in zip(rollout_returns, rollout_lengths):
                     log_scalars(
                         writer,
                         {
@@ -1787,6 +2015,7 @@ def main(
                 training_profiler = training_profiler,
                 shortcut_train_mode = "finetune",
                 desc = "world model pretrain finetune",
+                old_replay_sampling = old_replay_sampling,
             )
 
             wm_step, _ = train_world_model(
@@ -1806,6 +2035,7 @@ def main(
                 training_profiler = training_profiler,
                 shortcut_train_mode = "combined",
                 desc = "world model pretrain combined",
+                old_replay_sampling = old_replay_sampling,
             )
 
             did_world_model_pretrain = True
@@ -1827,6 +2057,7 @@ def main(
             training_profiler = training_profiler,
             shortcut_train_mode = "combined",
             desc = "world model",
+            old_replay_sampling = old_replay_sampling,
         )
 
         world_model.train()
@@ -1855,6 +2086,7 @@ def main(
             global_step = imagination_step,
             writer = writer,
             training_profiler = training_profiler,
+            old_replay_sampling = old_replay_sampling,
         )
 
         postfix_return = avg_return if exists(avg_return) else avg_horizon_return

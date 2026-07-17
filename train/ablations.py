@@ -28,11 +28,19 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 GYM_LOG_ROOT = Path("runs/gym_imagination")
 
 ABLATIONS = [
-    {"run_name": "faster_compile", "run_details": "750 env steps; compiled interact KV/time dynamic no graphs; fewer CPU-GPU syncs; 32 WM updates; 10 imagination updates; still has symexp"},
+    {
+        "run_name": "oldcode_baseline_newseed",
+        "run_details": "New seed (4 from 42)",
+    },
+    {
+        "run_name": "oldcode_baseline_value_sigma2",
+        "run_details": "Value encoder sigma-to-bin ratio 2.0",
+        "value_encoder_sigma_to_bin_ratio": 2.0,
+    },
 ]
 
 
-RUN_PARALLEL = False
+RUN_PARALLEL = True
 MAX_PARALLEL_WORKERS: int | None = None
 CONTINUE_ON_ERROR = False
 
@@ -131,6 +139,25 @@ def plan_run_log_dir(train_kwargs: Mapping[str, Any]):
     return str(GYM_LOG_ROOT / str(train_kwargs["run_name"]))
 
 
+def plan_checkpoint_folder(train_kwargs: dict[str, Any]):
+    """Give each new ablation run its own checkpoint directory."""
+    if train_kwargs.get("checkpoint_path"):
+        return
+
+    checkpoint_folder = train_kwargs.get("checkpoint_folder")
+
+    if checkpoint_folder is None:
+        return
+
+    run_name = str(train_kwargs["run_name"])
+    checkpoint_folder = Path(str(checkpoint_folder))
+
+    if checkpoint_folder.name != run_name:
+        checkpoint_folder /= run_name
+
+    train_kwargs["checkpoint_folder"] = str(checkpoint_folder)
+
+
 def build_ablation_specs(
     *,
     config_path: str | Path = DEFAULT_CONFIG_PATH,
@@ -178,6 +205,7 @@ def build_ablation_specs(
         train_kwargs.update(overrides)
         train_kwargs["run_name"] = run_name
         train_kwargs["log_dir"] = str(GYM_LOG_ROOT)
+        plan_checkpoint_folder(train_kwargs)
         train_kwargs["run_details"] = build_run_details(
             str(baseline["run_details"]),
             index = index,
