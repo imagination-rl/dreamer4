@@ -102,10 +102,13 @@ compile_world_model: true
 compile_generate: true
 compile_learn: true
 compile_backend: inductor
-compile_mode: reduce-overhead
+compile_mode: default
 compile_fullgraph: false
 compile_dynamic: false
 compile_generate_cudagraphs: true
+# Optional torch.compile backend options. The benchmark's custom cases supply
+# these individually; normal runs leave this disabled.
+compile_options: null
 optimize_generate_compilation: false
 compile_generate_with_time_cache: true
 track_compile_performance: false
@@ -127,7 +130,7 @@ use_tensorboard: true
 log_dir: runs/gym_imagination
 run_name: halfcheetah_baseline
 run_details: Baseline HalfCheetah-v4 Gym imagination run.
-checkpoint_folder: checkpoints_gym_imagination
+checkpoint_folder: null
 checkpoint_every: 25
 checkpoint_path: null
 clear_log_dir: false

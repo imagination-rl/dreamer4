@@ -29,7 +29,7 @@ from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 from math import sqrt
 
 import fire
@@ -1542,6 +1542,7 @@ def main(
     compile_fullgraph: bool,
     compile_dynamic: bool | None,
     compile_generate_cudagraphs: bool,
+    compile_options: Mapping[str, Any] | None = None,
     optimize_generate_compilation: bool,
     compile_generate_with_time_cache: bool,
     track_compile_performance: bool,
@@ -1834,6 +1835,7 @@ def main(
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = compile_dynamic,
         compile_generate_cudagraphs = compile_generate_cudagraphs,
+        compile_options = compile_options,
         optimize_generate_compilation = optimize_generate_compilation,
         compile_generate_with_time_cache = compile_generate_with_time_cache,
         track_compile_performance = track_compile_performance,

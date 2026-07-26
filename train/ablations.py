@@ -17,7 +17,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from multiprocessing import get_context
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Mapping, Sequence
 
 import fire
@@ -29,20 +29,191 @@ GYM_LOG_ROOT = Path("runs/gym_imagination")
 
 ABLATIONS = [
     {
-        "run_name": "oldcode_baseline_newseed",
-        "run_details": "New seed (4 from 42)",
+        "run_name": "modded_better_baseline",
+        "run_details": "Better baseline with old PMPO, reward head, policy tokens, and compilation (seed 42)",
+        "seed": 42,
+        "require_cuda": True,
+        "policy_all_tokens": True,
+        "pretrain_world_model_finetune_steps": 0,
+        "pretrain_world_model_combined_steps": 256,
+        "replay_size": 256,
+        "add_action_embed_to_agent_token": False,
+        "old_continuous_action_encoder": False,
+        "old_reward_shifting": False,
+        "old_pmpo": True,
+        "old_reward_head": True,
+        "old_terminal_head": False,
+        "old_state_tokenizer": False,
+        "old_dynamics_ff": False,
+        "old_policy_head": False,
+        "old_value_head": False,
+        "old_replay_sampling": False,
+        "old_embedding_init": False,
+        "compile": None,
+        "compile_interact": True,
+        "compile_world_model": True,
+        "compile_generate": True,
+        "compile_learn": True,
+        "compile_backend": "inductor",
+        "compile_mode": "reduce-overhead",
+        "compile_fullgraph": False,
+        "compile_dynamic": False,
+        "compile_generate_cudagraphs": True,
+        "optimize_generate_compilation": False,
+        "compile_generate_with_time_cache": True,
     },
     {
-        "run_name": "oldcode_baseline_value_sigma2",
-        "run_details": "Value encoder sigma-to-bin ratio 2.0",
-        "value_encoder_sigma_to_bin_ratio": 2.0,
+        "run_name": "modded_better_baseline2",
+        "run_details": "Better baseline with old PMPO, reward head, policy tokens, and compilation (seed 4)",
+        "seed": 4,
+        "require_cuda": True,
+        "policy_all_tokens": True,
+        "pretrain_world_model_finetune_steps": 0,
+        "pretrain_world_model_combined_steps": 256,
+        "replay_size": 256,
+        "add_action_embed_to_agent_token": False,
+        "old_continuous_action_encoder": False,
+        "old_reward_shifting": False,
+        "old_pmpo": True,
+        "old_reward_head": True,
+        "old_terminal_head": False,
+        "old_state_tokenizer": False,
+        "old_dynamics_ff": False,
+        "old_policy_head": False,
+        "old_value_head": False,
+        "old_replay_sampling": False,
+        "old_embedding_init": False,
+        "compile": None,
+        "compile_interact": True,
+        "compile_world_model": True,
+        "compile_generate": True,
+        "compile_learn": True,
+        "compile_backend": "inductor",
+        "compile_mode": "reduce-overhead",
+        "compile_fullgraph": False,
+        "compile_dynamic": False,
+        "compile_generate_cudagraphs": True,
+        "optimize_generate_compilation": False,
+        "compile_generate_with_time_cache": True,
+    },
+    {
+        "run_name": "old_reward_shifting",
+        "run_details": "Disable old_reward_shifting (seed 42)",
+        "seed": 42,
+        "old_reward_shifting": False,
+    },
+    {
+        "run_name": "old_reward_shifting2",
+        "run_details": "Disable old_reward_shifting (seed 4)",
+        "seed": 4,
+        "old_reward_shifting": False,
+    },
+    {
+        "run_name": "old_continuous_action_encoder",
+        "run_details": "Disable old_continuous_action_encoder (seed 42)",
+        "seed": 42,
+        "old_continuous_action_encoder": False,
+    },
+    {
+        "run_name": "old_continuous_action_encoder2",
+        "run_details": "Disable old_continuous_action_encoder (seed 4)",
+        "seed": 4,
+        "old_continuous_action_encoder": False,
+    },
+    {
+        "run_name": "old_terminal_head",
+        "run_details": "Disable old_terminal_head (seed 42)",
+        "seed": 42,
+        "old_terminal_head": False,
+    },
+    {
+        "run_name": "old_terminal_head2",
+        "run_details": "Disable old_terminal_head (seed 4)",
+        "seed": 4,
+        "old_terminal_head": False,
+    },
+    {
+        "run_name": "old_state_tokenizer",
+        "run_details": "Disable old_state_tokenizer (seed 42)",
+        "seed": 42,
+        "old_state_tokenizer": False,
+    },
+    {
+        "run_name": "old_state_tokenizer2",
+        "run_details": "Disable old_state_tokenizer (seed 4)",
+        "seed": 4,
+        "old_state_tokenizer": False,
+    },
+    {
+        "run_name": "old_dynamics_ff",
+        "run_details": "Disable old_dynamics_ff (seed 42)",
+        "seed": 42,
+        "old_dynamics_ff": False,
+    },
+    {
+        "run_name": "old_dynamics_ff2",
+        "run_details": "Disable old_dynamics_ff (seed 4)",
+        "seed": 4,
+        "old_dynamics_ff": False,
+    },
+    {
+        "run_name": "old_policy_head",
+        "run_details": "Disable old_policy_head (seed 42)",
+        "seed": 42,
+        "old_policy_head": False,
+    },
+    {
+        "run_name": "old_policy_head2",
+        "run_details": "Disable old_policy_head (seed 4)",
+        "seed": 4,
+        "old_policy_head": False,
+    },
+    {
+        "run_name": "old_value_head",
+        "run_details": "Disable old_value_head (seed 42)",
+        "seed": 42,
+        "old_value_head": False,
+    },
+    {
+        "run_name": "old_value_head2",
+        "run_details": "Disable old_value_head (seed 4)",
+        "seed": 4,
+        "old_value_head": False,
+    },
+    {
+        "run_name": "old_replay_sampling",
+        "run_details": "Disable old_replay_sampling (seed 42)",
+        "seed": 42,
+        "old_replay_sampling": False,
+    },
+    {
+        "run_name": "old_replay_sampling2",
+        "run_details": "Disable old_replay_sampling (seed 4)",
+        "seed": 4,
+        "old_replay_sampling": False,
+    },
+    {
+        "run_name": "old_embedding_init",
+        "run_details": "Disable old_embedding_init (seed 42)",
+        "seed": 42,
+        "old_embedding_init": False,
+    },
+    {
+        "run_name": "old_embedding_init2",
+        "run_details": "Disable old_embedding_init (seed 4)",
+        "seed": 4,
+        "old_embedding_init": False,
     },
 ]
+
+# This list uses 1-based indexing; it is not 0 indexed.
+ABLATIONS_TO_RUN = [1, 2]
 
 
 RUN_PARALLEL = True
 MAX_PARALLEL_WORKERS: int | None = None
 CONTINUE_ON_ERROR = False
+PARALLEL_LAUNCH_DELAY_SECONDS = 15
 
 
 @dataclass(frozen = True)
@@ -158,10 +329,42 @@ def plan_checkpoint_folder(train_kwargs: dict[str, Any]):
     train_kwargs["checkpoint_folder"] = str(checkpoint_folder)
 
 
+def select_ablation_indices(
+    ablation_count: int,
+    indices: Sequence[int] | None = None,
+):
+    selected_indices = list(ABLATIONS_TO_RUN if indices is None else indices)
+
+    if len(selected_indices) == 0:
+        raise ValueError("ABLATIONS_TO_RUN must contain at least one ablation index")
+
+    seen = set()
+
+    for index in selected_indices:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError(
+                "ABLATIONS_TO_RUN must contain only integer indices; indices are 1-based"
+            )
+
+        if index < 1 or index > ablation_count:
+            raise IndexError(
+                f"ablation index {index} is out of range; choose values from 1 to "
+                f"{ablation_count} (indices are 1-based)"
+            )
+
+        if index in seen:
+            raise ValueError(f"ablation index {index} was selected more than once")
+
+        seen.add(index)
+
+    return selected_indices
+
+
 def build_ablation_specs(
     *,
     config_path: str | Path = DEFAULT_CONFIG_PATH,
     ablations: Sequence[Mapping[str, Any]] | None = None,
+    ablation_indices: Sequence[int] | None = None,
 ):
     baseline = load_baseline_config(config_path)
     raw_ablations = list(ABLATIONS if ablations is None else ablations)
@@ -172,10 +375,16 @@ def build_ablation_specs(
             "for example ABLATIONS = [{'depth': 8}]"
         )
 
+    if ablations is not None and ablation_indices is None:
+        selected_indices = list(range(1, len(raw_ablations) + 1))
+    else:
+        selected_indices = select_ablation_indices(len(raw_ablations), ablation_indices)
     allowed_override_keys = set(baseline.keys())
     specs = []
 
-    for index, ablation in enumerate(raw_ablations):
+    for index in selected_indices:
+        ablation = raw_ablations[index - 1]
+
         if not isinstance(ablation, Mapping):
             raise TypeError(f"ablation #{index} must be a mapping, got {type(ablation).__name__}")
 
@@ -348,10 +557,13 @@ def run_ablation_specs(
     mp_context = get_context("spawn")
 
     with ProcessPoolExecutor(max_workers = worker_count, mp_context = mp_context) as executor:
-        future_to_spec = {
-            executor.submit(execute_ablation_in_subprocess, spec, dry_run): spec
-            for spec in specs
-        }
+        future_to_spec = {}
+
+        for index, spec in enumerate(specs):
+            if index > 0:
+                sleep(PARALLEL_LAUNCH_DELAY_SECONDS)
+
+            future_to_spec[executor.submit(execute_ablation_in_subprocess, spec, dry_run)] = spec
 
         for future in as_completed(future_to_spec):
             spec = future_to_spec[future]

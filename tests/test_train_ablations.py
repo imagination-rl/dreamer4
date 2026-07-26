@@ -41,7 +41,7 @@ def test_build_ablation_specs_uses_baseline_config_and_overrides(tmp_path):
     assert first.train_kwargs["run_name"] == "depth8"
     assert first.train_kwargs["log_dir"] == "runs/gym_imagination"
     assert first.run_log_dir == "runs/gym_imagination/depth8"
-    assert "Ablation 0: depth8" in first.train_kwargs["run_details"]
+    assert "Ablation 1: depth8" in first.train_kwargs["run_details"]
     assert "Depth-8 ablation" in first.train_kwargs["run_details"]
 
     second = specs[1]
@@ -50,6 +50,57 @@ def test_build_ablation_specs_uses_baseline_config_and_overrides(tmp_path):
     assert second.train_kwargs["depth"] == 3
     assert second.train_kwargs["run_name"] == "wider"
     assert second.run_log_dir == "runs/gym_imagination/wider"
+
+
+def test_build_ablation_specs_selects_requested_one_based_indices(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    write_config(
+        config_path,
+        {
+            "run_name": "baseline",
+            "run_details": "details",
+            "log_dir": "runs/test",
+        },
+    )
+
+    specs = build_ablation_specs(
+        config_path = config_path,
+        ablations = [
+            {"run_name": "first", "run_details": "first run"},
+            {"run_name": "second", "run_details": "second run"},
+            {"run_name": "third", "run_details": "third run"},
+        ],
+        ablation_indices = [1, 3],
+    )
+
+    assert [spec.index for spec in specs] == [1, 3]
+    assert [spec.label for spec in specs] == ["first", "third"]
+
+
+def test_build_ablation_specs_rejects_zero_based_or_out_of_range_indices(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    write_config(
+        config_path,
+        {
+            "run_name": "baseline",
+            "run_details": "details",
+            "log_dir": "runs/test",
+        },
+    )
+
+    with pytest.raises(IndexError, match = "1-based"):
+        build_ablation_specs(
+            config_path = config_path,
+            ablations = [{"run_name": "first", "run_details": "first run"}],
+            ablation_indices = [0],
+        )
+
+    with pytest.raises(IndexError, match = "1-based"):
+        build_ablation_specs(
+            config_path = config_path,
+            ablations = [{"run_name": "first", "run_details": "first run"}],
+            ablation_indices = [2],
+        )
 
 
 def test_build_ablation_specs_rejects_unknown_override_keys(tmp_path):

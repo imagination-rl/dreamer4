@@ -5,7 +5,7 @@ from __future__ import annotations
 import gc
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 import torch
 from torch import Tensor, nn
@@ -23,6 +23,7 @@ class CallTiming:
     name: str
     compiled: bool
     compile_mode: str | None = None
+    compile_options: tuple[str, ...] = ()
     cuda_graphs: bool = False
     # CUDA Graph modes capture on calls 2-3, not just compile on call 1, so
     # cudagraph timings treat the first few calls as cold instead of only the first
@@ -414,11 +415,18 @@ def torch_compile_kwargs(
     mode: str | None,
     fullgraph: bool,
     dynamic: bool | None,
+    options: Mapping[str, Any] | None = None,
 ):
     kwargs = dict(backend = backend, fullgraph = fullgraph)
     mode = torch_compile_mode(mode)
+    options = dict(options or {})
 
-    if exists(mode) and mode != "default":
+    # PyTorch rejects passing mode and options together. Options take
+    # precedence, so the mode is deliberately omitted whenever options are
+    # supplied.
+    if len(options) > 0:
+        kwargs["options"] = options
+    elif exists(mode) and mode != "default":
         kwargs["mode"] = mode
 
     if dynamic is not None:
@@ -439,18 +447,26 @@ def maybe_compile_and_time(
     compile_fullgraph: bool,
     compile_dynamic: bool | None,
     compile_cudagraphs = True,
+    compile_options: Mapping[str, Any] | None = None,
     wrap_timing = True,
 ):
     compile_mode = normalize_compile_mode(compile_mode)
+    compile_options = dict(compile_options or {})
     uses_cuda_graphs = (
         enabled and
         device.type == "cuda" and
         compile_cudagraphs and
-        compile_mode_uses_cuda_graphs(compile_mode)
+        (
+            bool(compile_options.get("triton.cudagraphs", False))
+            if len(compile_options) > 0
+            else compile_mode_uses_cuda_graphs(compile_mode)
+        )
     )
     effective_compile_mode = compile_mode
 
-    if enabled and compile_mode_uses_cuda_graphs(compile_mode) and not compile_cudagraphs:
+    if len(compile_options) > 0:
+        effective_compile_mode = None
+    elif enabled and compile_mode_uses_cuda_graphs(compile_mode) and not compile_cudagraphs:
         # Dynamic caches and live autograd intermediates are unsafe to replay,
         # so paths that opt out fall back to a non-CUDA-graph mode.
         effective_compile_mode = "max-autotune-no-cudagraphs" if compile_mode == "max-autotune" else "default"
@@ -459,6 +475,7 @@ def maybe_compile_and_time(
         name = name,
         compiled = enabled,
         compile_mode = effective_compile_mode if enabled else None,
+        compile_options = tuple(f"{key}={value}" for key, value in compile_options.items()),
         cuda_graphs = uses_cuda_graphs,
         warmup_calls = 3 if uses_cuda_graphs else 1,
     )
@@ -471,6 +488,7 @@ def maybe_compile_and_time(
                 mode = effective_compile_mode,
                 fullgraph = compile_fullgraph,
                 dynamic = compile_dynamic,
+                options = compile_options,
             )
         )
         fn = CompiledCallable(fn, timing)
@@ -493,6 +511,7 @@ def build_compile_runtime(
     compile_fullgraph: bool,
     compile_dynamic: bool | None,
     compile_generate_cudagraphs: bool,
+    compile_options: Mapping[str, Any] | None = None,
     optimize_generate_compilation: bool = False,
     compile_generate_with_time_cache: bool = False,
     track_compile_performance: bool,
@@ -527,6 +546,7 @@ def build_compile_runtime(
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = True,
         compile_cudagraphs = False,
+        compile_options = compile_options,
         wrap_timing = False,
     )
     if compile_interact:
@@ -547,6 +567,7 @@ def build_compile_runtime(
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = compile_dynamic,
         compile_cudagraphs = False,
+        compile_options = compile_options,
         wrap_timing = False,
     )
     world_model_loss_timing = timing if track_compile_performance else None
@@ -568,6 +589,7 @@ def build_compile_runtime(
             # its cached graphs instead of compiling the Python rollout loop.
             compile_dynamic = True,
             compile_cudagraphs = False,
+            compile_options = compile_options,
             wrap_timing = False,
         )
         cached_generate_forward = DynamicTimeCacheCallable(
@@ -601,6 +623,7 @@ def build_compile_runtime(
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = compile_dynamic,
         compile_cudagraphs = compile_generate_cudagraphs,
+        compile_options = compile_options,
     )
     generate_rollout_timing = timing if track_compile_performance else None
     generate_uses_cuda_graphs = timing.cuda_graphs
@@ -621,6 +644,7 @@ def build_compile_runtime(
         compile_fullgraph = compile_fullgraph,
         compile_dynamic = compile_dynamic,
         compile_cudagraphs = False,
+        compile_options = compile_options,
         wrap_timing = False,
     )
     learn_from_dream_timing = timing if track_compile_performance else None
@@ -666,14 +690,15 @@ def print_compile_timing_report(timings: list[CallTiming]):
         warm_avg = timing.warm_average_seconds
         warm_avg_text = f"{warm_avg:.4f}s" if exists(warm_avg) else "n/a"
         compiled_text = "compiled" if timing.compiled else "eager"
-        mode_text = timing.compile_mode or ("compiled" if timing.compiled else "eager")
+        mode_text = timing.compile_mode or ("options" if timing.compile_options else ("compiled" if timing.compiled else "eager"))
+        options_text = f", options={','.join(timing.compile_options)}" if len(timing.compile_options) > 0 else ""
 
         print(
             f"  {timing.name} ({compiled_text}): "
             f"calls={timing.calls}, first_call={first:.4f}s, "
             f"warm_total={timing.warm_seconds:.4f}s, warm_avg={warm_avg_text}, "
             f"total={timing.total_seconds:.4f}s, "
-            f"mode={mode_text}, cuda_graphs={timing.cuda_graphs}"
+            f"mode={mode_text}{options_text}, cuda_graphs={timing.cuda_graphs}"
         )
 
 

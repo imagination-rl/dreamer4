@@ -15,6 +15,7 @@ from train.compile_runtime import (
     InteractWithEnvForward,
     build_compile_runtime,
     configure_sac,
+    maybe_compile_and_time,
     reset_torch_compile_state,
 )
 
@@ -213,6 +214,42 @@ def test_interact_forward_compiles_only_world_model_forward_without_cudagraphs(m
     interact_timing = next(timing for timing in runtime.timings if timing.name == "interact_forward")
     assert interact_timing.compile_mode == "default"
     assert interact_timing.cuda_graphs is False
+
+
+def test_compile_options_are_passed_without_compile_mode(monkeypatch):
+    compile_calls = []
+
+    def fake_compile(fn, **kwargs):
+        compile_calls.append(kwargs)
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    options = {
+        "cpp_wrapper": True,
+        "max_autotune_gemm": True,
+        "b2b_gemm_pass": True,
+        "triton.enable_persistent_tma_matmul": True,
+        "epilogue_fusion_first": True,
+    }
+
+    _, timing = maybe_compile_and_time(
+        lambda value: value,
+        name = "custom_options",
+        enabled = True,
+        track_timing = False,
+        device = torch.device("cpu"),
+        compile_backend = "inductor",
+        compile_mode = "reduce-overhead",
+        compile_fullgraph = False,
+        compile_dynamic = False,
+        compile_options = options,
+    )
+
+    assert len(compile_calls) == 1
+    assert compile_calls[0]["options"] == options
+    assert "mode" not in compile_calls[0]
+    assert timing.compile_mode is None
+    assert timing.compile_options == tuple(f"{key}={value}" for key, value in options.items())
 
 
 def test_interact_forward_marks_kv_time_dynamic(monkeypatch):
