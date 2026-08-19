@@ -1,6 +1,6 @@
 # Environment and device setup
 env_name: HalfCheetah-v4
-seed: 4
+seed: 42
 cpu: false
 require_cuda: true
 allow_tf32: true
@@ -28,18 +28,18 @@ value_use_symlog: false
 reward_decode_symlog_expected_raw: false
 value_decode_symlog_expected_raw: false
 normalize_advantages: false
-add_action_embed_to_agent_token: true
-old_continuous_action_encoder: true
+add_action_embed_to_agent_token: false
+old_continuous_action_encoder: false
 old_reward_shifting: true
 old_pmpo: true
 old_reward_head: true
-old_terminal_head: true
-old_state_tokenizer: true
-old_dynamics_ff: true
-old_policy_head: true
-old_value_head: true
-old_replay_sampling: true
-old_embedding_init: true
+old_terminal_head: false
+old_state_tokenizer: false
+old_dynamics_ff: false
+old_policy_head: false
+old_value_head: false
+old_replay_sampling: false
+old_embedding_init: false
 reward_range: [-20.0, 20.0]
 reward_encoder_sigma_to_bin_ratio: 2.0
 reward_min_max_value_on_bin_center: false
@@ -67,7 +67,7 @@ replay_size: 256
 # World model training
 world_model_batch_size: 128
 pretrain_world_model_finetune_steps: 0
-pretrain_world_model_combined_steps: 250
+pretrain_world_model_combined_steps: 256
 world_model_train_steps: 13
 world_model_train_sequence_length: 200
 world_model_learning_rate: 0.0006
@@ -102,7 +102,7 @@ compile_world_model: true
 compile_generate: true
 compile_learn: true
 compile_backend: inductor
-compile_mode: default
+compile_mode: reduce-overhead
 compile_fullgraph: false
 compile_dynamic: false
 compile_generate_cudagraphs: true
@@ -128,8 +128,8 @@ profile_with_flops: false
 # Logging and checkpoints
 use_tensorboard: true
 log_dir: runs/gym_imagination
-run_name: halfcheetah_baseline
-run_details: Baseline HalfCheetah-v4 Gym imagination run.
+run_name: modded_better_baseline
+run_details: Better baseline with old PMPO, reward head, policy tokens, and compilation.
 checkpoint_folder: null
 checkpoint_every: 25
 checkpoint_path: null

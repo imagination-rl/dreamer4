@@ -331,15 +331,17 @@ def test_main_parameters_match_config_exactly():
     } <= parameters
 
 
-def test_config_enables_independent_old_settings_without_disabling_compile_or_tf32():
+def test_config_matches_modded_better_baseline():
     config = yaml.safe_load(CONFIG_PATH.read_text())
+
+    assert config["seed"] == 42
+    assert config["old_pmpo"] is True
+    assert config["old_reward_head"] is True
 
     for flag in (
         "add_action_embed_to_agent_token",
         "old_continuous_action_encoder",
         "old_reward_shifting",
-        "old_pmpo",
-        "old_reward_head",
         "old_terminal_head",
         "old_state_tokenizer",
         "old_dynamics_ff",
@@ -348,7 +350,7 @@ def test_config_enables_independent_old_settings_without_disabling_compile_or_tf
         "old_replay_sampling",
         "old_embedding_init",
     ):
-        assert config[flag] is True
+        assert config[flag] is False
 
     assert config["normalize_advantages"] is False
     assert config["policy_all_tokens"] is True
@@ -362,12 +364,13 @@ def test_config_enables_independent_old_settings_without_disabling_compile_or_tf
     assert config["num_envs"] == 64
     assert config["max_timesteps"] == 1000
     assert config["pretrain_world_model_finetune_steps"] == 0
-    assert config["pretrain_world_model_combined_steps"] == 250
+    assert config["pretrain_world_model_combined_steps"] == 256
     assert config["allow_tf32"] is True
     assert config["optimize_generate_compilation"] is False
     assert config["compile_generate_with_time_cache"] is True
     assert config["activation_memory_budget"] == 0.9
     assert config["imagination_use_time_cache"] is True
+    assert config["compile_mode"] == "reduce-overhead"
     assert all(config[key] is True for key in (
         "compile_interact",
         "compile_world_model",
