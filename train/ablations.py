@@ -29,27 +29,38 @@ GYM_LOG_ROOT = Path("runs/gym_imagination")
 
 ABLATIONS = [
     {
-        "run_name": "old_value_head_zero_init",
-        "run_details": "Enable old_value_head zero-value initialization (seed 42)",
-        "old_value_head": True,
-    },
-    {
-        "run_name": "old_value_head_zero_init2",
-        "run_details": "Enable old_value_head zero-value initialization (seed 4)",
-        "seed": 4,
-        "old_value_head": True,
-    },
-    {
-        "run_name": "old_embedding_init",
-        "run_details": "Enable old_embedding_init (seed 42)",
+        "run_name": "symlog_hl_gauss_value_head",
+        "run_details": "prev=old_reward_shifting[2], change=[enable smooth symlog HL-Gauss value head with raw expected-value decoding, zero initialization, and support -10 to 10]",
         "seed": 42,
-        "old_embedding_init": True,
+        "old_reward_shifting": False,
+        "use_symlog_hl_gauss_value_head": True,
+        "value_range": [-10.0, 10.0],
     },
     {
-        "run_name": "old_embedding_init2",
-        "run_details": "Enable old_embedding_init (seed 4)",
+        "run_name": "symlog_hl_gauss_value_head2",
+        "run_details": "prev=old_reward_shifting[2], change=[enable smooth symlog HL-Gauss value head with raw expected-value decoding, zero initialization, and support -10 to 10]",
         "seed": 4,
-        "old_embedding_init": True,
+        "old_reward_shifting": False,
+        "use_symlog_hl_gauss_value_head": True,
+        "value_range": [-10.0, 10.0],
+    },
+    {
+        "run_name": "symexp_hl_gauss_actor_critic",
+        "run_details": "prev=symexp_value_head, change=[train a baseline HL-Gauss critic beside the Dreamer symexp critic and use the HL-Gauss critic for GAE and PMPO signs]",
+        "seed": 42,
+        "old_reward_shifting": False,
+        "use_symexp_value_head": True,
+        "use_hl_gauss_actor_critic": True,
+        "value_range": [-10.0, 10.0],
+    },
+    {
+        "run_name": "symexp_hl_gauss_actor_critic2",
+        "run_details": "prev=symexp_value_head2, change=[train a baseline HL-Gauss critic beside the Dreamer symexp critic and use the HL-Gauss critic for GAE and PMPO signs]",
+        "seed": 4,
+        "old_reward_shifting": False,
+        "use_symexp_value_head": True,
+        "use_hl_gauss_actor_critic": True,
+        "value_range": [-10.0, 10.0],
     },
 ]
 
@@ -290,32 +301,66 @@ def run_train_gym(train_kwargs: Mapping[str, Any]):
     return train_gym_main(**dict(train_kwargs))
 
 
+def log_ablation_error(
+    spec: AblationSpec,
+    error: str,
+    *,
+    source: str,
+):
+    """Write a failure traceback before the launcher waits for other runs."""
+    print(
+        f"\n[ablation {spec.index}] {source} for {spec.train_kwargs['run_name']}:\n{error}",
+        file = sys.stderr,
+        flush = True,
+    )
+
+
+def failed_ablation_result(
+    spec: AblationSpec,
+    *,
+    elapsed_seconds: float,
+    error: str,
+    source: str,
+):
+    log_ablation_error(spec, error, source = source)
+
+    return AblationResult(
+        index = spec.index,
+        label = spec.label,
+        run_name = str(spec.train_kwargs["run_name"]),
+        run_log_dir = spec.run_log_dir,
+        success = False,
+        elapsed_seconds = elapsed_seconds,
+        error = error,
+    )
+
+
 def execute_ablation(spec: AblationSpec, *, dry_run: bool):
     start = perf_counter()
 
-    print(f"[ablation {spec.index}] starting {spec.label}")
-    print(f"[ablation {spec.index}] run_name={spec.train_kwargs['run_name']}")
+    print(f"[ablation {spec.index}] starting {spec.label}", flush = True)
+    print(f"[ablation {spec.index}] run_name={spec.train_kwargs['run_name']}", flush = True)
 
     if spec.run_log_dir:
-        print(f"[ablation {spec.index}] log_dir={spec.run_log_dir}")
+        print(f"[ablation {spec.index}] log_dir={spec.run_log_dir}", flush = True)
 
     if spec.overrides:
-        print(f"[ablation {spec.index}] overrides={json.dumps(spec.overrides, sort_keys = True)}")
+        print(
+            f"[ablation {spec.index}] overrides={json.dumps(spec.overrides, sort_keys = True)}",
+            flush = True,
+        )
     else:
-        print(f"[ablation {spec.index}] overrides={{}}")
+        print(f"[ablation {spec.index}] overrides={{}}", flush = True)
 
     try:
         if not dry_run:
             run_train_gym(spec.train_kwargs)
     except Exception:
-        return AblationResult(
-            index = spec.index,
-            label = spec.label,
-            run_name = str(spec.train_kwargs["run_name"]),
-            run_log_dir = spec.run_log_dir,
-            success = False,
+        return failed_ablation_result(
+            spec,
             elapsed_seconds = perf_counter() - start,
             error = traceback.format_exc(),
+            source = "worker error",
         )
 
     return AblationResult(
@@ -380,14 +425,11 @@ def run_ablation_specs(
             try:
                 return future.result()
             except Exception:
-                return AblationResult(
-                    index = spec.index,
-                    label = spec.label,
-                    run_name = str(spec.train_kwargs["run_name"]),
-                    run_log_dir = spec.run_log_dir,
-                    success = False,
+                return failed_ablation_result(
+                    spec,
                     elapsed_seconds = 0.,
                     error = traceback.format_exc(),
+                    source = "worker process error",
                 )
 
     if not parallel or len(specs) == 1:
@@ -418,14 +460,11 @@ def run_ablation_specs(
             try:
                 result = future.result()
             except Exception:
-                result = AblationResult(
-                    index = spec.index,
-                    label = spec.label,
-                    run_name = str(spec.train_kwargs["run_name"]),
-                    run_log_dir = spec.run_log_dir,
-                    success = False,
+                result = failed_ablation_result(
+                    spec,
                     elapsed_seconds = 0.,
                     error = traceback.format_exc(),
+                    source = "worker process error",
                 )
 
             results.append(result)

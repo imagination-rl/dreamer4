@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+import warnings
 
 import gymnasium as gym
 import numpy as np
@@ -106,6 +107,47 @@ def test_old_world_model_heads_get_dedicated_clip_groups():
     assert set(groups["reward_head"]) == set(world_model.to_agent_embed_reward_pred.parameters())
     assert set(groups["terminal_head"]) == set(world_model.to_latent_state_terminal_pred.parameters())
     assert not set(groups["reward_head"]) & set(groups["terminal_head"])
+
+
+def test_agent_optimizer_parameters_include_world_model_only_when_enabled():
+    world_model = DynamicsWorldModel(
+        dim = 8,
+        dim_latent = 4,
+        max_steps = 8,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        num_continuous_actions = 2,
+        reward_encoder_kwargs = dict(num_bins = 5),
+        value_encoder_kwargs = dict(num_bins = 5),
+    )
+
+    disabled = train_gym.agent_optimizer_parameters(world_model, False)
+    enabled = train_gym.agent_optimizer_parameters(world_model, True)
+
+    assert disabled == world_model.agent_parameters()
+    assert set(enabled) == set(world_model.parameters())
+    assert not set(disabled) & set(world_model.transformer.parameters())
+    assert set(world_model.transformer.parameters()) <= set(enabled)
+
+
+def test_dynamics_loss_normalization_freeze_requires_normalization():
+    with pytest.raises(ValueError, match = "requires use_dynamics_loss_normalization=true"):
+        train_gym.validate_dynamics_loss_normalization(False, True)
+
+
+def test_active_dynamics_loss_normalization_warns_without_freeze():
+    with pytest.warns(UserWarning, match = "RMS statistics remain active"):
+        train_gym.validate_dynamics_loss_normalization(True, False)
+
+
+def test_disabled_dynamics_loss_normalization_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        train_gym.validate_dynamics_loss_normalization(False, False)
 
 
 def test_rollout_episode_stats_use_returns_and_exclude_bootstrap_padding():
@@ -337,11 +379,11 @@ def test_config_matches_modded_better_baseline():
     assert config["seed"] == 42
     assert config["old_pmpo"] is True
     assert config["old_reward_head"] is True
+    assert config["old_reward_shifting"] is True
 
     for flag in (
         "add_action_embed_to_agent_token",
         "old_continuous_action_encoder",
-        "old_reward_shifting",
         "old_terminal_head",
         "old_state_tokenizer",
         "old_dynamics_ff",
@@ -357,6 +399,11 @@ def test_config_matches_modded_better_baseline():
     assert config["value_range"] == [-1200., 1200.]
     assert config["value_encoder_num_bins"] == 255
     assert config["reward_encoder_num_bins"] == 255
+    assert config["use_symexp_value_head"] is False
+    assert config["use_tdmpc2_value_head"] is False
+    assert config["use_symlog_hl_gauss_value_head"] is False
+    assert config["use_hl_gauss_actor_critic"] is False
+    assert config["use_baseline_symexp_value_head_init"] is False
     assert config["pretrain_tokenizer_steps"] == 2000
     assert config["pretrain_tokenizer_observations"] == 16384
     assert config["value_use_symlog"] is False
@@ -461,3 +508,15 @@ def test_static_training_paths_enforce_fixed_shapes():
         for call in world_model_calls
     )
     assert ast.unparse(imagination_call["static_generate_shape"]) == "compile_generate and static_compile_shapes"
+    assert ast.unparse(imagination_call["full_transformer_finetuning"]) == "full_transformer_finetuning"
+    assert ast.unparse(imagination_call["preservation_sequence_length"]) == "preservation_sequence_length"
+    assert ast.unparse(imagination_call["preservation_batch_size"]) == "world_model_batch_size"
+    assert sum(
+        ast.unparse(call["update_loss_ema"]) == "True"
+        for call in world_model_calls
+    ) == 2
+    assert sum(
+        ast.unparse(call["update_loss_ema"])
+        == "not freeze_dynamics_loss_normalization_after_pretraining"
+        for call in world_model_calls
+    ) == 1

@@ -23,6 +23,7 @@ import json
 import os
 import random
 import shutil
+import warnings
 from contextlib import nullcontext
 from copy import deepcopy
 from contextvars import ContextVar
@@ -597,6 +598,16 @@ def optimizer_parameters(optimizer: Optimizer):
     return [param for group in optimizer.param_groups for param in group["params"]]
 
 
+def agent_optimizer_parameters(
+    world_model: DynamicsWorldModel,
+    full_transformer_finetuning: bool,
+):
+    if full_transformer_finetuning:
+        return list(world_model.parameters())
+
+    return world_model.agent_parameters()
+
+
 def disjoint_optimizer_param_groups(
     optimizer: AdamW,
     named_params: list[tuple[str, list[nn.Parameter]]],
@@ -679,6 +690,7 @@ def agent_clip_groups(world_model: DynamicsWorldModel, optimizer: Optimizer):
             ("policy_head", module_parameters(getattr(world_model, "policy_head", None))),
             ("action_unembed", list(world_model.action_embedder.unembed_parameters())),
             ("value_head", module_parameters(getattr(world_model, "value_head", None))),
+            ("actor_critic_value_head", module_parameters(getattr(world_model, "actor_critic_value_head", None))),
             ("critic_state_embedder", module_parameters(getattr(world_model, "critic_state_embedder", None))),
         ],
         "agent_rest",
@@ -1011,6 +1023,7 @@ def train_world_model(
     shortcut_train_mode: ShortcutTrainMode,
     desc: str,
     old_replay_sampling: bool = False,
+    update_loss_ema: bool = True,
 ):
     if len(replay) == 0 or steps <= 0:
         return global_step, {}
@@ -1090,6 +1103,7 @@ def train_world_model(
                         exp.actions.continuous if exists(exp.actions) else None,
                         exp.lens,
                         shortcut_train_mode,
+                        update_loss_ema,
                     )
 
                 with record("world_model/model/backward", cuda = True):
@@ -1114,6 +1128,12 @@ def train_world_model(
                     "world_model/terminal_loss": (losses.agent_embed_terminal.mean() + losses.latent_state_terminal.mean()).item(),
                     "world_model/agent_state_pred_loss": losses.agent_state_pred.item(),
                     "world_model/grad_norm": float(norm),
+                    "extra/flow_loss_raw": losses.diagnostics.raw_flow.item(),
+                    "extra/shortcut_loss_raw": losses.diagnostics.raw_shortcut.item(),
+                    "extra/dynamics_loss_raw": losses.diagnostics.raw_dynamics.item(),
+                    "extra/dynamics_loss_normalized": losses.diagnostics.normalized_dynamics.item(),
+                    "extra/reward_loss_raw": losses.diagnostics.raw_reward.item(),
+                    "extra/terminal_loss_raw": losses.diagnostics.raw_terminal.item(),
                 }
                 last_metrics.update({
                     f"world_model/{key}": value
@@ -1160,6 +1180,9 @@ def train_agent_in_imagination(
     writer: SummaryWriter | None,
     training_profiler: TrainingProfiler | None,
     old_replay_sampling: bool = False,
+    full_transformer_finetuning: bool = False,
+    preservation_sequence_length: int | None = None,
+    preservation_batch_size: int | None = None,
 ):
     if steps <= 0:
         return global_step, {}
@@ -1205,6 +1228,46 @@ def train_agent_in_imagination(
         else cycle(prompt_dataloader) if prompt_length > 0 and len(prompt_dataloader) > 0
         else None
     )
+
+    preservation_iterator = None
+    if full_transformer_finetuning:
+        preservation_sequence_length = (
+            horizon
+            if preservation_sequence_length is None
+            else preservation_sequence_length
+        )
+        preservation_batch_size = (
+            batch_size
+            if preservation_batch_size is None
+            else preservation_batch_size
+        )
+
+        if preservation_sequence_length <= 0:
+            raise ValueError("preservation_sequence_length must be positive")
+
+        if preservation_batch_size <= 0:
+            raise ValueError("preservation_batch_size must be positive")
+
+        preservation_dataset = ReplayDatasetTimeWindow(
+            replay_buffer = replay,
+            window_length = preservation_sequence_length,
+            include_metadata = True,
+        )
+        preservation_dataloader = DataLoader(
+            preservation_dataset,
+            batch_size = preservation_batch_size,
+            shuffle = True,
+            drop_last = not old_replay_sampling and len(preservation_dataset) >= preservation_batch_size,
+        )
+        if len(preservation_dataloader) > 0:
+            preservation_iterator = (
+                resampling_dataloader_iterator(preservation_dataloader)
+                if old_replay_sampling
+                else cycle(preservation_dataloader)
+            )
+
+        if not exists(preservation_iterator):
+            raise ValueError("full_transformer_finetuning requires at least one replay window")
 
     if static_generate_shape and prompt_length > 0 and not exists(prompt_iterator):
         raise ValueError("static compiled generation requires at least one prompt window")
@@ -1268,9 +1331,27 @@ def train_agent_in_imagination(
                 with record("imagination/model/policy_prior", cuda = True):
                     dream = attach_policy_prior_unembeds(dream, policy_prior)
 
+            preservation_exp = None
+            if full_transformer_finetuning:
+                with record("imagination/data/load_preservation_batch", cuda = True):
+                    preservation_batch = next(preservation_iterator)
+
+                    if static_generate_shape and not old_replay_sampling:
+                        preservation_batch = repeat_batch_to_size(
+                            preservation_batch,
+                            preservation_batch_size,
+                        )
+
+                    preservation_exp = Experience.from_buffer_dict(preservation_batch)
+                    preservation_exp.lens = preservation_batch.get("_lens")
+                    preservation_exp = preservation_exp.to(world_model.device)
+
         dream_actions = action_pair_or_empty(dream.actions)
         dream_log_probs = action_pair_or_empty(dream.log_probs)
         dream_old_action_unembeds = action_pair_or_empty(dream.old_action_unembeds)
+        preservation_actions = action_pair_or_empty(
+            preservation_exp.actions if exists(preservation_exp) else None
+        )
 
         def forward_backward():
             with record("imagination/model/learn_forward", cuda = True):
@@ -1294,6 +1375,12 @@ def train_agent_in_imagination(
                     dream.is_truncated,
                     dream.is_from_world_model,
                     dream.episode_return,
+                    preservation_exp.latents if exists(preservation_exp) else None,
+                    preservation_exp.proprio if exists(preservation_exp) else None,
+                    preservation_exp.rewards if exists(preservation_exp) else None,
+                    preservation_actions.discrete,
+                    preservation_actions.continuous,
+                    preservation_exp.lens if exists(preservation_exp) else None,
                 )
 
             loss = policy_loss + value_loss
@@ -1321,10 +1408,13 @@ def train_agent_in_imagination(
         dream_return = dream.episode_return.mean().item() if exists(dream.episode_return) else 0.
         dream_len = dream.lens.float().mean().item() if exists(dream.lens) else horizon
         action_std = dream.actions.continuous.std().item() if exists(dream.actions) and exists(dream.actions.continuous) else 0.
+        policy_objective = policy_loss.detach()
+        if "preservation/loss" in value_diagnostics:
+            policy_objective = policy_objective - value_diagnostics["preservation/loss"]
 
         last_metrics = {
             "imagination/loss": loss.item(),
-            "imagination/policy_loss": policy_loss.item(),
+            "imagination/policy_loss": policy_objective.item(),
             "imagination/value_loss": value_loss.item(),
             "imagination/dream_return": dream_return,
             "imagination/dream_length": dream_len,
@@ -1364,6 +1454,7 @@ def train_agent_in_imagination(
         del dream
         del agent_metrics, grad_metrics
         del dream_actions, dream_log_probs, dream_old_action_unembeds
+        del preservation_exp, preservation_actions
         del policy_loss, value_loss, value_diagnostics, loss
 
     if exists(training_profiler):
@@ -1463,6 +1554,25 @@ def serialize_hyperparameters(hyperparameters: dict):
     return "```json\n" + json.dumps(hyperparameters, indent = 2, sort_keys = True, default = str) + "\n```"
 
 
+def validate_dynamics_loss_normalization(
+    use_dynamics_loss_normalization: bool,
+    freeze_dynamics_loss_normalization_after_pretraining: bool,
+):
+    if freeze_dynamics_loss_normalization_after_pretraining and not use_dynamics_loss_normalization:
+        raise ValueError(
+            "freeze_dynamics_loss_normalization_after_pretraining requires "
+            "use_dynamics_loss_normalization=true"
+        )
+
+    if use_dynamics_loss_normalization and not freeze_dynamics_loss_normalization_after_pretraining:
+        warnings.warn(
+            "Dynamics loss RMS statistics remain active after world-model pretraining. "
+            "Set freeze_dynamics_loss_normalization_after_pretraining=true to freeze them.",
+            UserWarning,
+            stacklevel = 2,
+        )
+
+
 @close_runtime_resources
 def main(
     *,
@@ -1486,6 +1596,11 @@ def main(
     spatial_flex_attention_backend: str,
     final_special_cross_attn: bool,
     reward_encoder_type: Literal["symexp_two_hot", "hl_gauss"],
+    use_symexp_value_head: bool,
+    use_tdmpc2_value_head: bool = False,
+    use_symlog_hl_gauss_value_head: bool = False,
+    use_hl_gauss_actor_critic: bool = False,
+    use_baseline_symexp_value_head_init: bool = False,
     reward_encoder_num_bins: int,
     value_encoder_num_bins: int,
     reward_use_symlog: bool,
@@ -1500,6 +1615,9 @@ def main(
     world_model_train_steps: int,
     world_model_train_sequence_length: int,
     world_model_learning_rate: float,
+    use_dynamics_loss_normalization: bool,
+    freeze_dynamics_loss_normalization_after_pretraining: bool,
+    use_paper_aligned_shortcut_objective: bool,
     imagination_batch_size: int,
     imagination_horizon: int,
     imagination_prompt_length: int,
@@ -1507,6 +1625,7 @@ def main(
     imagination_train_steps: int,
     imagination_generate_steps: int,
     imagination_use_time_cache: bool,
+    preservation_sequence_length: int,
     agent_learning_rate: float,
     use_muon_optimizer: bool,
     optimizer_weight_decay: float,
@@ -1514,6 +1633,7 @@ def main(
     pmpo_pos_to_neg_weight: float,
     pmpo_kl_div_loss_weight: float,
     use_delight_gating: bool,
+    full_transformer_finetuning: bool,
     agent_predicts_state: bool,
     agent_state_pred_loss_weight: float,
     pretrain_tokenizer_steps: int,
@@ -1575,12 +1695,27 @@ def main(
     value_encoder_sigma_to_bin_ratio: float = 0.75,
     value_min_max_value_on_bin_center: bool = True,
     value_head_init_value: float | None = None,
+    hl_gauss_actor_critic_range: tuple[float, float] = (-1200., 1200.),
+    hl_gauss_actor_critic_num_bins: int = 255,
+    hl_gauss_actor_critic_sigma_to_bin_ratio: float = 0.75,
+    hl_gauss_actor_critic_min_max_value_on_bin_center: bool = False,
     activation_memory_budget: float = 0.9,
 ):
     hyperparameters = dict(locals())
 
     if not run_details:
         raise ValueError("run_details is required and must be non-empty")
+
+    if full_transformer_finetuning and objective != "pmpo":
+        raise ValueError("full_transformer_finetuning requires objective='pmpo' for the policy-prior loss")
+
+    if full_transformer_finetuning and pmpo_kl_div_loss_weight <= 0.:
+        raise ValueError("full_transformer_finetuning requires pmpo_kl_div_loss_weight > 0")
+
+    validate_dynamics_loss_normalization(
+        use_dynamics_loss_normalization,
+        freeze_dynamics_loss_normalization_after_pretraining,
+    )
 
     if exists(checkpoint_path) and clear_log_dir:
         raise ValueError("clear_log_dir must be false when checkpoint_path is set, otherwise resume state would be deleted")
@@ -1719,6 +1854,37 @@ def main(
     )
     register_runtime_cleanup(env.close)
 
+    value_encoder_kwargs = dict(
+        reward_range = value_range,
+        num_bins = value_encoder_num_bins,
+    )
+
+    if not (use_symexp_value_head or use_tdmpc2_value_head):
+        value_encoder_kwargs.update(
+            sigma_to_bin_ratio = value_encoder_sigma_to_bin_ratio,
+            min_max_value_on_bin_center = value_min_max_value_on_bin_center,
+            use_symlog = value_use_symlog,
+            decode_symlog_expected_raw = value_decode_symlog_expected_raw,
+        )
+
+    if use_symlog_hl_gauss_value_head:
+        value_encoder_kwargs.update(
+            use_symlog = True,
+            decode_symlog_expected_raw = True,
+        )
+
+    hl_gauss_actor_critic_kwargs = None
+
+    if use_hl_gauss_actor_critic:
+        hl_gauss_actor_critic_kwargs = dict(
+            reward_range = hl_gauss_actor_critic_range,
+            num_bins = hl_gauss_actor_critic_num_bins,
+            sigma_to_bin_ratio = hl_gauss_actor_critic_sigma_to_bin_ratio,
+            min_max_value_on_bin_center = hl_gauss_actor_critic_min_max_value_on_bin_center,
+            use_symlog = False,
+            decode_symlog_expected_raw = False,
+        )
+
     world_model = DynamicsWorldModel(
         dim = model_dim,
         dim_latent = dim_latent,
@@ -1738,8 +1904,14 @@ def main(
         continuous_dist_type = "beta",
         continuous_target_action_range = action_range,
         reward_encoder_type = reward_encoder_type,
+        use_symexp_value_head = use_symexp_value_head,
+        use_tdmpc2_value_head = use_tdmpc2_value_head,
+        use_symlog_hl_gauss_value_head = use_symlog_hl_gauss_value_head,
+        use_hl_gauss_actor_critic = use_hl_gauss_actor_critic,
+        use_baseline_symexp_value_head_init = use_baseline_symexp_value_head_init,
         reward_encoder_kwargs = dict(reward_range = reward_range, num_bins = reward_encoder_num_bins, sigma_to_bin_ratio = reward_encoder_sigma_to_bin_ratio, min_max_value_on_bin_center = reward_min_max_value_on_bin_center, use_symlog = reward_use_symlog, decode_symlog_expected_raw = reward_decode_symlog_expected_raw),
-        value_encoder_kwargs = dict(reward_range = value_range, num_bins = value_encoder_num_bins, sigma_to_bin_ratio = value_encoder_sigma_to_bin_ratio, min_max_value_on_bin_center = value_min_max_value_on_bin_center, use_symlog = value_use_symlog, decode_symlog_expected_raw = value_decode_symlog_expected_raw),
+        value_encoder_kwargs = value_encoder_kwargs,
+        hl_gauss_actor_critic_kwargs = hl_gauss_actor_critic_kwargs,
         predict_terminals = True,
         continuous_action_loss_weight = 0.,
         discrete_action_loss_weight = 0.,
@@ -1764,7 +1936,8 @@ def main(
         old_embedding_init = old_embedding_init,
         value_head_init_value = value_head_init_value,
         policy_entropy_weight = 0.01,
-        use_loss_normalization = False,
+        use_loss_normalization = use_dynamics_loss_normalization,
+        use_paper_aligned_shortcut_objective = use_paper_aligned_shortcut_objective,
         attn_heads = attn_heads,
         attn_dim_head = attn_dim_head,
         policy_head_mlp_depth = 2,
@@ -1772,7 +1945,7 @@ def main(
     ).to(device)
 
     world_params = world_model.world_model_parameters()
-    agent_params = world_model.agent_parameters()
+    agent_params = agent_optimizer_parameters(world_model, full_transformer_finetuning)
 
     world_optimizer = make_optimizer(
         world_params,
@@ -1845,6 +2018,7 @@ def main(
         objective = objective,
         use_delight_gating = use_delight_gating,
         store_old_action_unembeds = objective == "pmpo" and not exists(policy_prior),
+        full_transformer_finetuning = full_transformer_finetuning,
     )
 
     memmap_path = run_log_dir / "replay_buffer"
@@ -2018,6 +2192,7 @@ def main(
                 shortcut_train_mode = "finetune",
                 desc = "world model pretrain finetune",
                 old_replay_sampling = old_replay_sampling,
+                update_loss_ema = True,
             )
 
             wm_step, _ = train_world_model(
@@ -2038,6 +2213,7 @@ def main(
                 shortcut_train_mode = "combined",
                 desc = "world model pretrain combined",
                 old_replay_sampling = old_replay_sampling,
+                update_loss_ema = True,
             )
 
             did_world_model_pretrain = True
@@ -2060,6 +2236,7 @@ def main(
             shortcut_train_mode = "combined",
             desc = "world model",
             old_replay_sampling = old_replay_sampling,
+            update_loss_ema = not freeze_dynamics_loss_normalization_after_pretraining,
         )
 
         world_model.train()
@@ -2089,6 +2266,9 @@ def main(
             writer = writer,
             training_profiler = training_profiler,
             old_replay_sampling = old_replay_sampling,
+            full_transformer_finetuning = full_transformer_finetuning,
+            preservation_sequence_length = preservation_sequence_length,
+            preservation_batch_size = world_model_batch_size,
         )
 
         postfix_return = avg_return if exists(avg_return) else avg_horizon_return

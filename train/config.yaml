@@ -16,6 +16,11 @@ depth: 3
 time_block_every: 2
 final_special_cross_attn: false
 reward_encoder_type: hl_gauss
+use_symexp_value_head: false
+use_tdmpc2_value_head: false
+use_symlog_hl_gauss_value_head: false
+use_hl_gauss_actor_critic: false
+use_baseline_symexp_value_head_init: false
 prob_shortcut_train: null
 policy_all_tokens: true
 
@@ -47,6 +52,10 @@ value_range: [-1200.0, 1200.0]
 value_encoder_sigma_to_bin_ratio: 0.75
 value_min_max_value_on_bin_center: false
 value_head_init_value: 0.0
+hl_gauss_actor_critic_range: [-1200.0, 1200.0]
+hl_gauss_actor_critic_num_bins: 255
+hl_gauss_actor_critic_sigma_to_bin_ratio: 0.75
+hl_gauss_actor_critic_min_max_value_on_bin_center: false
 
 # Tokenizer pretraining
 pretrain_tokenizer_steps: 2000
@@ -71,6 +80,12 @@ pretrain_world_model_combined_steps: 256
 world_model_train_steps: 13
 world_model_train_sequence_length: 200
 world_model_learning_rate: 0.0006
+# Normalize world-model losses with running RMS statistics.
+use_dynamics_loss_normalization: false
+# Stop RMS-statistic updates after the initial world-model pretrain phase.
+freeze_dynamics_loss_normalization_after_pretraining: false
+# Use the paper's piecewise dynamics loss and sample shortcut steps per example.
+use_paper_aligned_shortcut_objective: false
 
 # Imagination rollout generation
 imagination_batch_size: 512
@@ -80,6 +95,8 @@ imagination_prompt_probability: 1.0
 imagination_train_steps: 3
 imagination_generate_steps: 4
 imagination_use_time_cache: true
+# Use long real-replay contexts for full-transformer preservation losses.
+preservation_sequence_length: 200
 
 # Agent learning in imagination
 agent_learning_rate: 0.0006
@@ -87,6 +104,8 @@ objective: pmpo
 pmpo_pos_to_neg_weight: 0.5
 pmpo_kl_div_loss_weight: 0.3
 use_delight_gating: false
+# Apply full-transformer updates with replay dynamics, reward, and policy-prior preservation losses.
+full_transformer_finetuning: false
 agent_predicts_state: false
 agent_state_pred_loss_weight: 0.1
 

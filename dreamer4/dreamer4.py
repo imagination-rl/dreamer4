@@ -122,7 +122,12 @@ VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses
 
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'flow_recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ortho', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net', 'byol'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'agent_embed_reward', 'latent_state_reward', 'agent_embed_terminal', 'latent_state_terminal', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem', 'h_net', 'reward_mae'), defaults = (None,))
+WorldModelLossDiagnostics = namedtuple(
+    'WorldModelLossDiagnostics',
+    ('raw_flow', 'raw_shortcut', 'raw_dynamics', 'normalized_dynamics', 'raw_reward', 'raw_terminal')
+)
+
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'agent_embed_reward', 'latent_state_reward', 'agent_embed_terminal', 'latent_state_terminal', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem', 'h_net', 'reward_mae', 'diagnostics'), defaults = (None, None))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
@@ -727,11 +732,23 @@ class LossNormalizer(Module):
 
     def forward(
         self,
-        losses: Tensor | list[Tensor] | dict[str, Tensor],
+        losses: Tensor,
         update_ema = None
     ):
         exp_avg_sq, beta = self.exp_avg_sq, self.beta
         update_ema = default(update_ema, self.training)
+
+        if not is_tensor(losses):
+            raise TypeError("LossNormalizer expects a tensor")
+
+        if losses.numel() != exp_avg_sq.numel():
+            raise ValueError(
+                f"LossNormalizer expected {exp_avg_sq.numel()} loss values, "
+                f"but received {losses.numel()}"
+            )
+
+        loss_shape = losses.shape
+        losses = losses.reshape(-1)
 
         # get the rms value - as mentioned at the end of section 3 in the paper
 
@@ -746,11 +763,9 @@ class LossNormalizer(Module):
 
         # then normalize
 
-        assert losses.numel() == rms.numel()
-
         normed_losses = losses / rms.clamp(min = self.eps)
 
-        return normed_losses
+        return normed_losses.reshape(loss_shape)
 
 class LPIPSLoss(Module):
     def __init__(
@@ -1044,6 +1059,20 @@ def decode_expected_scalar_from_probs(probs, support):
 
     return einsum(probs, support, '... l, l -> ...')
 
+def decode_symmetric_expected_scalar_from_probs(probs, support):
+    mid = support.shape[-1] // 2
+
+    if support.shape[-1] % 2 == 1:
+        left_probs, zero_probs, right_probs = probs[..., :mid], probs[..., mid:mid + 1], probs[..., mid + 1:]
+        left_support, zero_support, right_support = support[:mid], support[mid:mid + 1], support[mid + 1:]
+        paired = (left_probs * left_support).flip(-1) + right_probs * right_support
+        return (zero_probs * zero_support).sum(dim = -1) + paired.sum(dim = -1)
+
+    left_probs, right_probs = probs[..., :mid], probs[..., mid:]
+    left_support, right_support = support[:mid], support[mid:]
+    paired = (left_probs * left_support).flip(-1) + right_probs * right_support
+    return paired.sum(dim = -1)
+
 def decode_symlog_expected_raw_from_probs(probs, centers):
     return decode_expected_scalar_from_probs(probs, symexp(centers))
 
@@ -1136,6 +1165,70 @@ class SymExpTwoHot(Module):
 
         encoded = zeros((num_values, self.num_bins), device = self.device)
 
+        encoded.scatter_(-1, left_indices, left_logit_value)
+        encoded.scatter_(-1, right_indices, right_logit_value)
+
+        return inverse_pack(encoded, '* l')
+
+class SymExpValueTwoHot(SymExpTwoHot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if not torch.isfinite(self.bin_values).all():
+            raise ValueError(f'SymExpValueTwoHot range {self.reward_range} creates non-finite bins')
+
+    def bins_to_scalar_value(
+        self,
+        logits,
+        normalize = True
+    ):
+        probs = logits.softmax(dim = -1) if normalize else logits
+        return decode_symmetric_expected_scalar_from_probs(probs, self.bin_values)
+
+class TDMPC2ValueTwoHot(SymExpTwoHot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        min_value, max_value = self.reward_range
+        symlog_bin_values = linspace(min_value, max_value, self.num_bins)
+        self.register_buffer('symlog_bin_values', symlog_bin_values)
+
+        if not torch.isfinite(self.bin_values).all():
+            raise ValueError(f'TDMPC2ValueTwoHot range {self.reward_range} creates non-finite bins')
+
+    def bins_to_scalar_value(
+        self,
+        logits,
+        normalize = True
+    ):
+        probs = logits.softmax(dim = -1) if normalize else logits
+        expected_symlog = decode_symmetric_expected_scalar_from_probs(probs, self.symlog_bin_values)
+        return symexp(expected_symlog)
+
+    def forward(
+        self,
+        values
+    ):
+        bin_values = self.symlog_bin_values
+        min_bin_value, max_bin_value = bin_values[0], bin_values[-1]
+
+        values, inverse_pack = pack_one(values, '*')
+        num_values = values.shape[0]
+        values = symlog(values).clamp(min = min_bin_value, max = max_bin_value)
+
+        indices = torch.searchsorted(bin_values, values)
+        left_indices = (indices - 1).clamp(min = 0)
+        right_indices = (left_indices + 1).clamp(max = self.num_bins - 1)
+        left_indices, right_indices = tuple(rearrange(t, '... -> ... 1') for t in (left_indices, right_indices))
+
+        left_values = bin_values[left_indices]
+        right_values = bin_values[right_indices]
+        values = rearrange(values, '... -> ... 1')
+        total_distance = right_values - left_values
+        left_logit_value = (right_values - values) / total_distance
+        right_logit_value = 1. - left_logit_value
+
+        encoded = zeros((num_values, self.num_bins), device = self.device)
         encoded.scatter_(-1, left_indices, left_logit_value)
         encoded.scatter_(-1, right_indices, right_logit_value)
 
@@ -5340,9 +5433,15 @@ class DynamicsWorldModel(Module):
         dim_state = None,
         dim_critic_state = None,
         reward_encoder_type: Literal['hl_gauss', 'symexp_two_hot'] = 'hl_gauss',
+        use_symexp_value_head: bool = False,
+        use_tdmpc2_value_head: bool = False,
+        use_symlog_hl_gauss_value_head: bool = False,
+        use_hl_gauss_actor_critic: bool = False,
+        use_baseline_symexp_value_head_init: bool = False,
         critic_state_embedder: Module | None = None,
         reward_encoder_kwargs: dict = dict(),
         value_encoder_kwargs: dict | None = None,
+        hl_gauss_actor_critic_kwargs: dict | None = None,
         depth = 4,
         spatial_pre_encoder_depth = 0,
         action_pre_encoder_depth = 0,
@@ -5407,6 +5506,7 @@ class DynamicsWorldModel(Module):
         agent_value_gradient_frac = 1.,
         gae_use_accelerated = False,
         use_loss_normalization = False,
+        use_paper_aligned_shortcut_objective = False,
         policy_all_tokens = False,
         old_reward_shifting = False,
         old_pmpo = False,
@@ -5452,6 +5552,34 @@ class DynamicsWorldModel(Module):
         optimize_generate_compilation: bool = False
     ):
         super().__init__()
+
+        special_value_head_count = sum((
+            use_symexp_value_head,
+            use_tdmpc2_value_head,
+            use_symlog_hl_gauss_value_head,
+        ))
+
+        if special_value_head_count > 1:
+            raise ValueError('special value-head encoder flags are mutually exclusive')
+
+        if use_symexp_value_head and old_value_head:
+            raise ValueError('`use_symexp_value_head` cannot use `old_value_head`')
+
+        if use_tdmpc2_value_head and old_value_head:
+            raise ValueError('`use_tdmpc2_value_head` cannot use `old_value_head`')
+
+        if use_symlog_hl_gauss_value_head and old_value_head:
+            raise ValueError('`use_symlog_hl_gauss_value_head` cannot use `old_value_head`')
+
+        if use_baseline_symexp_value_head_init and not use_symexp_value_head:
+            raise ValueError('`use_baseline_symexp_value_head_init` requires `use_symexp_value_head`')
+
+        if use_hl_gauss_actor_critic and not use_symexp_value_head:
+            raise ValueError('`use_hl_gauss_actor_critic` requires `use_symexp_value_head`')
+
+        if use_hl_gauss_actor_critic and clip_values:
+            raise ValueError('`use_hl_gauss_actor_critic` does not support value clipping')
+
         self.dim = dim
         self.depth = depth
         self.add_action_embed_to_agent_token = add_action_embed_to_agent_token
@@ -5465,6 +5593,8 @@ class DynamicsWorldModel(Module):
         self.old_embedding_init = old_embedding_init
         self.old_continuous_action_encoder = old_continuous_action_encoder
         self.value_head_init_value = value_head_init_value
+        self.use_symlog_hl_gauss_value_head = use_symlog_hl_gauss_value_head
+        self.use_hl_gauss_actor_critic = use_hl_gauss_actor_critic
         self.final_special_cross_attn = final_special_cross_attn
         self.optimize_generate_compilation = optimize_generate_compilation
         self._compiled_generate_forward_fn = None
@@ -5512,6 +5642,7 @@ class DynamicsWorldModel(Module):
         # loss normalization
 
         self.use_loss_normalization = use_loss_normalization
+        self.use_paper_aligned_shortcut_objective = use_paper_aligned_shortcut_objective
 
         # spatial
 
@@ -5774,6 +5905,9 @@ class DynamicsWorldModel(Module):
         self.add_reward_embed_dropout = add_reward_embed_dropout
 
         reward_encoder_klass = get_reward_encoder_klass(reward_encoder_type)
+        self.use_symexp_value_head = use_symexp_value_head
+        self.use_tdmpc2_value_head = use_tdmpc2_value_head
+        self.use_baseline_symexp_value_head_init = use_baseline_symexp_value_head_init
 
         self.reward_encoder = reward_encoder_klass(
             **reward_encoder_kwargs,
@@ -5783,11 +5917,49 @@ class DynamicsWorldModel(Module):
 
         value_encoder_kwargs = default(value_encoder_kwargs, reward_encoder_kwargs)
 
-        self.value_encoder = reward_encoder_klass(
+        if use_tdmpc2_value_head:
+            value_encoder_klass = TDMPC2ValueTwoHot
+        elif use_symexp_value_head:
+            value_encoder_klass = SymExpValueTwoHot
+        elif use_symlog_hl_gauss_value_head:
+            value_encoder_klass = HLGaussRewardEncoder
+        else:
+            value_encoder_klass = reward_encoder_klass
+
+        self.value_encoder = value_encoder_klass(
             **value_encoder_kwargs,
             dim_embed = dim,
             learned_embedding = False
         )
+
+        if use_symlog_hl_gauss_value_head:
+            if not isinstance(self.value_encoder, HLGaussRewardEncoder):
+                raise TypeError('`use_symlog_hl_gauss_value_head` requires an HL-Gauss value encoder')
+
+            if not self.value_encoder.use_symlog or not self.value_encoder.decode_symlog_expected_raw:
+                raise ValueError(
+                    '`use_symlog_hl_gauss_value_head` requires symlog targets and raw expected-value decoding'
+                )
+
+        self.actor_critic_value_encoder = None
+
+        if use_hl_gauss_actor_critic:
+            actor_critic_kwargs = default(
+                hl_gauss_actor_critic_kwargs,
+                dict(
+                    reward_range = (-1200., 1200.),
+                    num_bins = 255,
+                    sigma_to_bin_ratio = 0.75,
+                    min_max_value_on_bin_center = False,
+                    use_symlog = False,
+                    decode_symlog_expected_raw = False,
+                )
+            )
+            self.actor_critic_value_encoder = HLGaussRewardEncoder(
+                **actor_critic_kwargs,
+                dim_embed = dim,
+                learned_embedding = False
+            )
 
         def create_action_embed_modules(embedder_to_copy, activation_name):
             embedder = deepcopy(embedder_to_copy)
@@ -5905,6 +6077,33 @@ class DynamicsWorldModel(Module):
             depth = value_head_mlp_depth,
             activation = get_activation('relu_squared' if old_value_head else value_head_mlp_activation)
         )
+
+        self.actor_critic_value_head = None
+
+        if use_hl_gauss_actor_critic:
+            self.actor_critic_value_head = create_mlp(
+                dim_in = dim,
+                dim = dim * 4,
+                dim_out = self.actor_critic_value_encoder.num_bins,
+                depth = value_head_mlp_depth,
+                activation = get_activation(value_head_mlp_activation)
+            )
+
+        zero_initialize_value_head = (
+            use_tdmpc2_value_head or
+            use_symlog_hl_gauss_value_head or
+            (use_symexp_value_head and not use_baseline_symexp_value_head_init)
+        )
+
+        if zero_initialize_value_head:
+            final_linear = next((m for m in reversed(list(self.value_head.modules())) if isinstance(m, nn.Linear)), None)
+
+            if exists(final_linear):
+                with torch.no_grad():
+                    final_linear.weight.zero_()
+
+                    if exists(final_linear.bias):
+                        final_linear.bias.zero_()
 
         if old_value_head and exists(value_head_init_value):
             # Set the final categorical logits to the requested scalar while
@@ -6085,6 +6284,7 @@ class DynamicsWorldModel(Module):
 
         self.flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
         self.shortcut_flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
+        self.paper_dynamics_loss_normalizer = LossNormalizer() if (use_loss_normalization and use_paper_aligned_shortcut_objective) else None
         self.agent_embed_reward_loss_normalizer = LossNormalizer(multi_token_pred_len) if use_loss_normalization else None
         self.latent_state_reward_loss_normalizer = LossNormalizer() if use_loss_normalization else None
         self.agent_embed_terminal_loss_normalizer = LossNormalizer(multi_token_pred_len) if (use_loss_normalization and self.predict_terminals) else None
@@ -6198,6 +6398,9 @@ class DynamicsWorldModel(Module):
 
     def value_head_parameters(self):
         params = list(self.value_head.parameters())
+
+        if exists(self.actor_critic_value_head):
+            params.extend(self.actor_critic_value_head.parameters())
 
         if exists(self.critic_transformer):
             params.extend(self.critic_transformer.parameters())
@@ -6867,7 +7070,7 @@ class DynamicsWorldModel(Module):
         experience: Experience,
         policy_optim: Optimizer | None = None,
         value_optim: Optimizer | None = None,
-        only_learn_policy_value_heads = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
+        only_learn_policy_value_heads = True, # the paper's default freezes the transformer and learns only the heads
         objective: Literal['ppo', 'pmpo', 'spo'] = 'ppo',
         use_delight_gating = None,
         delight_temperature = None,
@@ -7099,6 +7302,8 @@ class DynamicsWorldModel(Module):
         if exists(old_log_probs):
             old_log_probs = old_log_probs.sum(dim = -1)
 
+        importance_ratio = (log_probs - old_log_probs).exp()
+
         # calculate delight
         # Ian Osband - https://arxiv.org/abs/2603.14608v1
 
@@ -7176,7 +7381,7 @@ class DynamicsWorldModel(Module):
 
             # spo clipped surrogate loss
 
-            ratio = (log_probs - old_log_probs).exp()
+            ratio = importance_ratio
 
             policy_loss = -(
                 ratio * advantage -
@@ -7192,7 +7397,7 @@ class DynamicsWorldModel(Module):
 
             # ppo clipped surrogate loss
 
-            ratio = (log_probs - old_log_probs).exp()
+            ratio = importance_ratio
             clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
 
             policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)
@@ -7259,6 +7464,13 @@ class DynamicsWorldModel(Module):
         value_bins = self.value_head(value_agent_embeds)
         values = self.value_encoder.bins_to_scalar_value(value_bins)
 
+        actor_critic_value_bins = None
+        actor_critic_values = None
+
+        if self.use_hl_gauss_actor_critic:
+            actor_critic_value_bins = self.actor_critic_value_head(value_agent_embeds)
+            actor_critic_values = self.actor_critic_value_encoder.bins_to_scalar_value(actor_critic_value_bins)
+
         # align returns and old_values to value_bins length if bootstrap padded
 
         if returns.shape[1] == value_bins.shape[1] + 1:
@@ -7287,6 +7499,31 @@ class DynamicsWorldModel(Module):
                 'critic/value_abs_error': (masked_values - masked_returns).abs().mean().detach()
             }
 
+            advantage_time = min(advantage.shape[1], mask.shape[1])
+            diagnostic_advantages = advantage[:, :advantage_time]
+            diagnostic_advantage_mask = mask[:, :advantage_time]
+            diagnostic_importance_ratio = importance_ratio[:, :advantage_time]
+            num_valid_advantages = diagnostic_advantage_mask.sum().clamp(min = 1).to(diagnostic_advantages.dtype)
+
+            diagnostics['extra/positive_advantage_frac'] = (
+                (diagnostic_advantages > 0.) & diagnostic_advantage_mask
+            ).sum().to(diagnostic_advantages.dtype).div(num_valid_advantages).detach()
+            diagnostics['extra/negative_advantage_frac'] = (
+                (diagnostic_advantages < 0.) & diagnostic_advantage_mask
+            ).sum().to(diagnostic_advantages.dtype).div(num_valid_advantages).detach()
+            diagnostics['extra/advantage_mean'] = (
+                diagnostic_advantages.masked_fill(~diagnostic_advantage_mask, 0.).sum()
+                / num_valid_advantages
+            ).detach()
+            diagnostics['extra/advantage_abs_mean'] = (
+                diagnostic_advantages.abs().masked_fill(~diagnostic_advantage_mask, 0.).sum()
+                / num_valid_advantages
+            ).detach()
+            diagnostics['extra/policy_entropy'] = (-entropy_loss).detach()
+            diagnostics['extra/importance_ratio_clip_frac'] = (
+                ((diagnostic_importance_ratio - 1.).abs() > self.ppo_eps_clip) & diagnostic_advantage_mask
+            ).sum().to(diagnostic_advantages.dtype).div(num_valid_advantages).detach()
+
             value_support = getattr(self.value_encoder, 'bin_values', None)
 
             if exists(value_support):
@@ -7314,7 +7551,19 @@ class DynamicsWorldModel(Module):
                 (masked_returns < min_value) | (masked_returns > max_value)
             ).float().mean().detach()
 
+            if self.use_hl_gauss_actor_critic:
+                masked_actor_critic_values = actor_critic_values[value_mask]
+                primary_advantages = masked_returns - masked_values
+                actor_critic_advantages = masked_returns - masked_actor_critic_values
+                diagnostics['extra/actor_critic_value_abs_error'] = (
+                    masked_actor_critic_values - masked_returns
+                ).abs().mean().detach()
+                diagnostics['extra/critic_advantage_sign_disagreement'] = (
+                    (primary_advantages > 0.) != (actor_critic_advantages > 0.)
+                ).float().mean().detach()
+
         return_bins = self.value_encoder(returns)
+        return_bin_entropy = -(return_bins * return_bins.clamp_min(eps).log()).sum(dim = -1)
 
         value_bins, return_bins = tuple(rearrange(t, 'b t l -> b l t') for t in (value_bins, return_bins))
 
@@ -7332,7 +7581,26 @@ class DynamicsWorldModel(Module):
 
         # mask out bootstrapped terminal step from bounds seamlessly
 
-        value_loss = value_loss[mask].mean()
+        primary_value_loss = value_loss[mask].mean()
+        value_loss = primary_value_loss
+
+        if return_diagnostics:
+            diagnostics['extra/value_target_entropy'] = return_bin_entropy[mask].mean().detach()
+            diagnostics['extra/value_excess_cross_entropy'] = (
+                primary_value_loss.detach() - diagnostics['extra/value_target_entropy']
+            )
+
+        if self.use_hl_gauss_actor_critic:
+            actor_critic_return_bins = self.actor_critic_value_encoder(returns)
+            actor_critic_value_bins, actor_critic_return_bins = tuple(
+                rearrange(t, 'b t l -> b l t')
+                for t in (actor_critic_value_bins, actor_critic_return_bins)
+            )
+            actor_critic_value_loss = -(
+                actor_critic_return_bins * actor_critic_value_bins.log_softmax(dim = 1)
+            ).sum(dim = 1)
+            actor_critic_value_loss = actor_critic_value_loss[mask].mean()
+            value_loss = value_loss + actor_critic_value_loss
 
         # maybe take value optimizer step
 
@@ -8031,8 +8299,15 @@ class DynamicsWorldModel(Module):
                     if exists(continuous_log_probs):
                         decoded_continuous_log_probs = store_generated(decoded_continuous_log_probs, continuous_log_probs, generated_index)
 
-                    value_bins = self.value_head(one_agent_embed)
-                    values = self.value_encoder.bins_to_scalar_value(value_bins)
+                    value_head = self.value_head
+                    value_encoder = self.value_encoder
+
+                    if self.use_hl_gauss_actor_critic:
+                        value_head = self.actor_critic_value_head
+                        value_encoder = self.actor_critic_value_encoder
+
+                    value_bins = value_head(one_agent_embed)
+                    values = value_encoder.bins_to_scalar_value(value_bins)
 
                     decoded_values = store_generated(decoded_values, values, generated_index)
 
@@ -8377,6 +8652,8 @@ class DynamicsWorldModel(Module):
         # if neither signal levels or step sizes passed in, assume training
         # generate them randomly for training
 
+        shortcut_sample_mask = None
+
         if not is_inference:
 
             assert shortcut_train_mode in (
@@ -8387,24 +8664,37 @@ class DynamicsWorldModel(Module):
                 'shortcut_only'
             ), f'unknown shortcut training mode: {shortcut_train_mode}'
 
-            if shortcut_train_mode == 'combined':
-                shortcut_train = _sample_prob(self.prob_shortcut_train)
-            elif shortcut_train_mode in ('non_bootstrap_only', 'finetune'):
-                shortcut_train = False
-            else:
-                shortcut_train = True
+            if self.use_paper_aligned_shortcut_objective:
+                if shortcut_train_mode == 'combined':
+                    step_sizes_log2 = _randint(0, self.num_step_sizes_log2, (batch,), device = device)
+                elif shortcut_train_mode in ('non_bootstrap_only', 'finetune'):
+                    step_sizes_log2 = zeros((batch,), device = device).long()
+                else:
+                    step_sizes_log2 = _randint(1, self.num_step_sizes_log2, (batch,), device = device)
 
-            if shortcut_train:
-
-                # now we follow eq (4)
-
-                step_sizes_log2 = _randint(1, self.num_step_sizes_log2, (batch,), device = device)
+                shortcut_sample_mask = step_sizes_log2 > 0
+                shortcut_train = shortcut_train_mode not in ('non_bootstrap_only', 'finetune')
                 num_step_sizes = 2 ** step_sizes_log2
-
-                signal_levels = _randint(0, self.max_steps, (batch, time), device = device) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
+                signal_levels = _randint(0, self.max_steps, (batch, time), device = device) // num_step_sizes[:, None] * num_step_sizes[:, None]
             else:
-                step_sizes_log2 = zeros((batch,), device = device).long() # zero because zero is equivalent to step size of 1
-                signal_levels = _randint(0, self.max_steps, (batch, time), device = device)
+                if shortcut_train_mode == 'combined':
+                    shortcut_train = _sample_prob(self.prob_shortcut_train)
+                elif shortcut_train_mode in ('non_bootstrap_only', 'finetune'):
+                    shortcut_train = False
+                else:
+                    shortcut_train = True
+
+                if shortcut_train:
+
+                    # now we follow eq (4)
+
+                    step_sizes_log2 = _randint(1, self.num_step_sizes_log2, (batch,), device = device)
+                    num_step_sizes = 2 ** step_sizes_log2
+
+                    signal_levels = _randint(0, self.max_steps, (batch, time), device = device) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
+                else:
+                    step_sizes_log2 = zeros((batch,), device = device).long() # zero because zero is equivalent to step size of 1
+                    signal_levels = _randint(0, self.max_steps, (batch, time), device = device)
 
         # times is from 0 to 1
 
@@ -8789,7 +9079,18 @@ class DynamicsWorldModel(Module):
         should_compute_shortcut = not is_inference and shortcut_train
 
         if should_compute_shortcut:
-            step_sizes_log2_minus_one = step_sizes_log2 - 1 # which equals d / 2
+            shortcut_step_sizes_log2 = step_sizes_log2
+            shortcut_signal_levels = signal_levels
+
+            if self.use_paper_aligned_shortcut_objective:
+                shortcut_step_sizes_log2 = shortcut_step_sizes_log2.clamp(min = 1)
+                shortcut_signal_levels = torch.where(
+                    shortcut_sample_mask[:, None],
+                    shortcut_signal_levels,
+                    zeros_like(shortcut_signal_levels),
+                )
+
+            step_sizes_log2_minus_one = shortcut_step_sizes_log2 - 1 # which equals d / 2
             half_step_size = 2 ** step_sizes_log2_minus_one
 
             first_noised = noised
@@ -8799,7 +9100,7 @@ class DynamicsWorldModel(Module):
                 first_noised, first_noised_proprio = unpack(first_noised, for_flow_loss_packed_shape, 'b t *')
 
             with torch.no_grad():
-                first_step_pred = _get_prediction(first_noised, first_noised_proprio, signal_levels, step_sizes_log2_minus_one)
+                first_step_pred = _get_prediction(first_noised, first_noised_proprio, shortcut_signal_levels, step_sizes_log2_minus_one)
 
             if self.has_proprio:
                 first_step_pred, _ = pack((first_step_pred.flow, first_step_pred.proprioception), 'b t *')
@@ -8811,7 +9112,7 @@ class DynamicsWorldModel(Module):
             if is_v_space_pred:
                 first_step_pred_flow = first_step_pred
             else:
-                first_times = self.get_times_from_signal_level(signal_levels, noised)
+                first_times = self.get_times_from_signal_level(shortcut_signal_levels, noised)
 
                 first_step_pred_flow = (first_step_pred - noised) / (1. - first_times)
 
@@ -8823,7 +9124,7 @@ class DynamicsWorldModel(Module):
 
             # get second prediction for b''
 
-            signal_levels_plus_half_step = signal_levels + half_step_size[:, None]
+            signal_levels_plus_half_step = shortcut_signal_levels + half_step_size[:, None]
             second_noised = denoised
             second_noised_proprio = None
 
@@ -8872,6 +9173,18 @@ class DynamicsWorldModel(Module):
             loss_weight, _ = align_dims_left((loss_weight, flow_losses))
 
             flow_losses = flow_losses * loss_weight
+
+            if self.use_paper_aligned_shortcut_objective:
+                shortcut_flow_losses = shortcut_flow_losses * loss_weight
+
+        if self.use_paper_aligned_shortcut_objective and not is_inference:
+            shortcut_element_mask = shortcut_sample_mask
+
+            while shortcut_element_mask.ndim < flow_losses.ndim:
+                shortcut_element_mask = shortcut_element_mask[..., None]
+
+            flow_losses = flow_losses.masked_fill(shortcut_element_mask, 0.)
+            shortcut_flow_losses = shortcut_flow_losses.masked_fill(~shortcut_element_mask, 0.)
 
         # handle variable lengths if needed
 
@@ -9058,13 +9371,15 @@ class DynamicsWorldModel(Module):
         discrete_action_loss = self.zero
         continuous_action_loss = self.zero
 
-        if (
+        should_compute_action_loss = (
             self.has_action_loss_weight and
             self.num_agents == 1 and
             add_autoregressive_action_loss and
             time > 1 and
             (exists(discrete_actions) or exists(continuous_actions))
-        ):
+        )
+
+        if should_compute_action_loss:
             assert self.action_embedder.has_actions
 
             # if shift_action_tokens, pad a sentinel at the front so that
@@ -9179,24 +9494,49 @@ class DynamicsWorldModel(Module):
 
         # handle loss normalization
 
-        if exists(self.flow_loss_normalizer):
-            flow_loss = self.flow_loss_normalizer(flow_loss, update_ema = update_loss_ema)
+        raw_flow_loss = flow_loss
+        raw_shortcut_flow_loss = shortcut_flow_loss
+        raw_dynamics_loss = (
+            raw_flow_loss * self.latent_flow_loss_weight +
+            raw_shortcut_flow_loss * self.shortcut_loss_weight
+        )
+        raw_reward_loss = agent_embed_reward_loss.mean() + latent_state_reward_loss.mean()
+        raw_terminal_loss = agent_embed_terminal_loss.mean() + latent_state_terminal_loss.mean()
 
-        if exists(self.shortcut_flow_loss_normalizer):
-            shortcut_flow_loss = self.shortcut_flow_loss_normalizer(shortcut_flow_loss, update_ema = update_loss_ema)
+        paper_dynamics_loss = None
+
+        if self.use_paper_aligned_shortcut_objective:
+            paper_dynamics_loss = raw_dynamics_loss
+
+            if exists(self.paper_dynamics_loss_normalizer):
+                paper_dynamics_loss = self.paper_dynamics_loss_normalizer(
+                    paper_dynamics_loss,
+                    update_ema = update_loss_ema,
+                )
+        else:
+            if exists(self.flow_loss_normalizer):
+                flow_loss = self.flow_loss_normalizer(flow_loss, update_ema = update_loss_ema)
+
+            if should_compute_shortcut and exists(self.shortcut_flow_loss_normalizer):
+                shortcut_flow_loss = self.shortcut_flow_loss_normalizer(shortcut_flow_loss, update_ema = update_loss_ema)
 
         if exists(rewards):
-            agent_embed_reward_loss = maybe(self.agent_embed_reward_loss_normalizer)(agent_embed_reward_loss, update_ema = update_loss_ema)
-            latent_state_reward_loss = maybe(self.latent_state_reward_loss_normalizer)(latent_state_reward_loss, update_ema = update_loss_ema)
+            if should_predict_agent_reward:
+                agent_embed_reward_loss = maybe(self.agent_embed_reward_loss_normalizer)(agent_embed_reward_loss, update_ema = update_loss_ema)
+
+            if not self.old_reward_head:
+                latent_state_reward_loss = maybe(self.latent_state_reward_loss_normalizer)(latent_state_reward_loss, update_ema = update_loss_ema)
 
         if exists(terminals):
-            agent_embed_terminal_loss = maybe(self.agent_embed_terminal_loss_normalizer)(agent_embed_terminal_loss, update_ema = update_loss_ema)
+            if has_any_actions and not self.old_terminal_head:
+                agent_embed_terminal_loss = maybe(self.agent_embed_terminal_loss_normalizer)(agent_embed_terminal_loss, update_ema = update_loss_ema)
+
             latent_state_terminal_loss = maybe(self.latent_state_terminal_loss_normalizer)(latent_state_terminal_loss, update_ema = update_loss_ema)
 
-        if exists(discrete_actions) and exists(self.discrete_actions_loss_normalizer):
+        if should_compute_action_loss and exists(discrete_actions) and exists(self.discrete_actions_loss_normalizer):
             discrete_action_loss = self.discrete_actions_loss_normalizer(discrete_action_loss, update_ema = update_loss_ema)
 
-        if exists(continuous_actions) and exists(self.continuous_actions_loss_normalizer):
+        if should_compute_action_loss and exists(continuous_actions) and exists(self.continuous_actions_loss_normalizer):
             continuous_action_loss = self.continuous_actions_loss_normalizer(continuous_action_loss, update_ema = update_loss_ema)
 
         # latent autoregressive loss with sigreg
@@ -9253,26 +9593,59 @@ class DynamicsWorldModel(Module):
 
         # gather losses - they sum across the multi token prediction steps for rewards and actions - eq (9)
 
-        total_loss = (
-            flow_loss * self.latent_flow_loss_weight +
-            shortcut_flow_loss * self.shortcut_loss_weight +
-            (agent_embed_reward_loss * self.reward_loss_weight).sum() +
-            (latent_state_reward_loss * self.reward_loss_weight).sum() +
-            (agent_embed_terminal_loss * self.terminal_loss_weight).sum() +
-            (latent_state_terminal_loss * self.terminal_loss_weight).sum() +
-            (discrete_action_loss * self.discrete_action_loss_weight).sum() +
-            (continuous_action_loss * self.continuous_action_loss_weight).sum() +
-            (state_pred_loss * self.state_pred_loss_weight) +
-            (agent_state_pred_loss * self.agent_state_pred_loss_weight) +
-            (latent_ar_loss * self.latent_ar_loss_weight) +
-            (latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight) +
-            (lapo_action_loss * self.lapo_action_loss_weight) +
-            (lapo_fdm_loss * self.lapo_fdm_loss_weight) +
-            (lapo_raw_latent_fdm_loss * self.lapo_raw_latent_fdm_loss_weight) +
-            (tem_loss * self.tem_loss_weight)
+        if self.use_paper_aligned_shortcut_objective:
+            total_loss = (
+                paper_dynamics_loss +
+                (agent_embed_reward_loss * self.reward_loss_weight).sum() +
+                (latent_state_reward_loss * self.reward_loss_weight).sum() +
+                (agent_embed_terminal_loss * self.terminal_loss_weight).sum() +
+                (latent_state_terminal_loss * self.terminal_loss_weight).sum() +
+                (discrete_action_loss * self.discrete_action_loss_weight).sum() +
+                (continuous_action_loss * self.continuous_action_loss_weight).sum() +
+                (state_pred_loss * self.state_pred_loss_weight) +
+                (agent_state_pred_loss * self.agent_state_pred_loss_weight) +
+                (latent_ar_loss * self.latent_ar_loss_weight) +
+                (latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight) +
+                (lapo_action_loss * self.lapo_action_loss_weight) +
+                (lapo_fdm_loss * self.lapo_fdm_loss_weight) +
+                (lapo_raw_latent_fdm_loss * self.lapo_raw_latent_fdm_loss_weight) +
+                (tem_loss * self.tem_loss_weight)
+            )
+            normalized_dynamics_loss = paper_dynamics_loss
+        else:
+            total_loss = (
+                flow_loss * self.latent_flow_loss_weight +
+                shortcut_flow_loss * self.shortcut_loss_weight +
+                (agent_embed_reward_loss * self.reward_loss_weight).sum() +
+                (latent_state_reward_loss * self.reward_loss_weight).sum() +
+                (agent_embed_terminal_loss * self.terminal_loss_weight).sum() +
+                (latent_state_terminal_loss * self.terminal_loss_weight).sum() +
+                (discrete_action_loss * self.discrete_action_loss_weight).sum() +
+                (continuous_action_loss * self.continuous_action_loss_weight).sum() +
+                (state_pred_loss * self.state_pred_loss_weight) +
+                (agent_state_pred_loss * self.agent_state_pred_loss_weight) +
+                (latent_ar_loss * self.latent_ar_loss_weight) +
+                (latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight) +
+                (lapo_action_loss * self.lapo_action_loss_weight) +
+                (lapo_fdm_loss * self.lapo_fdm_loss_weight) +
+                (lapo_raw_latent_fdm_loss * self.lapo_raw_latent_fdm_loss_weight) +
+                (tem_loss * self.tem_loss_weight)
+            )
+            normalized_dynamics_loss = (
+                flow_loss * self.latent_flow_loss_weight +
+                shortcut_flow_loss * self.shortcut_loss_weight
+            )
+
+        loss_diagnostics = WorldModelLossDiagnostics(
+            raw_flow_loss.detach(),
+            raw_shortcut_flow_loss.detach(),
+            raw_dynamics_loss.detach(),
+            normalized_dynamics_loss.detach(),
+            raw_reward_loss.detach(),
+            raw_terminal_loss.detach(),
         )
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, agent_embed_reward_loss, latent_state_reward_loss, agent_embed_terminal_loss, latent_state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss, self.zero, reward_mae)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, agent_embed_reward_loss, latent_state_reward_loss, agent_embed_terminal_loss, latent_state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss, self.zero, reward_mae, loss_diagnostics)
 
         if not (return_all_losses or return_intermediates):
             return total_loss

@@ -238,6 +238,7 @@ class WorldModelTrainingLoss(nn.Module):
         continuous_actions: Tensor | None,
         lens: Tensor | None,
         shortcut_train_mode: ShortcutTrainMode = "combined",
+        update_loss_ema: bool = True,
     ):
         return self.world_model(
             latents = latents,
@@ -247,7 +248,7 @@ class WorldModelTrainingLoss(nn.Module):
             lens = lens,
             latent_has_view_dim = latents.ndim == 5,
             return_all_losses = True,
-            update_loss_ema = True,
+            update_loss_ema = update_loss_ema,
             shortcut_train_mode = shortcut_train_mode,
         )
 
@@ -313,11 +314,19 @@ class ImaginationLearningLoss(nn.Module):
         *,
         objective: Literal["ppo", "pmpo", "spo"],
         use_delight_gating: bool,
+        full_transformer_finetuning: bool = False,
     ):
         super().__init__()
         self.world_model = world_model
         self.objective = objective
         self.use_delight_gating = use_delight_gating
+        self.full_transformer_finetuning = full_transformer_finetuning
+
+        if full_transformer_finetuning and objective != "pmpo":
+            raise ValueError("full_transformer_finetuning requires objective='pmpo' for the policy-prior loss")
+
+        if full_transformer_finetuning and world_model.pmpo_kl_div_loss_weight <= 0.:
+            raise ValueError("full_transformer_finetuning requires pmpo_kl_div_loss_weight > 0")
 
     def forward(
         self,
@@ -340,7 +349,20 @@ class ImaginationLearningLoss(nn.Module):
         is_truncated: Tensor | None,
         is_from_world_model: bool | Tensor,
         episode_return: Tensor | None,
+        preservation_latents: Tensor | None,
+        preservation_proprio: Tensor | None,
+        preservation_rewards: Tensor | None,
+        preservation_actions_discrete: Tensor | None,
+        preservation_actions_continuous: Tensor | None,
+        preservation_lens: Tensor | None,
     ):
+        if (
+            self.full_transformer_finetuning and
+            old_action_unembeds_discrete is None and
+            old_action_unembeds_continuous is None
+        ):
+            raise ValueError("full_transformer_finetuning requires frozen policy-prior targets")
+
         experience = Experience(
             latents = latents,
             proprio = proprio,
@@ -360,13 +382,53 @@ class ImaginationLearningLoss(nn.Module):
             episode_return = episode_return,
         )
 
-        return self.world_model.learn_from_experience(
+        policy_loss, value_loss, diagnostics = self.world_model.learn_from_experience(
             experience,
-            only_learn_policy_value_heads = True,
+            only_learn_policy_value_heads = not self.full_transformer_finetuning,
             objective = self.objective,
             use_delight_gating = self.use_delight_gating,
             return_diagnostics = True,
         )
+
+        if not self.full_transformer_finetuning:
+            return policy_loss, value_loss, diagnostics
+
+        # Dreamer 4 reports that full-transformer imagination finetuning needs
+        # the dynamics, policy-prior, and reward losses to prevent collapse.
+        # PMPO supplies the policy-prior loss in learn_from_experience().  Apply
+        # the other two losses to real replay targets during the same step.
+        assert preservation_latents is not None
+        _, preservation_losses = self.world_model(
+            latents = preservation_latents,
+            proprio = preservation_proprio,
+            rewards = preservation_rewards,
+            discrete_actions = preservation_actions_discrete,
+            continuous_actions = preservation_actions_continuous,
+            lens = preservation_lens,
+            latent_has_view_dim = preservation_latents.ndim == 5,
+            return_all_losses = True,
+            update_loss_ema = False,
+            shortcut_train_mode = "combined",
+        )
+
+        dynamics_loss = (
+            preservation_losses.flow * self.world_model.latent_flow_loss_weight +
+            preservation_losses.shortcut * self.world_model.shortcut_loss_weight
+        )
+        reward_loss = (
+            (preservation_losses.agent_embed_reward * self.world_model.reward_loss_weight).sum() +
+            (preservation_losses.latent_state_reward * self.world_model.reward_loss_weight).sum()
+        )
+        preservation_loss = dynamics_loss + reward_loss
+
+        diagnostics = dict(diagnostics)
+        diagnostics.update({
+            "preservation/dynamics_loss": dynamics_loss.detach(),
+            "preservation/reward_loss": reward_loss.detach(),
+            "preservation/loss": preservation_loss.detach(),
+        })
+
+        return policy_loss + preservation_loss, value_loss, diagnostics
 
 
 @dataclass
@@ -523,6 +585,7 @@ def build_compile_runtime(
     store_old_action_unembeds: bool,
     compile_interact: bool = False,
     interact_max_timesteps: int = 16,
+    full_transformer_finetuning: bool = False,
 ) -> CompileRuntime:
     timings = []
 
@@ -634,6 +697,7 @@ def build_compile_runtime(
             world_model,
             objective = objective,
             use_delight_gating = use_delight_gating,
+            full_transformer_finetuning = full_transformer_finetuning,
         ),
         name = "imagination_learn",
         enabled = compile_learn,

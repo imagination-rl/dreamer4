@@ -263,7 +263,7 @@ def test_world_model_reward_mae_combines_reward_heads_and_masks_invalid_targets(
     assert not losses.reward_mae.requires_grad
 
 def test_dynamics_world_model_defaults_to_hl_gauss_reward_encoder():
-    from dreamer4.dreamer4 import DynamicsWorldModel, HLGaussRewardEncoder, SymExpTwoHot
+    from dreamer4.dreamer4 import DynamicsWorldModel, HLGaussRewardEncoder, SymExpTwoHot, SymExpValueTwoHot, TDMPC2ValueTwoHot
 
     dynamics = DynamicsWorldModel(
         dim = 16,
@@ -288,10 +288,179 @@ def test_dynamics_world_model_defaults_to_hl_gauss_reward_encoder():
     )
 
     assert isinstance(dynamics.reward_encoder, SymExpTwoHot)
+    assert type(dynamics.value_encoder) is SymExpTwoHot
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        num_latent_tokens = 4,
+        depth = 1,
+        reward_encoder_type = 'hl_gauss',
+        use_symexp_value_head = True,
+        reward_encoder_kwargs = dict(num_bins = 20),
+        value_encoder_kwargs = dict(reward_range = (-10., 10.), num_bins = 255),
+    )
+
+    assert isinstance(dynamics.reward_encoder, HLGaussRewardEncoder)
+    assert isinstance(dynamics.value_encoder, SymExpValueTwoHot)
+    assert dynamics.value_encoder.bin_values[0].item() < -22000.
+    assert dynamics.value_encoder.bin_values[-1].item() > 22000.
+
+    value_logits = dynamics.value_head(torch.randn(3, 16))
+    values = dynamics.value_encoder.bins_to_scalar_value(value_logits)
+
+    assert torch.equal(values, torch.zeros_like(values))
+
+    with pytest.raises(ValueError, match = 'non-finite bins'):
+        SymExpValueTwoHot((-1200., 1200.))
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        num_latent_tokens = 4,
+        depth = 1,
+        reward_encoder_type = 'hl_gauss',
+        use_tdmpc2_value_head = True,
+        reward_encoder_kwargs = dict(num_bins = 20),
+        value_encoder_kwargs = dict(reward_range = (-10., 10.), num_bins = 101),
+    )
+
+    assert isinstance(dynamics.reward_encoder, HLGaussRewardEncoder)
+    assert isinstance(dynamics.value_encoder, TDMPC2ValueTwoHot)
+    assert dynamics.value_encoder.bin_values[0].item() < -22000.
+    assert dynamics.value_encoder.bin_values[-1].item() > 22000.
+
+    value_logits = dynamics.value_head(torch.randn(3, 16))
+    values = dynamics.value_encoder.bins_to_scalar_value(value_logits)
+
+    assert torch.equal(values, torch.zeros_like(values))
+
+
+def test_tdmpc2_value_two_hot_uses_symlog_targets_and_inverse_expected_symlog():
+    from dreamer4.dreamer4 import TDMPC2ValueTwoHot, symexp
+
+    encoder = TDMPC2ValueTwoHot(reward_range = (-10., 10.), num_bins = 101)
+    targets = torch.tensor([-1200., 0., 1200.])
+    probs = encoder(targets)
+    decoded = encoder.bins_to_scalar_value(probs, normalize = False)
+
+    torch.testing.assert_close(decoded, targets, rtol = 1e-5, atol = 1e-4)
+
+    probs = torch.zeros(1, 101)
+    probs[0, 50] = 0.99
+    probs[0, -1] = 0.01
+    decoded = encoder.bins_to_scalar_value(probs, normalize = False)
+
+    torch.testing.assert_close(decoded, symexp(torch.tensor([0.1])))
+
+    with pytest.raises(ValueError, match = 'non-finite bins'):
+        TDMPC2ValueTwoHot(reward_range = (-1200., 1200.), num_bins = 101)
+
+
+def test_special_value_head_encoders_are_mutually_exclusive():
+    with pytest.raises(ValueError, match = 'mutually exclusive'):
+        _small_flag_dynamics(
+            use_symexp_value_head = True,
+            use_tdmpc2_value_head = True,
+        )
+
+    with pytest.raises(ValueError, match = 'mutually exclusive'):
+        _small_flag_dynamics(
+            use_symexp_value_head = True,
+            use_symlog_hl_gauss_value_head = True,
+        )
+
+
+def test_symlog_hl_gauss_value_head_is_smooth_raw_decoded_and_zero_initialized():
+    from dreamer4.dreamer4 import HLGaussRewardEncoder
+
+    dynamics = _small_flag_dynamics(
+        use_symlog_hl_gauss_value_head = True,
+        value_encoder_kwargs = dict(
+            reward_range = (-10., 10.),
+            num_bins = 7,
+            sigma_to_bin_ratio = 0.75,
+            min_max_value_on_bin_center = False,
+            use_symlog = True,
+            decode_symlog_expected_raw = True,
+        ),
+    )
+
+    assert isinstance(dynamics.value_encoder, HLGaussRewardEncoder)
+    assert dynamics.value_encoder.use_symlog is True
+    assert dynamics.value_encoder.decode_symlog_expected_raw is True
+
+    logits = dynamics.value_head(torch.randn(3, 16))
+    values = dynamics.value_encoder.bins_to_scalar_value(logits)
+
+    assert torch.equal(logits, torch.zeros_like(logits))
+    assert torch.equal(values, torch.zeros_like(values))
+
+
+def test_hl_gauss_actor_critic_is_opt_in_and_owned_by_agent_optimizer():
+    from dreamer4.dreamer4 import Actions, Experience, HLGaussRewardEncoder, SymExpValueTwoHot
+
+    dynamics = _small_flag_dynamics(
+        use_symexp_value_head = True,
+        use_hl_gauss_actor_critic = True,
+        value_encoder_kwargs = dict(reward_range = (-10., 10.), num_bins = 7),
+        hl_gauss_actor_critic_kwargs = dict(
+            reward_range = (-1200., 1200.),
+            num_bins = 7,
+            sigma_to_bin_ratio = 0.75,
+            min_max_value_on_bin_center = False,
+        ),
+        num_continuous_actions = 2,
+        pmpo_kl_div_loss_weight = 0.,
+    )
+
+    assert isinstance(dynamics.value_encoder, SymExpValueTwoHot)
+    assert isinstance(dynamics.actor_critic_value_encoder, HLGaussRewardEncoder)
+    assert dynamics.actor_critic_value_head is not None
+    assert set(dynamics.actor_critic_value_head.parameters()) <= set(dynamics.agent_parameters())
+
+    batch, time = 2, 4
+    agent_embed = torch.randn(batch, time, 16)
+    with torch.no_grad():
+        actor_critic_logits = dynamics.actor_critic_value_head(agent_embed)
+        old_values = dynamics.actor_critic_value_encoder.bins_to_scalar_value(actor_critic_logits)
+
+    experience = Experience(
+        latents = torch.randn(batch, time, 2, 8),
+        agent_embed = agent_embed,
+        rewards = torch.randn(batch, time),
+        actions = Actions(None, torch.rand(batch, time, 2)),
+        log_probs = Actions(None, torch.zeros(batch, time, 2)),
+        values = old_values,
+        step_size = 1,
+        lens = torch.full((batch,), time, dtype = torch.long),
+        is_truncated = torch.ones(batch, dtype = torch.bool),
+        terminals = torch.zeros(batch, dtype = torch.bool),
+        is_from_world_model = True,
+    )
+    _, value_loss, diagnostics = dynamics.learn_from_experience(
+        experience,
+        objective = 'pmpo',
+        return_diagnostics = True,
+    )
+
+    assert {
+        'extra/actor_critic_value_abs_error',
+        'extra/critic_advantage_sign_disagreement',
+    } <= diagnostics.keys()
+
+    value_loss.backward()
+    assert any(param.grad is not None for param in dynamics.value_head.parameters())
+    assert any(param.grad is not None for param in dynamics.actor_critic_value_head.parameters())
+
+    with pytest.raises(ValueError, match = 'requires `use_symexp_value_head`'):
+        _small_flag_dynamics(use_hl_gauss_actor_critic = True)
 
 
 def _small_flag_dynamics(**kwargs):
     from dreamer4.dreamer4 import DynamicsWorldModel
+
+    value_encoder_kwargs = kwargs.pop('value_encoder_kwargs', dict(num_bins = 7))
 
     return DynamicsWorldModel(
         dim = 16,
@@ -303,7 +472,7 @@ def _small_flag_dynamics(**kwargs):
         time_block_every = 1,
         max_steps = 8,
         reward_encoder_kwargs = dict(num_bins = 7),
-        value_encoder_kwargs = dict(num_bins = 7),
+        value_encoder_kwargs = value_encoder_kwargs,
         **kwargs
     )
 
@@ -346,6 +515,11 @@ def test_old_behavior_flags_leave_model_default_state_unchanged_when_disabled():
         old_policy_head = False,
         old_value_head = False,
         old_embedding_init = False,
+        use_symexp_value_head = False,
+        use_tdmpc2_value_head = False,
+        use_symlog_hl_gauss_value_head = False,
+        use_hl_gauss_actor_critic = False,
+        use_baseline_symexp_value_head_init = False,
         value_head_init_value = None,
         final_special_cross_attn = None,
     )
@@ -354,6 +528,111 @@ def test_old_behavior_flags_leave_model_default_state_unchanged_when_disabled():
     explicit_state = explicit.state_dict()
     assert implicit_state.keys() == explicit_state.keys()
     assert all(torch.equal(implicit_state[key], explicit_state[key]) for key in implicit_state)
+
+
+def _paper_shortcut_dynamics(**kwargs):
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    return DynamicsWorldModel(
+        dim = 8,
+        dim_latent = 4,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        num_register_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        max_steps = 8,
+        reward_encoder_kwargs = dict(num_bins = 5),
+        value_encoder_kwargs = dict(num_bins = 5),
+        **kwargs,
+    )
+
+
+def test_paper_shortcut_flag_uses_piecewise_per_example_objective():
+    torch.manual_seed(123)
+    model = _paper_shortcut_dynamics(
+        use_paper_aligned_shortcut_objective = True,
+    )
+    latents = torch.randn(16, 3, 1, 4)
+
+    loss, losses = model(
+        latents = latents,
+        shortcut_train_mode = 'combined',
+        return_all_losses = True,
+        seed = 42,
+    )
+
+    diagnostics = losses.diagnostics
+
+    assert diagnostics.raw_flow > 0.
+    assert diagnostics.raw_shortcut > 0.
+    assert torch.equal(
+        diagnostics.raw_dynamics,
+        diagnostics.raw_flow + diagnostics.raw_shortcut,
+    )
+    assert torch.equal(diagnostics.raw_dynamics, diagnostics.normalized_dynamics)
+
+    _, finetune_losses = model(
+        latents = latents,
+        shortcut_train_mode = 'finetune',
+        return_all_losses = True,
+        seed = 42,
+    )
+    _, bootstrap_losses = model(
+        latents = latents,
+        shortcut_train_mode = 'bootstrap_only',
+        return_all_losses = True,
+        seed = 42,
+    )
+
+    assert finetune_losses.diagnostics.raw_flow > 0.
+    assert finetune_losses.diagnostics.raw_shortcut == 0.
+    assert bootstrap_losses.diagnostics.raw_flow == 0.
+    assert bootstrap_losses.diagnostics.raw_shortcut > 0.
+
+    loss.backward()
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
+
+
+def test_paper_shortcut_flag_normalizes_one_piecewise_dynamics_loss():
+    torch.manual_seed(123)
+    model = _paper_shortcut_dynamics(
+        use_loss_normalization = True,
+        use_paper_aligned_shortcut_objective = True,
+    )
+
+    _, losses = model(
+        latents = torch.randn(16, 3, 1, 4),
+        shortcut_train_mode = 'combined',
+        return_all_losses = True,
+        seed = 42,
+    )
+
+    assert losses.diagnostics.raw_flow > 0.
+    assert losses.diagnostics.raw_shortcut > 0.
+    assert model.paper_dynamics_loss_normalizer.exp_avg_sq.item() != 1.
+    assert model.flow_loss_normalizer.exp_avg_sq.item() == 1.
+    assert model.shortcut_flow_loss_normalizer.exp_avg_sq.item() == 1.
+
+
+def test_paper_shortcut_flag_accepts_explicit_inference_step():
+    model = _paper_shortcut_dynamics(
+        use_paper_aligned_shortcut_objective = True,
+    )
+
+    loss = model(
+        latents = torch.randn(2, 3, 1, 4),
+        signal_levels = torch.zeros(2, 3, dtype = torch.long),
+        step_sizes_log2 = torch.zeros(2, dtype = torch.long),
+    )
+
+    assert torch.isfinite(loss)
 
 
 def test_opt_in_old_heads_shift_and_embedding_initializers():
@@ -630,8 +909,23 @@ def test_action_with_world_model():
         'critic/value_min',
         'critic/value_max',
         'critic/value_abs_error',
-        'critic/value_target_saturation_frac'
+        'critic/value_target_saturation_frac',
+        'extra/positive_advantage_frac',
+        'extra/negative_advantage_frac',
+        'extra/advantage_mean',
+        'extra/advantage_abs_mean',
+        'extra/policy_entropy',
+        'extra/importance_ratio_clip_frac',
+        'extra/value_target_entropy',
+        'extra/value_excess_cross_entropy'
     } <= diagnostics.keys()
+
+    assert torch.isfinite(diagnostics['extra/advantage_mean'])
+    assert torch.isfinite(diagnostics['extra/advantage_abs_mean'])
+    assert torch.isfinite(diagnostics['extra/policy_entropy'])
+    assert torch.isfinite(diagnostics['extra/value_target_entropy'])
+    assert torch.isfinite(diagnostics['extra/value_excess_cross_entropy'])
+    assert diagnostics['extra/importance_ratio_clip_frac'].item() == 0.
 
     actor_loss.backward(retain_graph = True)
     critic_loss.backward()
@@ -1141,6 +1435,119 @@ def test_loss_normalizer():
     normed_losses = loss_normalizer(losses)
 
     assert (normed_losses == 1.).all()
+
+
+def test_loss_normalizer_preserves_scalar_shape_and_validates_before_update():
+    from dreamer4.dreamer4 import LossNormalizer
+
+    scalar_normalizer = LossNormalizer()
+    scalar_loss = torch.tensor(2.)
+
+    normalized = scalar_normalizer(scalar_loss)
+
+    assert normalized.shape == scalar_loss.shape
+
+    vector_normalizer = LossNormalizer(2)
+    initial_stats = vector_normalizer.exp_avg_sq.clone()
+
+    with pytest.raises(ValueError, match = "expected 2 loss values"):
+        vector_normalizer(torch.tensor(1.))
+
+    assert torch.equal(vector_normalizer.exp_avg_sq, initial_stats)
+
+
+def test_world_model_loss_normalization_skips_inactive_losses():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    model = DynamicsWorldModel(
+        dim = 8,
+        dim_latent = 4,
+        max_steps = 8,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        num_discrete_actions = 0,
+        num_continuous_actions = 1,
+        continuous_dist_type = "beta",
+        continuous_target_action_range = (-1., 1.),
+        continuous_action_loss_weight = 0.,
+        discrete_action_loss_weight = 0.,
+        multi_token_pred_len = 2,
+        reward_encoder_kwargs = dict(num_bins = 5),
+        value_encoder_kwargs = dict(num_bins = 5),
+        policy_head_mlp_depth = 1,
+        value_head_mlp_depth = 1,
+        old_reward_head = True,
+        old_reward_shifting = True,
+        use_loss_normalization = True,
+    )
+
+    shortcut_stats = model.shortcut_flow_loss_normalizer.exp_avg_sq.clone()
+    latent_reward_stats = model.latent_state_reward_loss_normalizer.exp_avg_sq.clone()
+    action_stats = model.continuous_actions_loss_normalizer.exp_avg_sq.clone()
+
+    total_loss, losses = model(
+        latents = torch.randn(2, 4, 1, 4),
+        rewards = torch.randn(2, 4),
+        terminals = torch.zeros(2, dtype = torch.bool),
+        continuous_actions = torch.rand(2, 4, 1),
+        lens = torch.tensor((4, 3)),
+        return_all_losses = True,
+        shortcut_train_mode = "finetune",
+    )
+
+    assert total_loss.ndim == 0
+    assert losses.continuous_actions.ndim == 0
+    assert torch.equal(model.shortcut_flow_loss_normalizer.exp_avg_sq, shortcut_stats)
+    assert torch.equal(model.latent_state_reward_loss_normalizer.exp_avg_sq, latent_reward_stats)
+    assert torch.equal(model.continuous_actions_loss_normalizer.exp_avg_sq, action_stats)
+
+
+def test_world_model_loss_normalization_skips_inactive_legacy_terminal_head():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    model = DynamicsWorldModel(
+        dim = 8,
+        dim_latent = 4,
+        max_steps = 8,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        num_discrete_actions = 0,
+        num_continuous_actions = 1,
+        continuous_dist_type = "beta",
+        continuous_action_loss_weight = 0.,
+        discrete_action_loss_weight = 0.,
+        multi_token_pred_len = 2,
+        reward_encoder_kwargs = dict(num_bins = 5),
+        value_encoder_kwargs = dict(num_bins = 5),
+        policy_head_mlp_depth = 1,
+        value_head_mlp_depth = 1,
+        old_terminal_head = True,
+        use_loss_normalization = True,
+    )
+
+    terminal_stats = model.agent_embed_terminal_loss_normalizer.exp_avg_sq.clone()
+
+    total_loss, losses = model(
+        latents = torch.randn(2, 4, 1, 4),
+        rewards = torch.randn(2, 4),
+        terminals = torch.zeros(2, dtype = torch.bool),
+        continuous_actions = torch.rand(2, 4, 1),
+        lens = torch.tensor((4, 3)),
+        return_all_losses = True,
+        shortcut_train_mode = "finetune",
+    )
+
+    assert total_loss.ndim == 0
+    assert losses.agent_embed_terminal.ndim == 0
+    assert torch.equal(model.agent_embed_terminal_loss_normalizer.exp_avg_sq, terminal_stats)
 
 def test_tokenizer_trainer():
     from dreamer4.trainers import VideoTokenizerTrainer

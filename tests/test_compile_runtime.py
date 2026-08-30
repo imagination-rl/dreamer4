@@ -12,7 +12,10 @@ from dreamer4.dreamer4 import DynamicsWorldModel
 from train.compile_runtime import (
     DynamicTimeCacheCallable,
     ImaginationGenerateRollout,
+    ImaginationLearningLoss,
     InteractWithEnvForward,
+    WorldModelTrainingLoss,
+    action_pair_or_empty,
     build_compile_runtime,
     configure_sac,
     maybe_compile_and_time,
@@ -107,6 +110,67 @@ def make_tiny_world_model(*, dim = 8, attn_dim_head = 8, **kwargs):
     )
 
 
+def test_compiled_world_model_loss_normalization_skips_disabled_action_loss(reset_compile_after_test):
+    model = make_tiny_world_model(
+        continuous_action_loss_weight = 0.,
+        discrete_action_loss_weight = 0.,
+        old_reward_head = True,
+        old_reward_shifting = True,
+        use_loss_normalization = True,
+    )
+    loss_fn = torch.compile(
+        WorldModelTrainingLoss(model),
+        backend = "eager",
+        fullgraph = False,
+        dynamic = False,
+    )
+
+    loss, losses = loss_fn(
+        torch.randn(2, 4, 1, 4),
+        torch.randn(2, 4),
+        torch.zeros(2, dtype = torch.bool),
+        torch.rand(2, 4, 2),
+        torch.tensor((4, 3)),
+        "finetune",
+        True,
+    )
+    loss.backward()
+
+    assert loss.ndim == 0
+    assert losses.continuous_actions.ndim == 0
+
+
+def test_compiled_paper_shortcut_objective_supports_mixed_batches(reset_compile_after_test):
+    torch.manual_seed(42)
+    model = make_tiny_world_model(
+        continuous_action_loss_weight = 0.,
+        discrete_action_loss_weight = 0.,
+        use_loss_normalization = True,
+        use_paper_aligned_shortcut_objective = True,
+    )
+    loss_fn = torch.compile(
+        WorldModelTrainingLoss(model),
+        backend = "eager",
+        fullgraph = False,
+        dynamic = False,
+    )
+
+    loss, losses = loss_fn(
+        torch.randn(16, 4, 1, 4),
+        torch.randn(16, 4),
+        torch.zeros(16, dtype = torch.bool),
+        torch.rand(16, 4, 2),
+        torch.full((16,), 4),
+        "combined",
+        True,
+    )
+    loss.backward()
+
+    assert loss.ndim == 0
+    assert losses.diagnostics.raw_flow > 0.
+    assert losses.diagnostics.raw_shortcut > 0.
+
+
 def make_tiny_imagination_runtime(monkeypatch, *, denoising_steps):
     reset_torch_compile_state(torch.device("cpu"))
     monkeypatch.setattr(
@@ -171,6 +235,211 @@ def assert_matching_experience(actual, expected, *, tolerance = 0.):
     for actual_tensor, expected_tensor in tensors:
         assert actual_tensor.shape == expected_tensor.shape
         assert torch.allclose(actual_tensor, expected_tensor, atol = tolerance, rtol = tolerance)
+
+
+def apply_imagination_loss(loss_module, dream, preservation = None):
+    actions = action_pair_or_empty(dream.actions)
+    log_probs = action_pair_or_empty(dream.log_probs)
+    old_action_unembeds = action_pair_or_empty(dream.old_action_unembeds)
+    preservation_actions = action_pair_or_empty(
+        preservation.actions if preservation is not None else None
+    )
+
+    return loss_module(
+        dream.latents,
+        dream.proprio,
+        dream.critic_state,
+        dream.agent_embed,
+        dream.policy_input,
+        dream.rewards,
+        dream.terminals,
+        actions.discrete,
+        actions.continuous,
+        log_probs.discrete,
+        log_probs.continuous,
+        old_action_unembeds.discrete,
+        old_action_unembeds.continuous,
+        dream.values,
+        dream.step_size,
+        dream.lens,
+        dream.is_truncated,
+        dream.is_from_world_model,
+        dream.episode_return,
+        preservation.latents if preservation is not None else None,
+        preservation.proprio if preservation is not None else None,
+        preservation.rewards if preservation is not None else None,
+        preservation_actions.discrete,
+        preservation_actions.continuous,
+        preservation.lens if preservation is not None else None,
+    )
+
+
+@pytest.mark.parametrize("objective", ("pmpo", "ppo", "spo"))
+def test_imagination_diagnostics_log_policy_signal_and_on_policy_ratio(objective):
+    model = make_tiny_world_model()
+    dream_kwargs = generate_kwargs(time_steps = 4)
+    dream_kwargs["store_old_action_unembeds"] = True
+
+    with torch.no_grad():
+        dream = model.generate(**dream_kwargs)
+
+    loss_module = ImaginationLearningLoss(
+        model,
+        objective = objective,
+        use_delight_gating = False,
+    )
+    _, _, diagnostics = apply_imagination_loss(loss_module, dream)
+
+    expected = {
+        "extra/advantage_mean",
+        "extra/advantage_abs_mean",
+        "extra/policy_entropy",
+        "extra/importance_ratio_clip_frac",
+    }
+    assert expected <= diagnostics.keys()
+    assert all(torch.isfinite(diagnostics[key]) for key in expected)
+    assert diagnostics["extra/importance_ratio_clip_frac"].item() == 0.
+
+
+def test_full_transformer_finetuning_is_opt_in_and_preserves_world_model_functions():
+    source_model = make_tiny_world_model()
+    dream_kwargs = generate_kwargs(time_steps = 4)
+    dream_kwargs["store_old_action_unembeds"] = True
+
+    with torch.no_grad():
+        dream = source_model.generate(**dream_kwargs)
+
+    disabled_model = deepcopy(source_model)
+    disabled_loss = ImaginationLearningLoss(
+        disabled_model,
+        objective = "pmpo",
+        use_delight_gating = False,
+    )
+    policy_loss, value_loss, diagnostics = apply_imagination_loss(disabled_loss, dream)
+    (policy_loss + value_loss).backward()
+
+    assert all(parameter.grad is None for parameter in disabled_model.transformer.parameters())
+    assert all(parameter.grad is None for parameter in disabled_model.to_latent_pred.parameters())
+    assert all(parameter.grad is None for parameter in disabled_model.to_agent_embed_reward_pred.parameters())
+    assert not any(key.startswith("preservation/") for key in diagnostics)
+
+    enabled_model = deepcopy(source_model)
+    enabled_loss = ImaginationLearningLoss(
+        enabled_model,
+        objective = "pmpo",
+        use_delight_gating = False,
+        full_transformer_finetuning = True,
+    )
+    policy_loss, value_loss, diagnostics = apply_imagination_loss(enabled_loss, dream, dream)
+    (policy_loss + value_loss).backward()
+
+    assert any(parameter.grad is not None for parameter in enabled_model.transformer.parameters())
+    assert any(parameter.grad is not None for parameter in enabled_model.to_latent_pred.parameters())
+    assert any(parameter.grad is not None for parameter in enabled_model.to_agent_embed_reward_pred.parameters())
+    assert {
+        "preservation/dynamics_loss",
+        "preservation/reward_loss",
+        "preservation/loss",
+    } <= diagnostics.keys()
+
+
+def test_full_transformer_finetuning_requires_policy_prior_loss():
+    model = make_tiny_world_model()
+
+    with pytest.raises(ValueError, match = "objective='pmpo'"):
+        ImaginationLearningLoss(
+            model,
+            objective = "ppo",
+            use_delight_gating = False,
+            full_transformer_finetuning = True,
+        )
+
+    model.pmpo_kl_div_loss_weight = 0.
+    with pytest.raises(ValueError, match = "pmpo_kl_div_loss_weight > 0"):
+        ImaginationLearningLoss(
+            model,
+            objective = "pmpo",
+            use_delight_gating = False,
+            full_transformer_finetuning = True,
+        )
+
+
+def test_full_transformer_finetuning_uses_replay_preservation_batch(monkeypatch):
+    preservation_window_lengths = []
+    dataloader_batch_sizes = []
+    original_dataloader = train_gym.DataLoader
+
+    def make_replay_dataset(**kwargs):
+        preservation_window_lengths.append(kwargs["window_length"])
+        return DummyReplayDataset(kwargs["window_length"])
+
+    def make_dataloader(dataset, **kwargs):
+        dataloader_batch_sizes.append(kwargs["batch_size"])
+        return original_dataloader(dataset, **kwargs)
+
+    monkeypatch.setattr(
+        train_gym,
+        "ReplayDatasetTimeWindow",
+        make_replay_dataset,
+    )
+    monkeypatch.setattr(train_gym, "DataLoader", make_dataloader)
+    world_model = make_tiny_world_model()
+    policy_prior = train_gym.FrozenPolicyPrior(world_model)
+    optimizer = torch.optim.Adam(
+        train_gym.agent_optimizer_parameters(world_model, True),
+        lr = 1e-4,
+    )
+    runtime = build_compile_runtime(
+        world_model,
+        device = torch.device("cpu"),
+        compile_world_model = False,
+        compile_generate = False,
+        compile_learn = False,
+        compile_backend = "eager",
+        compile_mode = None,
+        compile_fullgraph = False,
+        compile_dynamic = False,
+        compile_generate_cudagraphs = False,
+        track_compile_performance = False,
+        imagination_generate_steps = 2,
+        imagination_use_time_cache = False,
+        objective = "pmpo",
+        use_delight_gating = False,
+        store_old_action_unembeds = False,
+        full_transformer_finetuning = True,
+    )
+
+    _, metrics = train_gym.train_agent_in_imagination(
+        world_model,
+        optimizer,
+        policy_prior,
+        object(),
+        generate_rollout_fn = runtime.generate_rollout,
+        learn_from_dream_fn = runtime.learn_from_dream,
+        learn_from_dream_timing = None,
+        imagination_step_timing = None,
+        steps = 1,
+        batch_size = 2,
+        horizon = 4,
+        prompt_length = 0,
+        prompt_probability = 0.,
+        static_generate_shape = False,
+        generate_steps = 2,
+        max_grad_norm = 1.,
+        objective = "pmpo",
+        use_delight_gating = False,
+        global_step = 0,
+        writer = None,
+        training_profiler = None,
+        full_transformer_finetuning = True,
+        preservation_sequence_length = 7,
+        preservation_batch_size = 3,
+    )
+
+    assert preservation_window_lengths == [0, 7]
+    assert dataloader_batch_sizes == [2, 3]
+    assert "preservation/dynamics_loss" in metrics
+    assert "preservation/reward_loss" in metrics
 
 
 def test_interact_forward_compiles_only_world_model_forward_without_cudagraphs(monkeypatch):

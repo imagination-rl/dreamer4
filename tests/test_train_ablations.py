@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from train.ablations import build_ablation_specs
+from train import ablations
+from train.ablations import AblationSpec, build_ablation_specs, execute_ablation
 
 
 def write_config(path, config):
@@ -193,3 +194,43 @@ def test_resume_ablation_preserves_explicit_checkpoint_folder(tmp_path):
 
     assert spec.train_kwargs["checkpoint_folder"] == "existing_checkpoints"
     assert spec.train_kwargs["checkpoint_path"] == "existing_checkpoints/loop_25.pt"
+
+
+def test_execute_ablation_logs_worker_exception_immediately(monkeypatch, capsys):
+    spec = AblationSpec(
+        index = 7,
+        label = "broken",
+        overrides = {},
+        train_kwargs = {"run_name": "broken"},
+        run_log_dir = "runs/gym_imagination/broken",
+    )
+
+    def raise_error(_):
+        raise RuntimeError("test failure")
+
+    monkeypatch.setattr(ablations, "run_train_gym", raise_error)
+
+    result = execute_ablation(spec, dry_run = False)
+
+    captured = capsys.readouterr()
+
+    assert not result.success
+    assert "RuntimeError: test failure" in result.error
+    assert "[ablation 7] worker error for broken:" in captured.err
+    assert "RuntimeError: test failure" in captured.err
+
+
+def test_selected_ablations_cover_smooth_symlog_and_hl_gauss_actor_critic():
+    selected = [ablations.ABLATIONS[index - 1] for index in ablations.ABLATIONS_TO_RUN]
+
+    assert [item["seed"] for item in selected] == [42, 4, 42, 4]
+    assert all(item["old_reward_shifting"] is False for item in selected)
+    assert all(item["value_range"] == [-10., 10.] for item in selected)
+
+    smooth = selected[:2]
+    crossover = selected[2:]
+
+    assert all(item["use_symlog_hl_gauss_value_head"] is True for item in smooth)
+    assert all("use_symexp_value_head" not in item for item in smooth)
+    assert all(item["use_symexp_value_head"] is True for item in crossover)
+    assert all(item["use_hl_gauss_actor_critic"] is True for item in crossover)
