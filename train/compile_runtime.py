@@ -312,7 +312,7 @@ class ImaginationLearningLoss(nn.Module):
         self,
         world_model: DynamicsWorldModel,
         *,
-        objective: Literal["ppo", "pmpo", "spo"],
+        objective: Literal["ppo", "pmpo", "spo", "reinforce"],
         use_delight_gating: bool,
         full_transformer_finetuning: bool = False,
     ):
@@ -580,7 +580,7 @@ def build_compile_runtime(
     imagination_generate_steps: int,
     imagination_use_time_cache: bool,
     imagination_max_timesteps: int = 64,
-    objective: Literal["ppo", "pmpo", "spo"],
+    objective: Literal["ppo", "pmpo", "spo", "reinforce"],
     use_delight_gating: bool,
     store_old_action_unembeds: bool,
     compile_interact: bool = False,

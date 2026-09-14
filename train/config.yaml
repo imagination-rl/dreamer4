@@ -6,6 +6,20 @@ require_cuda: true
 allow_tf32: true
 obs_dim: null
 
+# State-only actor-critic benchmark. This path is inactive unless enabled.
+small_model_only: false
+small_model:
+  dim: 128
+  encoder_depth: 2
+  update_epochs: 1
+  minibatch_num_envs: null
+  observation_normalization: fixed_random
+  normalization_observations: 16384
+  cleanrl_pmpo: false
+  cleanrl_pmpo_constant_learning_rate: false
+  cleanrl_pmpo_joint_log_prob: false
+  cleanrl_pmpo_q_ranked_preferences: false
+
 # Model architecture
 num_latent_tokens: 4
 dim_latent: 32
@@ -23,6 +37,7 @@ use_hl_gauss_actor_critic: false
 use_baseline_symexp_value_head_init: false
 prob_shortcut_train: null
 policy_all_tokens: true
+continuous_dist_type: beta
 
 # Old settings added
 spatial_flex_attention_backend: AUTO
@@ -100,10 +115,17 @@ preservation_sequence_length: 200
 
 # Agent learning in imagination
 agent_learning_rate: 0.0006
+# Select pmpo, ppo, spo, or reinforce.
 objective: pmpo
+# Keep these values for the current REINFORCE baseline.
+reinforce_discount_factor: 0.99
+reinforce_gae_lambda: 1.0
+reinforce_return_normalization: none
+reinforce_use_discounted_trajectory_weights: false
 pmpo_pos_to_neg_weight: 0.5
 pmpo_kl_div_loss_weight: 0.3
 use_delight_gating: false
+policy_entropy_weight: 0.01
 # Apply full-transformer updates with replay dynamics, reward, and policy-prior preservation losses.
 full_transformer_finetuning: false
 agent_predicts_state: false

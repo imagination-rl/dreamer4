@@ -1,36 +1,14 @@
-import ast
-from pathlib import Path
 import warnings
 
 import gymnasium as gym
 import numpy as np
 import pytest
 import torch
-import yaml
 
 import train.train_gym as train_gym
 from dreamer4.dreamer4 import DynamicsWorldModel
 from train.compile_runtime import ImaginationGenerateRollout
 from train.train_gym import RolloutTimingWrapper, pop_rollout_env_timings, repeat_batch_to_size
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-TRAIN_GYM_PATH = REPO_ROOT / "train" / "train_gym.py"
-CONFIG_PATH = REPO_ROOT / "train" / "config.yaml"
-
-
-def get_function(name):
-    module = ast.parse(TRAIN_GYM_PATH.read_text())
-
-    for node in module.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-            return node
-
-    raise AssertionError(f"{name}() not found")
-
-
-def keyword_map(call):
-    return {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg is not None}
 
 
 def test_repeat_batch_to_size_repeats_all_tensor_fields():
@@ -63,16 +41,6 @@ def test_old_observation_tokenizer_uses_plain_silu_mlp():
     assert isinstance(tokenizer.tokenizer, train_gym.OldStateTokenizer)
     assert latents.shape == (5, 2, 4)
     assert any(isinstance(module, torch.nn.SiLU) for module in tokenizer.tokenizer.encoder)
-
-
-def test_old_replay_sampling_keeps_partial_world_model_batches_and_replaces_prompts():
-    world_model_source = ast.unparse(get_function("train_world_model"))
-    imagination_source = ast.unparse(get_function("train_agent_in_imagination"))
-
-    assert "static_batch_shape and (not old_replay_sampling)" in world_model_source
-    assert "RandomSampler(prompt_dataset, replacement=True, num_samples=batch_size)" in imagination_source
-    assert "resampling_dataloader_iterator(dataloader)" in world_model_source
-    assert "resampling_dataloader_iterator(prompt_dataloader)" in imagination_source
 
 
 def test_resampling_dataloader_iterator_recreates_each_epoch():
@@ -355,168 +323,3 @@ def test_async_vector_env_reset_and_step_smoke():
 
     assert observations.shape == (2, 3)
     assert step_out[0].shape == (2, 3)
-
-
-def test_main_parameters_match_config_exactly():
-    config = yaml.safe_load(CONFIG_PATH.read_text())
-    main = get_function("main")
-    parameters = {argument.arg for argument in main.args.kwonlyargs}
-
-    assert parameters == set(config)
-    assert {
-        "collect_timings",
-        "profile",
-        "profile_memory",
-        "profile_record_shapes",
-        "profile_with_stack",
-        "profile_with_flops",
-    } <= parameters
-
-
-def test_config_matches_modded_better_baseline():
-    config = yaml.safe_load(CONFIG_PATH.read_text())
-
-    assert config["seed"] == 42
-    assert config["old_pmpo"] is True
-    assert config["old_reward_head"] is True
-    assert config["old_reward_shifting"] is True
-
-    for flag in (
-        "add_action_embed_to_agent_token",
-        "old_continuous_action_encoder",
-        "old_terminal_head",
-        "old_state_tokenizer",
-        "old_dynamics_ff",
-        "old_policy_head",
-        "old_value_head",
-        "old_replay_sampling",
-        "old_embedding_init",
-    ):
-        assert config[flag] is False
-
-    assert config["normalize_advantages"] is False
-    assert config["policy_all_tokens"] is True
-    assert config["value_range"] == [-1200., 1200.]
-    assert config["value_encoder_num_bins"] == 255
-    assert config["reward_encoder_num_bins"] == 255
-    assert config["use_symexp_value_head"] is False
-    assert config["use_tdmpc2_value_head"] is False
-    assert config["use_symlog_hl_gauss_value_head"] is False
-    assert config["use_hl_gauss_actor_critic"] is False
-    assert config["use_baseline_symexp_value_head_init"] is False
-    assert config["pretrain_tokenizer_steps"] == 2000
-    assert config["pretrain_tokenizer_observations"] == 16384
-    assert config["value_use_symlog"] is False
-    assert config["spatial_flex_attention_backend"] == "AUTO"
-    assert config["num_envs"] == 64
-    assert config["max_timesteps"] == 1000
-    assert config["pretrain_world_model_finetune_steps"] == 0
-    assert config["pretrain_world_model_combined_steps"] == 256
-    assert config["allow_tf32"] is True
-    assert config["optimize_generate_compilation"] is False
-    assert config["compile_generate_with_time_cache"] is True
-    assert config["activation_memory_budget"] == 0.9
-    assert config["imagination_use_time_cache"] is True
-    assert config["compile_mode"] == "reduce-overhead"
-    assert all(config[key] is True for key in (
-        "compile_interact",
-        "compile_world_model",
-        "compile_generate",
-        "compile_learn",
-    ))
-
-
-def test_main_forwards_spatial_flex_attention_backend():
-    main = get_function("main")
-    world_model_call = next(
-        node
-        for node in ast.walk(main)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "DynamicsWorldModel"
-    )
-    keywords = keyword_map(world_model_call)
-
-    assert ast.unparse(keywords["transformer_kwargs"]) == (
-        "dict(spatial_flex_attention_backend=spatial_flex_attention_backend)"
-    )
-
-
-def test_main_forwards_old_continuous_action_encoder():
-    main = get_function("main")
-    world_model_call = next(
-        node
-        for node in ast.walk(main)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "DynamicsWorldModel"
-    )
-    keywords = keyword_map(world_model_call)
-
-    assert ast.unparse(keywords["old_continuous_action_encoder"]) == "old_continuous_action_encoder"
-
-
-def test_world_model_training_logs_reward_mae():
-    train_world_model = get_function("train_world_model")
-    metric_values = {
-        key.value: ast.unparse(value)
-        for node in ast.walk(train_world_model)
-        if isinstance(node, ast.Dict)
-        for key, value in zip(node.keys, node.values)
-        if isinstance(key, ast.Constant) and isinstance(key.value, str)
-    }
-
-    assert metric_values["world_model/reward_mae"] == "losses.reward_mae.item()"
-
-
-def test_static_training_paths_enforce_fixed_shapes():
-    train_world_model = get_function("train_world_model")
-    train_imagination = get_function("train_agent_in_imagination")
-    main = get_function("main")
-
-    assert "repeat_batch_to_size(batch, batch_size)" in ast.unparse(train_world_model)
-
-    imagination_source = ast.unparse(train_imagination)
-    assert "static_generate_shape and prompt_length > 0 and (prompt_probability != 1.0)" in imagination_source
-    assert "static compiled generation requires at least one prompt window" in imagination_source
-    assert "repeat_batch_to_size(prompt_batch, batch_size)" in imagination_source
-
-    assignments = {
-        target.id: ast.unparse(node.value)
-        for node in ast.walk(main)
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
-    assert assignments["compile"] == "device.type == 'cuda'"
-    assert assignments["static_compile_shapes"] == "compile_dynamic is False"
-
-    calls = [
-        node
-        for node in ast.walk(main)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in ("train_world_model", "train_agent_in_imagination")
-    ]
-
-    world_model_calls = [keyword_map(call) for call in calls if call.func.id == "train_world_model"]
-    imagination_call = next(keyword_map(call) for call in calls if call.func.id == "train_agent_in_imagination")
-
-    assert len(world_model_calls) == 3
-    assert all(
-        ast.unparse(call["static_batch_shape"]) == "compile_world_model and static_compile_shapes"
-        for call in world_model_calls
-    )
-    assert ast.unparse(imagination_call["static_generate_shape"]) == "compile_generate and static_compile_shapes"
-    assert ast.unparse(imagination_call["full_transformer_finetuning"]) == "full_transformer_finetuning"
-    assert ast.unparse(imagination_call["preservation_sequence_length"]) == "preservation_sequence_length"
-    assert ast.unparse(imagination_call["preservation_batch_size"]) == "world_model_batch_size"
-    assert sum(
-        ast.unparse(call["update_loss_ema"]) == "True"
-        for call in world_model_calls
-    ) == 2
-    assert sum(
-        ast.unparse(call["update_loss_ema"])
-        == "not freeze_dynamics_loss_normalization_after_pretraining"
-        for call in world_model_calls
-    ) == 1

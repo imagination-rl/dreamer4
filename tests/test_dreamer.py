@@ -7,40 +7,87 @@ from einops import rearrange
 def exists(v):
     return v is not None
 
-@param('pred_orig_latent', (False, True))
-@param('grouped_query_attn', (False, True))
-@param('dynamics_with_video_input', (False, True))
-@param('prob_shortcut_train', (None, 1., 0.))
-@param('add_task_embeds', (False, True))
-@param('num_spatial_tokens', (2, 8))
-@param('signal_and_step_passed_in', (False, True))
-@param('condition_on_actions', (False, True))
-@param('add_reward_embed_to_agent_token', (False, True))
-@param('add_state_pred_head', (False, True))
-@param('use_time_cache', (False, True))
-@param('var_len', (False, True))
-@param('time_attention_use_pope', (False, True))
-@param('with_latent_ar_in_dynamics', (False, True))
-@param('with_latent_ar_action_conditioned', (False, True))
-@param('predict_terminals', (False, True))
-def test_e2e(
-    pred_orig_latent,
-    grouped_query_attn,
-    dynamics_with_video_input,
-    prob_shortcut_train,
-    add_task_embeds,
-    num_spatial_tokens,
-    signal_and_step_passed_in,
-    condition_on_actions,
-    add_reward_embed_to_agent_token,
-    add_state_pred_head,
-    use_time_cache,
-    var_len,
-    time_attention_use_pope,
-    with_latent_ar_in_dynamics,
-    with_latent_ar_action_conditioned,
-    predict_terminals
-):
+E2E_CASES = (
+    pytest.param({}, id = 'default'),
+    pytest.param(
+        dict(
+            pred_orig_latent = True,
+            grouped_query_attn = True,
+            num_spatial_tokens = 8,
+            dynamics_with_video_input = True,
+            add_task_embeds = True,
+        ),
+        id = 'video-task-grouped',
+    ),
+    pytest.param(
+        dict(
+            prob_shortcut_train = 1.,
+            signal_and_step_passed_in = True,
+            use_time_cache = True,
+            var_len = True,
+        ),
+        id = 'shortcut-cache-variable-length',
+    ),
+    pytest.param(
+        dict(
+            prob_shortcut_train = 0.,
+            with_latent_ar_in_dynamics = True,
+            with_latent_ar_action_conditioned = True,
+            condition_on_actions = True,
+        ),
+        id = 'latent-ar-action-conditioned',
+    ),
+    pytest.param(
+        dict(
+            add_reward_embed_to_agent_token = True,
+            add_state_pred_head = True,
+            predict_terminals = True,
+            time_attention_use_pope = True,
+        ),
+        id = 'agent-heads-and-pope',
+    ),
+)
+
+
+@param('case', E2E_CASES)
+def test_e2e(case):
+    settings = dict(
+        pred_orig_latent = False,
+        grouped_query_attn = False,
+        dynamics_with_video_input = False,
+        prob_shortcut_train = None,
+        add_task_embeds = False,
+        num_spatial_tokens = 2,
+        signal_and_step_passed_in = False,
+        condition_on_actions = False,
+        add_reward_embed_to_agent_token = False,
+        add_state_pred_head = False,
+        use_time_cache = False,
+        var_len = False,
+        time_attention_use_pope = False,
+        with_latent_ar_in_dynamics = False,
+        with_latent_ar_action_conditioned = False,
+        predict_terminals = False,
+    )
+    settings.update(case)
+    (
+        pred_orig_latent,
+        grouped_query_attn,
+        dynamics_with_video_input,
+        prob_shortcut_train,
+        add_task_embeds,
+        num_spatial_tokens,
+        signal_and_step_passed_in,
+        condition_on_actions,
+        add_reward_embed_to_agent_token,
+        add_state_pred_head,
+        use_time_cache,
+        var_len,
+        time_attention_use_pope,
+        with_latent_ar_in_dynamics,
+        with_latent_ar_action_conditioned,
+        predict_terminals,
+    ) = (settings[key] for key in settings)
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
     tokenizer = VideoTokenizer(

@@ -8,7 +8,8 @@ from torch._dynamo.utils import clear_compilation_metrics, get_compilation_metri
 from torch.utils.data import Dataset
 
 import train.train_gym as train_gym
-from dreamer4.dreamer4 import DynamicsWorldModel
+import dreamer4.dreamer4 as dreamer4_module
+from dreamer4.dreamer4 import Actions, DynamicsWorldModel
 from train.compile_runtime import (
     DynamicTimeCacheCallable,
     ImaginationGenerateRollout,
@@ -88,7 +89,7 @@ def test_configure_sac_rejects_invalid_memory_budget(budget):
         configure_sac(budget)
 
 
-def make_tiny_world_model(*, dim = 8, attn_dim_head = 8, **kwargs):
+def make_tiny_world_model(*, dim = 8, attn_dim_head = 8, continuous_dist_type = "beta", **kwargs):
     return DynamicsWorldModel(
         dim = dim,
         dim_latent = 4,
@@ -101,7 +102,7 @@ def make_tiny_world_model(*, dim = 8, attn_dim_head = 8, **kwargs):
         attn_dim_head = attn_dim_head,
         num_discrete_actions = 0,
         num_continuous_actions = 2,
-        continuous_dist_type = "beta",
+        continuous_dist_type = continuous_dist_type,
         reward_encoder_kwargs = dict(num_bins = 5),
         value_encoder_kwargs = dict(num_bins = 5),
         policy_head_mlp_depth = 1,
@@ -274,7 +275,7 @@ def apply_imagination_loss(loss_module, dream, preservation = None):
     )
 
 
-@pytest.mark.parametrize("objective", ("pmpo", "ppo", "spo"))
+@pytest.mark.parametrize("objective", ("pmpo", "ppo", "spo", "reinforce"))
 def test_imagination_diagnostics_log_policy_signal_and_on_policy_ratio(objective):
     model = make_tiny_world_model()
     dream_kwargs = generate_kwargs(time_steps = 4)
@@ -299,6 +300,140 @@ def test_imagination_diagnostics_log_policy_signal_and_on_policy_ratio(objective
     assert expected <= diagnostics.keys()
     assert all(torch.isfinite(diagnostics[key]) for key in expected)
     assert diagnostics["extra/importance_ratio_clip_frac"].item() == 0.
+
+
+def test_reinforce_uses_reward_to_go_without_a_behavior_ratio(monkeypatch):
+    model = make_tiny_world_model()
+    model.policy_entropy_weight = 0.
+
+    with torch.no_grad():
+        dream = model.generate(**generate_kwargs(time_steps = 4))
+
+    captured_lambdas = []
+    original_calc_gae = dreamer4_module.calc_gae
+
+    def capture_calc_gae(*args, **kwargs):
+        captured_lambdas.append(kwargs["lam"])
+        return original_calc_gae(*args, **kwargs)
+
+    monkeypatch.setattr(dreamer4_module, "calc_gae", capture_calc_gae)
+    loss_module = ImaginationLearningLoss(
+        model,
+        objective = "reinforce",
+        use_delight_gating = False,
+    )
+    policy_loss, _, _ = apply_imagination_loss(loss_module, dream)
+
+    shifted_dream = deepcopy(dream)
+    shifted_dream.log_probs = Actions(
+        dream.log_probs.discrete,
+        dream.log_probs.continuous + 5.,
+    )
+    shifted_policy_loss, _, _ = apply_imagination_loss(loss_module, shifted_dream)
+
+    assert captured_lambdas == [1., 1.]
+    assert torch.allclose(policy_loss, shifted_policy_loss)
+
+
+def test_dreamerv3_reinforce_controls_set_targets_and_return_scale(monkeypatch):
+    discount_factor = 1. - 1. / 333.
+    model = make_tiny_world_model(
+        reinforce_discount_factor = discount_factor,
+        reinforce_gae_lambda = 0.95,
+        reinforce_return_normalization = "percentile",
+        reinforce_use_discounted_trajectory_weights = True,
+        policy_entropy_weight = 0.0003,
+    )
+
+    with torch.no_grad():
+        dream = model.generate(**generate_kwargs(time_steps = 4))
+        dream.rewards.copy_(torch.linspace(0., 3., dream.rewards.numel()).reshape_as(dream.rewards))
+        dream.values.zero_()
+
+    captured = {}
+    original_calc_gae = dreamer4_module.calc_gae
+
+    def capture_calc_gae(*args, **kwargs):
+        captured.update(gamma = kwargs["gamma"], lam = kwargs["lam"])
+        return original_calc_gae(*args, **kwargs)
+
+    monkeypatch.setattr(dreamer4_module, "calc_gae", capture_calc_gae)
+    policy_loss, value_loss, _ = apply_imagination_loss(
+        ImaginationLearningLoss(
+            model,
+            objective = "reinforce",
+            use_delight_gating = False,
+        ),
+        dream,
+    )
+
+    assert captured == {"gamma": discount_factor, "lam": 0.95}
+    assert model.reinforce_return_high > model.reinforce_return_low
+    assert model.policy_entropy_weight == 0.0003
+    assert torch.isfinite(policy_loss)
+    assert torch.isfinite(value_loss)
+
+
+def test_dreamerv3_reinforce_actor_loss_supports_squashed_gaussian():
+    model = make_tiny_world_model(
+        continuous_dist_type = "squashed_gaussian",
+        reinforce_discount_factor = 1. - 1. / 333.,
+        reinforce_gae_lambda = 0.95,
+        reinforce_return_normalization = "percentile",
+        reinforce_use_discounted_trajectory_weights = True,
+        policy_entropy_weight = 0.0003,
+    )
+
+    with torch.no_grad():
+        dream = model.generate(**generate_kwargs(time_steps = 4))
+
+    policy_loss, value_loss, _ = apply_imagination_loss(
+        ImaginationLearningLoss(
+            model,
+            objective = "reinforce",
+            use_delight_gating = False,
+        ),
+        dream,
+    )
+    (policy_loss + value_loss).backward()
+
+    assert torch.isfinite(policy_loss)
+    assert torch.isfinite(value_loss)
+    assert any(parameter.grad is not None for parameter in model.policy_head.parameters())
+
+
+def test_default_model_checkpoint_has_no_reinforce_normalizer_state():
+    baseline = make_tiny_world_model()
+    aligned = make_tiny_world_model(reinforce_return_normalization = "percentile")
+
+    assert not any(key.startswith("reinforce_return_") for key in baseline.state_dict())
+    assert "reinforce_return_low" in aligned.state_dict()
+    assert "reinforce_return_high" in aligned.state_dict()
+
+
+def test_compiled_reinforce_loss_backpropagates(reset_compile_after_test):
+    model = make_tiny_world_model()
+
+    with torch.no_grad():
+        dream = model.generate(**generate_kwargs(time_steps = 4))
+
+    loss_module = torch.compile(
+        ImaginationLearningLoss(
+            model,
+            objective = "reinforce",
+            use_delight_gating = False,
+        ),
+        backend = "eager",
+        fullgraph = False,
+        dynamic = False,
+    )
+    policy_loss, value_loss, diagnostics = apply_imagination_loss(loss_module, dream)
+    (policy_loss + value_loss).backward()
+
+    assert torch.isfinite(policy_loss)
+    assert torch.isfinite(value_loss)
+    assert torch.isfinite(diagnostics["extra/advantage_mean"])
+    assert any(parameter.grad is not None for parameter in model.policy_head.parameters())
 
 
 def test_full_transformer_finetuning_is_opt_in_and_preserves_world_model_functions():

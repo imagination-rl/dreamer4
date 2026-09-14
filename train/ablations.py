@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import traceback
+from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from multiprocessing import get_context
@@ -27,51 +28,73 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 GYM_LOG_ROOT = Path("runs/gym_imagination")
 
+# Each ablation requires seeds 4 and 42.
 ABLATIONS = [
     {
-        "run_name": "symlog_hl_gauss_value_head",
-        "run_details": "prev=old_reward_shifting[2], change=[enable smooth symlog HL-Gauss value head with raw expected-value decoding, zero initialization, and support -10 to 10]",
+        "run_name": "reinforce_baseline",
+        "run_details": "prev=[], change=[select the current REINFORCE objective]",
         "seed": 42,
-        "old_reward_shifting": False,
-        "use_symlog_hl_gauss_value_head": True,
-        "value_range": [-10.0, 10.0],
+        "objective": "reinforce",
     },
     {
-        "run_name": "symlog_hl_gauss_value_head2",
-        "run_details": "prev=old_reward_shifting[2], change=[enable smooth symlog HL-Gauss value head with raw expected-value decoding, zero initialization, and support -10 to 10]",
+        "run_name": "reinforce_baseline2",
+        "run_details": "prev=[], change=[select the current REINFORCE objective]",
         "seed": 4,
-        "old_reward_shifting": False,
-        "use_symlog_hl_gauss_value_head": True,
-        "value_range": [-10.0, 10.0],
+        "objective": "reinforce",
     },
     {
-        "run_name": "symexp_hl_gauss_actor_critic",
-        "run_details": "prev=symexp_value_head, change=[train a baseline HL-Gauss critic beside the Dreamer symexp critic and use the HL-Gauss critic for GAE and PMPO signs]",
+        "run_name": "reinforce_dreamerv3_targets",
+        "run_details": "prev=[reinforce_baseline], change=[use DreamerV3 discount 1-1/333, lambda 0.95, and percentile return-scale normalization]",
         "seed": 42,
-        "old_reward_shifting": False,
-        "use_symexp_value_head": True,
-        "use_hl_gauss_actor_critic": True,
-        "value_range": [-10.0, 10.0],
+        "objective": "reinforce",
+        "reinforce_discount_factor": 1. - 1. / 333.,
+        "reinforce_gae_lambda": 0.95,
+        "reinforce_return_normalization": "percentile",
     },
     {
-        "run_name": "symexp_hl_gauss_actor_critic2",
-        "run_details": "prev=symexp_value_head2, change=[train a baseline HL-Gauss critic beside the Dreamer symexp critic and use the HL-Gauss critic for GAE and PMPO signs]",
+        "run_name": "reinforce_dreamerv3_targets2",
+        "run_details": "prev=[reinforce_baseline2], change=[use DreamerV3 discount 1-1/333, lambda 0.95, and percentile return-scale normalization]",
         "seed": 4,
-        "old_reward_shifting": False,
-        "use_symexp_value_head": True,
-        "use_hl_gauss_actor_critic": True,
-        "value_range": [-10.0, 10.0],
+        "objective": "reinforce",
+        "reinforce_discount_factor": 1. - 1. / 333.,
+        "reinforce_gae_lambda": 0.95,
+        "reinforce_return_normalization": "percentile",
+    },
+    {
+        "run_name": "reinforce_dreamerv3_actor_loss",
+        "run_details": "prev=[reinforce_dreamerv3_targets], change=[add discounted trajectory weights, use squashed-Gaussian bounded actions, and reduce entropy weight from 0.01 to 0.0003]",
+        "seed": 42,
+        "objective": "reinforce",
+        "reinforce_discount_factor": 1. - 1. / 333.,
+        "reinforce_gae_lambda": 0.95,
+        "reinforce_return_normalization": "percentile",
+        "reinforce_use_discounted_trajectory_weights": True,
+        "continuous_dist_type": "squashed_gaussian",
+        "policy_entropy_weight": 0.0003,
+    },
+    {
+        "run_name": "reinforce_dreamerv3_actor_loss2",
+        "run_details": "prev=[reinforce_dreamerv3_targets2], change=[add discounted trajectory weights, use squashed-Gaussian bounded actions, and reduce entropy weight from 0.01 to 0.0003]",
+        "seed": 4,
+        "objective": "reinforce",
+        "reinforce_discount_factor": 1. - 1. / 333.,
+        "reinforce_gae_lambda": 0.95,
+        "reinforce_return_normalization": "percentile",
+        "reinforce_use_discounted_trajectory_weights": True,
+        "continuous_dist_type": "squashed_gaussian",
+        "policy_entropy_weight": 0.0003,
     },
 ]
 
 # This list uses 1-based indexing; it is not 0 indexed.
-ABLATIONS_TO_RUN = [1, 2]
+# Keep exactly two runs for each ablation here.
+ABLATIONS_TO_RUN = [5]
 
 
 RUN_PARALLEL = True
-MAX_PARALLEL_WORKERS: int | None = None
+MAX_PARALLEL_WORKERS: int | None = 2
 CONTINUE_ON_ERROR = False
-PARALLEL_LAUNCH_DELAY_SECONDS = 15
+PARALLEL_LAUNCH_DELAY_SECONDS = 60
 
 
 @dataclass(frozen = True)
@@ -187,6 +210,31 @@ def plan_checkpoint_folder(train_kwargs: dict[str, Any]):
     train_kwargs["checkpoint_folder"] = str(checkpoint_folder)
 
 
+def merge_small_model_config(
+    baseline: Mapping[str, Any],
+    overrides: Mapping[str, Any],
+):
+    """Merge state-only overrides without dropping unspecified defaults."""
+
+    merged = deepcopy(dict(baseline))
+    merged.update(overrides)
+
+    if "small_model" not in overrides:
+        return merged
+
+    base_small_model = baseline.get("small_model")
+    override_small_model = overrides["small_model"]
+    if not isinstance(base_small_model, Mapping):
+        raise TypeError("baseline small_model must be a mapping")
+    if not isinstance(override_small_model, Mapping):
+        raise TypeError("small_model ablation override must be a mapping")
+
+    merged_small_model = deepcopy(dict(base_small_model))
+    merged_small_model.update(override_small_model)
+    merged["small_model"] = merged_small_model
+    return merged
+
+
 def select_ablation_indices(
     ablation_count: int,
     indices: Sequence[int] | None = None,
@@ -268,8 +316,7 @@ def build_ablation_specs(
 
         label = run_name
 
-        train_kwargs = dict(baseline)
-        train_kwargs.update(overrides)
+        train_kwargs = merge_small_model_config(baseline, overrides)
         train_kwargs["run_name"] = run_name
         train_kwargs["log_dir"] = str(GYM_LOG_ROOT)
         plan_checkpoint_folder(train_kwargs)

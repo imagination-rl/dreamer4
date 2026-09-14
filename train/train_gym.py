@@ -1174,7 +1174,7 @@ def train_agent_in_imagination(
     static_generate_shape: bool,
     generate_steps: int,
     max_grad_norm: float,
-    objective: Literal["ppo", "pmpo", "spo"],
+    objective: Literal["ppo", "pmpo", "spo", "reinforce"],
     use_delight_gating: bool,
     global_step: int,
     writer: SummaryWriter | None,
@@ -1611,6 +1611,7 @@ def main(
     pretrain_world_model_finetune_steps: int,
     pretrain_world_model_combined_steps: int,
     policy_all_tokens: bool,
+    continuous_dist_type: Literal["gaussian", "squashed_gaussian", "beta"],
     world_model_batch_size: int,
     world_model_train_steps: int,
     world_model_train_sequence_length: int,
@@ -1629,10 +1630,15 @@ def main(
     agent_learning_rate: float,
     use_muon_optimizer: bool,
     optimizer_weight_decay: float,
-    objective: Literal["ppo", "pmpo", "spo"],
+    objective: Literal["ppo", "pmpo", "spo", "reinforce"],
+    reinforce_discount_factor: float,
+    reinforce_gae_lambda: float,
+    reinforce_return_normalization: Literal["none", "percentile"],
+    reinforce_use_discounted_trajectory_weights: bool,
     pmpo_pos_to_neg_weight: float,
     pmpo_kl_div_loss_weight: float,
     use_delight_gating: bool,
+    policy_entropy_weight: float,
     full_transformer_finetuning: bool,
     agent_predicts_state: bool,
     agent_state_pred_loss_weight: float,
@@ -1700,8 +1706,16 @@ def main(
     hl_gauss_actor_critic_sigma_to_bin_ratio: float = 0.75,
     hl_gauss_actor_critic_min_max_value_on_bin_center: bool = False,
     activation_memory_budget: float = 0.9,
+    small_model_only: bool = False,
+    small_model: Mapping[str, Any] | None = None,
 ):
     hyperparameters = dict(locals())
+
+    # Keep the standard Dreamer path untouched unless the explicit benchmark
+    # flag selects the state-only trainer before tokenizer setup.
+    if small_model_only:
+        from .train_model_free import run as run_state_actor_critic
+        return run_state_actor_critic(**hyperparameters)
 
     if not run_details:
         raise ValueError("run_details is required and must be non-empty")
@@ -1901,7 +1915,7 @@ def main(
         final_special_cross_attn = final_special_cross_attn,
         num_discrete_actions = 0,
         num_continuous_actions = action_dim,
-        continuous_dist_type = "beta",
+        continuous_dist_type = continuous_dist_type,
         continuous_target_action_range = action_range,
         reward_encoder_type = reward_encoder_type,
         use_symexp_value_head = use_symexp_value_head,
@@ -1920,6 +1934,10 @@ def main(
         prob_shortcut_train = prob_shortcut_train,
         policy_all_tokens = policy_all_tokens,
         gae_discount_factor = 0.99,
+        reinforce_discount_factor = reinforce_discount_factor,
+        reinforce_gae_lambda = reinforce_gae_lambda,
+        reinforce_return_normalization = reinforce_return_normalization,
+        reinforce_use_discounted_trajectory_weights = reinforce_use_discounted_trajectory_weights,
         pmpo_pos_to_neg_weight = pmpo_pos_to_neg_weight,
         pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight,
         ppo_eps_clip = 0.2,
@@ -1935,7 +1953,7 @@ def main(
         old_value_head = old_value_head,
         old_embedding_init = old_embedding_init,
         value_head_init_value = value_head_init_value,
-        policy_entropy_weight = 0.01,
+        policy_entropy_weight = policy_entropy_weight,
         use_loss_normalization = use_dynamics_loss_normalization,
         use_paper_aligned_shortcut_objective = use_paper_aligned_shortcut_objective,
         attn_heads = attn_heads,

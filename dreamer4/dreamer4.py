@@ -5492,6 +5492,10 @@ class DynamicsWorldModel(Module):
         reward_quantile_filter = (0.05, 0.95),
         gae_discount_factor = 0.997,
         gae_lambda = 0.95,
+        reinforce_discount_factor = 0.99,
+        reinforce_gae_lambda = 1.,
+        reinforce_return_normalization: Literal['none', 'percentile'] = 'none',
+        reinforce_use_discounted_trajectory_weights = False,
         ppo_eps_clip = 0.2,
         pmpo_pos_to_neg_weight = 0.5, # pos and neg equal weight
         pmpo_reverse_kl = True,
@@ -6248,6 +6252,20 @@ class DynamicsWorldModel(Module):
         self.gae_use_accelerated = gae_use_accelerated
         self.gae_discount_factor = gae_discount_factor
         self.gae_lambda = gae_lambda
+
+        if reinforce_return_normalization not in ('none', 'percentile'):
+            raise ValueError("reinforce_return_normalization must be 'none' or 'percentile'")
+
+        self.reinforce_discount_factor = reinforce_discount_factor
+        self.reinforce_gae_lambda = reinforce_gae_lambda
+        self.reinforce_return_normalization = reinforce_return_normalization
+        self.reinforce_use_discounted_trajectory_weights = reinforce_use_discounted_trajectory_weights
+        if reinforce_return_normalization == 'percentile':
+            self.register_buffer('reinforce_return_low', tensor(0.))
+            self.register_buffer('reinforce_return_high', tensor(0.))
+        else:
+            self.reinforce_return_low = None
+            self.reinforce_return_high = None
 
         self.ppo_eps_clip = ppo_eps_clip
         self.value_clip = value_clip
@@ -7071,7 +7089,7 @@ class DynamicsWorldModel(Module):
         policy_optim: Optimizer | None = None,
         value_optim: Optimizer | None = None,
         only_learn_policy_value_heads = True, # the paper's default freezes the transformer and learns only the heads
-        objective: Literal['ppo', 'pmpo', 'spo'] = 'ppo',
+        objective: Literal['ppo', 'pmpo', 'spo', 'reinforce'] = 'ppo',
         use_delight_gating = None,
         delight_temperature = None,
         normalize_advantages = None,
@@ -7145,13 +7163,16 @@ class DynamicsWorldModel(Module):
 
         # calculate returns
 
+        return_discount_factor = self.reinforce_discount_factor if objective == 'reinforce' else self.gae_discount_factor
+        return_gae_lambda = self.reinforce_gae_lambda if objective == 'reinforce' else self.gae_lambda
+
         returns = calc_gae(
             rewards,
             old_values,
             masks = gae_masks,
             learn_masks = mask,
-            gamma = self.gae_discount_factor,
-            lam = self.gae_lambda,
+            gamma = return_discount_factor,
+            lam = return_gae_lambda,
             use_accelerated = self.gae_use_accelerated
         )
 
@@ -7161,7 +7182,20 @@ class DynamicsWorldModel(Module):
 
         # maybe keep track returns statistics and normalize returns and values before calculating advantage, as done in dreamer v3
 
-        if self.keep_reward_ema_stats:
+        if objective == 'reinforce' and self.reinforce_return_normalization == 'percentile':
+            returns_for_stats = returns[mask] if exists(mask) else returns.flatten()
+            return_quantiles = torch.quantile(
+                returns_for_stats.detach().float(),
+                tensor((0.05, 0.95), device = returns.device)
+            )
+
+            with torch.no_grad():
+                self.reinforce_return_low.lerp_(return_quantiles[0], 0.01)
+                self.reinforce_return_high.lerp_(return_quantiles[1], 0.01)
+
+            return_scale = (self.reinforce_return_high - self.reinforce_return_low).clamp_min(1.)
+            advantage = (returns - old_values) / return_scale
+        elif self.keep_reward_ema_stats:
             ema_returns_mean, ema_returns_var = self.ema_returns_mean, self.ema_returns_var
 
             decay = 1. - self.reward_ema_decay
@@ -7377,6 +7411,28 @@ class DynamicsWorldModel(Module):
 
                 policy_loss = policy_loss + kl_div_loss * self.pmpo_kl_div_loss_weight
 
+        elif objective == 'reinforce':
+
+            # REINFORCE uses the current policy's joint action log probability.
+            # The configured lambda controls the reward-to-go estimate.
+            # The detached value baseline reduces variance without policy
+            # gradients through the critic.
+            policy_loss = -(log_probs * advantage.detach())
+
+            reinforce_trajectory_weights = None
+            if self.reinforce_use_discounted_trajectory_weights:
+                reinforce_trajectory_weights = self.reinforce_discount_factor ** torch.arange(
+                    log_probs.shape[1],
+                    device = log_probs.device,
+                    dtype = log_probs.dtype
+                )
+                policy_loss = policy_loss * reinforce_trajectory_weights
+
+            if use_delight_gating:
+                policy_loss = policy_loss * delight_gate
+
+            policy_loss = masked_mean(policy_loss, mask)
+
         elif objective == 'spo':
 
             # spo clipped surrogate loss
@@ -7413,6 +7469,9 @@ class DynamicsWorldModel(Module):
         # handle entropy loss for naive exploration bonus
 
         entropy_loss = - reduce(entropies, 'b t na -> b t', 'sum')
+
+        if objective == 'reinforce' and exists(reinforce_trajectory_weights):
+            entropy_loss = entropy_loss * reinforce_trajectory_weights
 
         entropy_loss = masked_mean(entropy_loss, mask)
 
