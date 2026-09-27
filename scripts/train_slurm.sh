@@ -3,8 +3,13 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+usage() {
+  echo "usage: $0 sbatch <time> -N <index[,index...]> [python args...]" >&2
+  echo "       $0 <sbatchc|srun> <time>" >&2
+}
+
 if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <sbatch|sbatchc|srun> <time> [python args...]" >&2
+  usage
   exit 2
 fi
 
@@ -13,7 +18,7 @@ TIME="$2"
 shift 2
 
 if [[ "$MODE" != "sbatch" && "$MODE" != "sbatchc" && "$MODE" != "srun" ]]; then
-  echo "usage: $0 <sbatch|sbatchc|srun> <time> [python args...]" >&2
+  usage
   exit 2
 fi
 
@@ -63,14 +68,29 @@ if [[ "$MODE" == "sbatchc" ]]; then
     -t "$TIME" \
     --nodes=1 \
     --ntasks=1 \
-    --cpus-per-task=71 \
-    --mem=110g \
+    --cpus-per-task=64 \
+    --mem=50g \
     --gpus-per-node=1 \
     --wrap "sleep $(printf '%q' "$SLEEP_SECONDS")"
 fi
 
 if [[ "$MODE" == "sbatch" ]]; then
+  if [[ "${1:-}" != "-N" || $# -lt 2 ]]; then
+    echo "sbatch requires -N <index[,index...]>" >&2
+    usage
+    exit 2
+  fi
+
+  ABLATION_INDICES="$2"
+  shift 2
+
+  if [[ ! "$ABLATION_INDICES" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+    echo "invalid ablation indices: $ABLATION_INDICES" >&2
+    exit 2
+  fi
+
   cmd="source $(printf '%q' "$HOME/lucid.sh") && python $(printf '%q' "$ROOT_DIR/train/ablations.py")"
+  cmd+=" $(printf '%q' "--ablation_indices=[$ABLATION_INDICES]")"
   for arg in "$@"; do
     cmd+=" $(printf '%q' "$arg")"
   done
@@ -82,8 +102,8 @@ if [[ "$MODE" == "sbatch" ]]; then
     -t "$TIME" \
     --nodes=1 \
     --ntasks=1 \
-    --cpus-per-task=71 \
-    --mem=110g \
+    --cpus-per-task=64 \
+    --mem=50g \
     --gpus-per-node=1 \
     --wrap "bash -lc $(printf '%q' "$cmd")"
 fi
@@ -96,8 +116,8 @@ exec srun \
   -t "$TIME" \
   --nodes=1 \
   --ntasks=1 \
-  --cpus-per-task=71 \
-  --mem=110g \
+  --cpus-per-task=64 \
+  --mem=50g \
   --gpus-per-node=1 \
   --chdir "$ROOT_DIR" \
   bash -l

@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 
+import gymnasium as gym
 import numpy as np
 import pytest
 import torch
@@ -194,6 +195,64 @@ def test_cleanrl_pmpo_ablation_flags_require_booleans():
         train_model_free.resolve_small_model_config({"cleanrl_pmpo_joint_log_prob": 1})
 
 
+def test_cleanrl_updated_ppo_uses_bounded_beta_actions_and_physical_densities():
+    torch.manual_seed(17)
+    observation_space = gym.spaces.Box(-np.inf, np.inf, shape = (4,), dtype = np.float32)
+    action_space = gym.spaces.Box(
+        low = np.array((-2., 1.), dtype = np.float32),
+        high = np.array((2., 3.), dtype = np.float32),
+    )
+    agent = train_model_free.CleanRLUpdatedPPOAgent(observation_space, action_space)
+    observations = torch.randn(8, 4)
+
+    native_actions, actions, log_probs, entropies, values = agent.sample_action_and_value(
+        observations
+    )
+    _, evaluated_log_probs, evaluated_entropies, evaluated_values = agent.get_action_and_value(
+        observations,
+        actions,
+    )
+
+    assert native_actions.shape == (8, 2)
+    assert torch.all((native_actions > 0.) & (native_actions < 1.))
+    assert torch.all(actions >= agent.action_low)
+    assert torch.all(actions <= agent.action_high)
+    assert torch.allclose(evaluated_log_probs, log_probs)
+    assert torch.allclose(evaluated_entropies, entropies)
+    assert torch.allclose(evaluated_values, values)
+
+
+def test_cleanrl_updated_ppo_gae_bootstraps_truncation_without_trace_leakage():
+    advantages, returns = train_model_free.cleanrl_updated_ppo_gae(
+        rewards = torch.tensor(((1.,), (2.,))),
+        values = torch.tensor(((10.,), (20.,))),
+        terminations = torch.zeros(2, 1),
+        truncations = torch.tensor(((1.,), (0.,))),
+        truncation_bootstrap_values = torch.tensor(((30.,), (0.,))),
+        rollout_tail_value = torch.tensor((40.,)),
+    )
+
+    assert advantages[:, 0].tolist() == pytest.approx((20.7, 21.6))
+    assert returns[:, 0].tolist() == pytest.approx((30.7, 41.6))
+
+
+def test_cleanrl_updated_ppo_accepts_current_gymnasium_final_observation_keys():
+    next_observations = np.zeros((2, 3), dtype = np.float32)
+    final_observation = np.array((1., 2., 3.), dtype = np.float32)
+
+    bootstrap = train_model_free.cleanrl_updated_ppo_bootstrap_observations(
+        next_observations,
+        np.array((True, False)),
+        {
+            "final_obs": np.array((final_observation, None), dtype = object),
+            "_final_obs": np.array((True, False)),
+        },
+    )
+
+    assert np.array_equal(bootstrap[0], final_observation)
+    assert np.array_equal(bootstrap[1], next_observations[1])
+
+
 def test_cleanrl_pmpo_constant_learning_rate_flag_disables_decay():
     initial_learning_rate = 3e-4
 
@@ -295,9 +354,20 @@ def test_cleanrl_completed_episodes_reads_current_and_legacy_vector_infos():
             None,
         ), dtype = object),
     }
+    same_step_infos = {
+        "final_info": {
+            "episode": {
+                "r": np.array((4.5, 0., 6.5)),
+                "l": np.array((200, 0, 300)),
+            },
+            "_episode": np.array((True, False, True)),
+        },
+        "_final_info": np.array((True, False, True)),
+    }
 
     assert train_model_free.cleanrl_completed_episodes(current_infos) == [(12.5, 1000), (-3., 400)]
     assert train_model_free.cleanrl_completed_episodes(legacy_infos) == [(8.5, 700)]
+    assert train_model_free.cleanrl_completed_episodes(same_step_infos) == [(4.5, 200), (6.5, 300)]
 
 
 class OneStepVectorEnv:

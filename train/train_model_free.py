@@ -38,7 +38,8 @@ import numpy as np
 import torch
 import yaml
 from torch import Tensor, nn
-from torch.distributions import Normal, kl_divergence
+from torch.distributions import Beta, Normal, kl_divergence
+from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -84,6 +85,7 @@ SMALL_MODEL_DEFAULTS = {
     "minibatch_num_envs": None,
     "observation_normalization": "fixed_random",
     "normalization_observations": 16384,
+    "cleanrl_updated_ppo": False,
     "cleanrl_pmpo": False,
     "cleanrl_pmpo_constant_learning_rate": False,
     "cleanrl_pmpo_joint_log_prob": False,
@@ -125,6 +127,7 @@ def resolve_small_model_config(config: Mapping[str, Any] | None):
         )
 
     for name in (
+        "cleanrl_updated_ppo",
         "cleanrl_pmpo",
         "cleanrl_pmpo_constant_learning_rate",
         "cleanrl_pmpo_joint_log_prob",
@@ -930,6 +933,243 @@ def cleanrl_layer_init(layer: nn.Linear, std = np.sqrt(2), bias_const = 0.):
     return layer
 
 
+# Match the algorithm defaults in CarsonBurke/cleanrl's ppo_continuous_action.py.
+CLEANRL_UPDATED_PPO_GAMMA = .99
+CLEANRL_UPDATED_PPO_GAE_LAMBDA = .95
+CLEANRL_UPDATED_PPO_NUM_MINIBATCHES = 32
+CLEANRL_UPDATED_PPO_UPDATE_EPOCHS = 10
+CLEANRL_UPDATED_PPO_CLIP_COEF = .2
+CLEANRL_UPDATED_PPO_VALUE_LOSS_WEIGHT = .5
+CLEANRL_UPDATED_PPO_ENTROPY_WEIGHT = 0.
+CLEANRL_UPDATED_PPO_MAX_GRAD_NORM = .5
+CLEANRL_UPDATED_PPO_SAMPLE_EPS = 1e-6
+
+
+class CleanRLUpdatedPPOAgent(nn.Module):
+    """The bounded-action Beta actor and critic from the updated CleanRL PPO."""
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Box,
+        action_space: gym.spaces.Box,
+    ):
+        super().__init__()
+
+        if not isinstance(observation_space, gym.spaces.Box) or len(observation_space.shape) != 1:
+            raise TypeError("CleanRL updated PPO requires a flat Box observation space")
+        if not isinstance(action_space, gym.spaces.Box):
+            raise TypeError("CleanRL updated PPO requires a Box action space")
+
+        action_low = np.asarray(action_space.low, dtype = np.float32).reshape(-1)
+        action_high = np.asarray(action_space.high, dtype = np.float32).reshape(-1)
+        if not (
+            np.isfinite(action_low).all()
+            and np.isfinite(action_high).all()
+            and np.all(action_high > action_low)
+        ):
+            raise ValueError("CleanRL updated PPO requires finite, ordered action bounds")
+
+        self.action_shape = tuple(action_space.shape)
+        self.action_dim = int(np.prod(action_space.shape))
+        observation_dim = int(np.prod(observation_space.shape))
+        self.register_buffer("action_low", torch.as_tensor(action_low))
+        self.register_buffer("action_high", torch.as_tensor(action_high))
+        self.register_buffer("action_scale", self.action_high - self.action_low)
+        self.register_buffer("log_action_scale", self.action_scale.log())
+        self.critic = nn.Sequential(
+            cleanrl_layer_init(nn.Linear(observation_dim, 64)),
+            nn.Tanh(),
+            cleanrl_layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            cleanrl_layer_init(nn.Linear(64, 1), std = 1.),
+        )
+        self.actor = nn.Sequential(
+            cleanrl_layer_init(nn.Linear(observation_dim, 64)),
+            nn.Tanh(),
+            cleanrl_layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            cleanrl_layer_init(nn.Linear(64, 2 * self.action_dim), std = .01),
+        )
+
+    def get_value(self, observations: Tensor):
+        return self.critic(observations.float())
+
+    def get_policy_and_value(self, observations: Tensor):
+        concentrations = F.softplus(self.actor(observations.float())) + 1.
+        alpha, beta = concentrations.chunk(2, dim = -1)
+        return alpha, beta, self.critic(observations.float())
+
+    def action_log_prob(self, alpha: Tensor, beta: Tensor, native_action: Tensor):
+        distribution = Beta(alpha, beta, validate_args = False)
+        return (distribution.log_prob(native_action) - self.log_action_scale).sum(dim = -1)
+
+    def sample_action_and_value(self, observations: Tensor):
+        """Sample native actions and return their physical action equivalents."""
+
+        alpha, beta, value = self.get_policy_and_value(observations)
+        distribution = Beta(alpha, beta, validate_args = False)
+        native_action = distribution.sample().clamp(
+            CLEANRL_UPDATED_PPO_SAMPLE_EPS,
+            1. - CLEANRL_UPDATED_PPO_SAMPLE_EPS,
+        )
+        action = self.action_low + self.action_scale * native_action
+        log_prob = (distribution.log_prob(native_action) - self.log_action_scale).sum(dim = -1)
+        entropy = (distribution.entropy() + self.log_action_scale).sum(dim = -1)
+        action = action.reshape((observations.shape[0],) + self.action_shape)
+        return native_action, action, log_prob, entropy, value
+
+    def get_action_and_value(self, observations: Tensor, action: Tensor | None = None):
+        """Use physical actions at this public interface."""
+
+        alpha, beta, value = self.get_policy_and_value(observations)
+        distribution = Beta(alpha, beta, validate_args = False)
+        if action is None:
+            native_action = distribution.sample().clamp(
+                CLEANRL_UPDATED_PPO_SAMPLE_EPS,
+                1. - CLEANRL_UPDATED_PPO_SAMPLE_EPS,
+            )
+            action = self.action_low + self.action_scale * native_action
+            action = action.reshape((observations.shape[0],) + self.action_shape)
+        else:
+            native_action = (
+                (action.reshape(observations.shape[0], -1) - self.action_low)
+                / self.action_scale
+            ).clamp(
+                CLEANRL_UPDATED_PPO_SAMPLE_EPS,
+                1. - CLEANRL_UPDATED_PPO_SAMPLE_EPS,
+            )
+
+        log_prob = (distribution.log_prob(native_action) - self.log_action_scale).sum(dim = -1)
+        entropy = (distribution.entropy() + self.log_action_scale).sum(dim = -1)
+        return action, log_prob, entropy, value
+
+
+def cleanrl_updated_ppo_loss(
+    agent: CleanRLUpdatedPPOAgent,
+    *,
+    observations: Tensor,
+    native_actions: Tensor,
+    old_log_probs: Tensor,
+    advantages: Tensor,
+    returns: Tensor,
+    old_values: Tensor,
+    normalize_advantages: bool = True,
+    clip_coef: float = CLEANRL_UPDATED_PPO_CLIP_COEF,
+    clip_value_loss: bool = True,
+    entropy_weight: float = CLEANRL_UPDATED_PPO_ENTROPY_WEIGHT,
+    value_loss_weight: float = CLEANRL_UPDATED_PPO_VALUE_LOSS_WEIGHT,
+):
+    """Calculate the updated CleanRL clipped PPO loss."""
+
+    alpha, beta, new_values = agent.get_policy_and_value(observations)
+    distribution = Beta(alpha, beta, validate_args = False)
+    new_log_probs = (
+        distribution.log_prob(native_actions) - agent.log_action_scale
+    ).sum(dim = -1)
+    entropy = (distribution.entropy() + agent.log_action_scale).sum(dim = -1)
+    log_ratio = new_log_probs - old_log_probs
+    ratio = log_ratio.exp()
+
+    with torch.no_grad():
+        old_approx_kl = (-log_ratio).mean()
+        approx_kl = ((ratio - 1.) - log_ratio).mean()
+        clip_fraction = ((ratio - 1.).abs() > clip_coef).float().mean()
+
+    if normalize_advantages:
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    policy_loss_unclipped = -advantages * ratio
+    policy_loss_clipped = -advantages * ratio.clamp(1. - clip_coef, 1. + clip_coef)
+    policy_loss = torch.maximum(policy_loss_unclipped, policy_loss_clipped).mean()
+
+    new_values = new_values.view(-1)
+    if clip_value_loss:
+        value_loss_unclipped = (new_values - returns).square()
+        clipped_values = old_values + (new_values - old_values).clamp(-clip_coef, clip_coef)
+        value_loss_clipped = (clipped_values - returns).square()
+        value_loss = .5 * torch.maximum(value_loss_unclipped, value_loss_clipped).mean()
+    else:
+        value_loss = .5 * (new_values - returns).square().mean()
+
+    entropy_value = entropy.mean()
+    loss = policy_loss - entropy_weight * entropy_value + value_loss_weight * value_loss
+    metrics = torch.stack((
+        policy_loss.detach(),
+        value_loss.detach(),
+        entropy_value.detach(),
+        old_approx_kl,
+        approx_kl,
+        clip_fraction,
+    ))
+    return loss, metrics
+
+
+def cleanrl_updated_ppo_gae(
+    rewards: Tensor,
+    values: Tensor,
+    terminations: Tensor,
+    truncations: Tensor,
+    truncation_bootstrap_values: Tensor,
+    rollout_tail_value: Tensor,
+    *,
+    gamma: float = CLEANRL_UPDATED_PPO_GAMMA,
+    gae_lambda: float = CLEANRL_UPDATED_PPO_GAE_LAMBDA,
+):
+    """Calculate GAE with separate bootstrap and trace boundary rules."""
+
+    advantages = torch.zeros_like(rewards)
+    last_advantage = torch.zeros_like(rollout_tail_value)
+    for step in reversed(range(rewards.shape[0])):
+        ordinary_next_value = (
+            rollout_tail_value
+            if step == rewards.shape[0] - 1
+            else values[step + 1]
+        )
+        next_value = torch.where(
+            truncations[step].bool(),
+            truncation_bootstrap_values[step],
+            ordinary_next_value,
+        )
+        bootstrap_nonterminal = 1. - terminations[step]
+        trace_nonterminal = 1. - torch.maximum(
+            terminations[step],
+            truncations[step],
+        )
+        delta = rewards[step] + gamma * bootstrap_nonterminal * next_value - values[step]
+        last_advantage = delta + gamma * gae_lambda * trace_nonterminal * last_advantage
+        advantages[step] = last_advantage
+
+    return advantages, advantages + values
+
+
+def cleanrl_updated_ppo_bootstrap_observations(
+    next_observations: np.ndarray,
+    truncations: np.ndarray,
+    infos: Mapping[str, Any],
+):
+    """Replace autoreset observations with final observations at time limits."""
+
+    bootstrap_observations = np.array(next_observations, copy = True)
+    truncations = np.asarray(truncations, dtype = bool)
+    if not np.any(truncations):
+        return bootstrap_observations
+
+    final_observations = infos.get("final_observation", infos.get("final_obs"))
+    final_mask = infos.get("_final_observation", infos.get("_final_obs"))
+    if final_observations is None:
+        raise RuntimeError("truncated transition lacks infos['final_observation']")
+
+    for env_index in np.flatnonzero(truncations):
+        if final_mask is not None and not final_mask[env_index]:
+            raise RuntimeError(f"truncated environment {env_index} lacks a final observation")
+        final_observation = final_observations[env_index]
+        if final_observation is None:
+            raise RuntimeError(f"truncated environment {env_index} lacks a final observation")
+        bootstrap_observations[env_index] = final_observation
+
+    return bootstrap_observations
+
+
 class CleanRLPmpoAgent(nn.Module):
     """The actor and critic architecture from CleanRL PMPO v3."""
 
@@ -1001,6 +1241,23 @@ class CleanRLPmpoAgent(nn.Module):
         )
 
 
+def make_cleanrl_updated_ppo_env(env_name: str, gamma: float):
+    """Build the standard CleanRL continuous-control wrapper sequence."""
+
+    env = gym.make(env_name)
+    env = gym.wrappers.FlattenObservation(env)
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+    # The Beta policy enforces bounds. Keep the physical space visible to the actor.
+    env = gym.wrappers.NormalizeObservation(env)
+    env = gym.wrappers.TransformObservation(
+        env,
+        lambda observations: np.clip(observations, -10., 10.),
+        observation_space = env.observation_space,
+    )
+    env = gym.wrappers.NormalizeReward(env, gamma = gamma)
+    return gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10., 10.))
+
+
 def make_cleanrl_pmpo_env(env_name: str, gamma: float):
     """Build the exact wrapper sequence used by CleanRL PMPO v3."""
 
@@ -1023,7 +1280,24 @@ def cleanrl_completed_episodes(infos: Mapping[str, Any]):
 
     completed = []
     final_infos = infos.get("final_info")
-    if final_infos is not None:
+    if isinstance(final_infos, Mapping):
+        episode = final_infos.get("episode")
+        if isinstance(episode, Mapping):
+            returns = np.asarray(episode["r"]).reshape(-1)
+            lengths = np.asarray(episode["l"]).reshape(-1)
+            mask = final_infos.get("_episode", infos.get("_final_info"))
+            if mask is None:
+                mask = episode.get("_r")
+            if mask is None:
+                mask = np.ones_like(returns, dtype = bool)
+            mask = np.asarray(mask, dtype = bool).reshape(-1)
+            if not (returns.shape == lengths.shape == mask.shape):
+                raise ValueError("Gymnasium final episode statistics have inconsistent shapes")
+            completed.extend(
+                (float(return_), int(length))
+                for return_, length in zip(returns[mask], lengths[mask])
+            )
+    elif final_infos is not None:
         for final_info in np.asarray(final_infos, dtype = object).reshape(-1):
             if not isinstance(final_info, Mapping):
                 continue
@@ -1208,6 +1482,316 @@ def cleanrl_pmpo_learning_rate(
     if constant:
         return initial_learning_rate
     return (1. - loop / num_loops) * initial_learning_rate
+
+
+def run_cleanrl_updated_ppo(*, config: Mapping[str, Any]):
+    """Run updated CleanRL PPO behind an explicit small-model flag."""
+
+    if config["objective"] != "ppo":
+        raise ValueError("small_model.cleanrl_updated_ppo requires objective='ppo'")
+    if config["checkpoint_path"]:
+        raise ValueError("small_model.cleanrl_updated_ppo does not support checkpoint resume")
+    if config["checkpoint_every"] > 0:
+        raise ValueError("small_model.cleanrl_updated_ppo requires checkpoint_every=0")
+    if config["clear_log_dir"]:
+        raise ValueError("small_model.cleanrl_updated_ppo does not support clear_log_dir")
+    if config["rollouts_per_loop"] != 1:
+        raise ValueError("small_model.cleanrl_updated_ppo requires rollouts_per_loop=1")
+
+    env_name = config["env_name"]
+    seed = config["seed"]
+    num_loops = config["num_loops"]
+    num_envs = config["num_envs"]
+    num_steps = config["max_timesteps"]
+    device = torch.device("cpu" if config["cpu"] or not torch.cuda.is_available() else "cuda")
+
+    if config["require_cuda"] and device.type != "cuda":
+        raise RuntimeError("CUDA was required for this run, but no CUDA device is available")
+    if min(num_loops, num_envs, num_steps) <= 0:
+        raise ValueError("loop, environment, and rollout step counts must be positive")
+
+    batch_size = num_envs * num_steps
+    minibatch_size = batch_size // CLEANRL_UPDATED_PPO_NUM_MINIBATCHES
+    if minibatch_size == 0:
+        raise ValueError(
+            "small_model.cleanrl_updated_ppo requires num_envs * max_timesteps to be at least 32"
+        )
+    if minibatch_size < 2 or batch_size % minibatch_size == 1:
+        raise ValueError(
+            "small_model.cleanrl_updated_ppo requires at least two samples in each minibatch"
+        )
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+    run_log_dir = train_gym.resolve_log_dir(
+        config["log_dir"],
+        run_name = config["run_name"],
+        checkpoint_path = None,
+        unique_log_dir = config["unique_log_dir"],
+        checkpoint_folder = None,
+    )
+    if run_log_dir.exists():
+        raise FileExistsError(
+            f"run directory already exists for run_name={config['run_name']!r}: {run_log_dir}"
+        )
+
+    envs = gym.vector.SyncVectorEnv(
+        [
+            lambda: make_cleanrl_updated_ppo_env(
+                env_name,
+                gamma = CLEANRL_UPDATED_PPO_GAMMA,
+            )
+            for _ in range(num_envs)
+        ],
+        autoreset_mode = gym.vector.AutoresetMode.SAME_STEP,
+    )
+    writer = SummaryWriter(str(run_log_dir)) if config["use_tensorboard"] else None
+
+    try:
+        if exists(writer):
+            writer.add_text("run/details", config["run_details"], 0)
+            writer.add_text(
+                "run/hyperparameters",
+                train_gym.serialize_hyperparameters(dict(config)),
+                0,
+            )
+            writer.add_text(
+                "run/policy",
+                "Beta: alpha,beta=1+softplus(head); FP32; native-action storage",
+                0,
+            )
+
+        observation_space = envs.single_observation_space
+        action_space = envs.single_action_space
+        agent = CleanRLUpdatedPPOAgent(observation_space, action_space).to(device)
+        optimizer = Adam(
+            agent.parameters(),
+            lr = config["agent_learning_rate"],
+            eps = 1e-5,
+            fused = device.type == "cuda",
+        )
+
+        observation_shape = observation_space.shape
+        native_action_shape = (agent.action_dim,)
+        observations = torch.zeros(
+            (num_steps, num_envs, *observation_shape),
+            device = device,
+        )
+        native_actions = torch.zeros(
+            (num_steps, num_envs, *native_action_shape),
+            device = device,
+        )
+        old_log_probs = torch.zeros((num_steps, num_envs), device = device)
+        rewards = torch.zeros((num_steps, num_envs), device = device)
+        terminations = torch.zeros((num_steps, num_envs), device = device)
+        truncations = torch.zeros((num_steps, num_envs), device = device)
+        truncation_bootstrap_values = torch.zeros(
+            (num_steps, num_envs),
+            device = device,
+        )
+        values = torch.zeros((num_steps, num_envs), device = device)
+        next_observations, _ = envs.reset(seed = seed)
+        next_observations = torch.as_tensor(
+            next_observations,
+            device = device,
+            dtype = torch.float32,
+        )
+        shuffle_generator = torch.Generator(device = device).manual_seed(seed)
+        env_step = 0
+        start_time = perf_counter()
+
+        pbar = tqdm(range(num_loops), desc = "CleanRL updated PPO", dynamic_ncols = True)
+        for loop in pbar:
+            learning_rate = cleanrl_pmpo_learning_rate(
+                config["agent_learning_rate"],
+                loop,
+                num_loops,
+            )
+            optimizer.param_groups[0]["lr"] = learning_rate
+            rollout_start = perf_counter()
+            rollout_environment_seconds = 0.
+            rollout_returns = []
+            rollout_lengths = []
+
+            for step in range(num_steps):
+                env_step += num_envs
+                observations[step] = next_observations
+
+                with torch.no_grad():
+                    native_action, action, log_prob, _, value = agent.sample_action_and_value(
+                        next_observations
+                    )
+                    native_actions[step] = native_action
+                    old_log_probs[step] = log_prob
+                    values[step] = value.flatten()
+
+                if not torch.isfinite(action).all():
+                    raise FloatingPointError("policy produced nonfinite actions")
+
+                environment_step_start = perf_counter()
+                (
+                    raw_next_observations,
+                    reward,
+                    terminated,
+                    truncated,
+                    infos,
+                ) = envs.step(action.cpu().numpy())
+                rollout_environment_seconds += perf_counter() - environment_step_start
+
+                terminated_tensor = torch.as_tensor(
+                    terminated,
+                    device = device,
+                    dtype = torch.float32,
+                )
+                truncated_tensor = torch.as_tensor(
+                    truncated,
+                    device = device,
+                    dtype = torch.float32,
+                )
+                terminations[step] = terminated_tensor
+                truncations[step] = truncated_tensor
+                rewards[step] = torch.as_tensor(
+                    reward,
+                    device = device,
+                    dtype = torch.float32,
+                ).view(-1)
+
+                if np.any(truncated):
+                    bootstrap_observations = cleanrl_updated_ppo_bootstrap_observations(
+                        raw_next_observations,
+                        truncated,
+                        infos,
+                    )
+                    bootstrap_observations = torch.as_tensor(
+                        bootstrap_observations,
+                        device = device,
+                        dtype = torch.float32,
+                    )
+                    with torch.no_grad():
+                        bootstrap_values = agent.get_value(bootstrap_observations).flatten()
+                    truncation_bootstrap_values[step] = torch.where(
+                        truncated_tensor.bool(),
+                        bootstrap_values,
+                        torch.zeros_like(bootstrap_values),
+                    )
+                else:
+                    truncation_bootstrap_values[step].zero_()
+
+                next_observations = torch.as_tensor(
+                    raw_next_observations,
+                    device = device,
+                    dtype = torch.float32,
+                )
+                for episode_return, episode_length in cleanrl_completed_episodes(infos):
+                    rollout_returns.append(episode_return)
+                    rollout_lengths.append(episode_length)
+                    train_gym.log_scalars(writer, {
+                        "charts/episodic_return": episode_return,
+                        "charts/episodic_length": episode_length,
+                    }, env_step)
+
+            rollout_total_seconds = perf_counter() - rollout_start
+            with torch.no_grad():
+                rollout_tail_value = agent.get_value(next_observations).flatten()
+                advantages, returns = cleanrl_updated_ppo_gae(
+                    rewards,
+                    values,
+                    terminations,
+                    truncations,
+                    truncation_bootstrap_values,
+                    rollout_tail_value,
+                )
+
+            batch_observations = observations.flatten(0, 1)
+            batch_native_actions = native_actions.flatten(0, 1)
+            batch_old_log_probs = old_log_probs.flatten()
+            batch_advantages = advantages.flatten()
+            batch_returns = returns.flatten()
+            batch_values = values.flatten()
+            last_update_metrics = None
+            clip_fractions = []
+            grad_norm = float("nan")
+
+            for _ in range(CLEANRL_UPDATED_PPO_UPDATE_EPOCHS):
+                indices = torch.randperm(
+                    batch_size,
+                    device = device,
+                    generator = shuffle_generator,
+                )
+                for start in range(0, batch_size, minibatch_size):
+                    minibatch_indices = indices[start:start + minibatch_size]
+                    loss, update_metrics = cleanrl_updated_ppo_loss(
+                        agent,
+                        observations = batch_observations[minibatch_indices],
+                        native_actions = batch_native_actions[minibatch_indices],
+                        old_log_probs = batch_old_log_probs[minibatch_indices],
+                        advantages = batch_advantages[minibatch_indices],
+                        returns = batch_returns[minibatch_indices],
+                        old_values = batch_values[minibatch_indices],
+                    )
+                    optimizer.zero_grad(set_to_none = True)
+                    loss.backward()
+                    grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                        agent.parameters(),
+                        CLEANRL_UPDATED_PPO_MAX_GRAD_NORM,
+                    ))
+                    optimizer.step()
+                    last_update_metrics = update_metrics
+                    clip_fractions.append(update_metrics[5])
+
+            if last_update_metrics is None:
+                raise RuntimeError("CleanRL updated PPO completed no optimizer updates")
+
+            target_variance = torch.var(batch_returns, correction = 0)
+            explained_variance = (
+                float("nan")
+                if target_variance == 0.
+                else 1. - torch.var(
+                    batch_returns - batch_values,
+                    correction = 0,
+                ).div(target_variance).item()
+            )
+            metrics = {
+                "charts/learning_rate": learning_rate,
+                "charts/SPS": env_step / max(perf_counter() - start_time, 1e-6),
+                "rollout/average_return": float(np.mean(rollout_returns)) if rollout_returns else None,
+                "rollout/average_length": float(np.mean(rollout_lengths)) if rollout_lengths else None,
+                "timings/rollout_environment_seconds": rollout_environment_seconds,
+                "timings/rollout_total_seconds": rollout_total_seconds,
+                "cleanrl_updated_ppo/loss": (
+                    last_update_metrics[0]
+                    + CLEANRL_UPDATED_PPO_VALUE_LOSS_WEIGHT * last_update_metrics[1]
+                ).item(),
+                "cleanrl_updated_ppo/policy_loss": last_update_metrics[0].item(),
+                "cleanrl_updated_ppo/value_loss": last_update_metrics[1].item(),
+                "cleanrl_updated_ppo/entropy": last_update_metrics[2].item(),
+                "cleanrl_updated_ppo/old_approx_kl": last_update_metrics[3].item(),
+                "cleanrl_updated_ppo/approx_kl": last_update_metrics[4].item(),
+                "cleanrl_updated_ppo/clip_fraction": torch.stack(clip_fractions).mean().item(),
+                "cleanrl_updated_ppo/explained_variance": explained_variance,
+                "cleanrl_updated_ppo/grad_norm": grad_norm,
+            }
+            finite_metrics = (
+                value
+                for name, value in metrics.items()
+                if value is not None and name != "cleanrl_updated_ppo/explained_variance"
+            )
+            if any(not np.isfinite(value) for value in finite_metrics):
+                raise FloatingPointError("nonfinite CleanRL updated PPO learner metrics")
+
+            train_gym.log_scalars(writer, metrics, env_step)
+            pbar.set_postfix(
+                return_ = f"{np.mean(rollout_returns):.1f}" if rollout_returns else "n/a",
+                loss = f"{metrics['cleanrl_updated_ppo/loss']:.3f}",
+            )
+    finally:
+        envs.close()
+        if exists(writer):
+            writer.flush()
+            writer.close()
 
 
 def run_cleanrl_pmpo(*, config: Mapping[str, Any]):
@@ -1441,7 +2025,17 @@ def run_cleanrl_pmpo(*, config: Mapping[str, Any]):
 def run(**config):
     """Run the small benchmark from a full Gym configuration mapping."""
 
+    train_gym.configure_matmul_precision(
+        config.get("allow_tf32", True),
+        torch.device("cpu" if config["cpu"] or not torch.cuda.is_available() else "cuda"),
+    )
     small_config = resolve_small_model_config(config.get("small_model"))
+    if small_config["cleanrl_updated_ppo"] and small_config["cleanrl_pmpo"]:
+        raise ValueError(
+            "small_model.cleanrl_updated_ppo and small_model.cleanrl_pmpo are mutually exclusive"
+        )
+    if small_config["cleanrl_updated_ppo"]:
+        return run_cleanrl_updated_ppo(config = config)
     if small_config["cleanrl_pmpo"]:
         return run_cleanrl_pmpo(config = config)
 

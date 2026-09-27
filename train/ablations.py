@@ -28,68 +28,249 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 GYM_LOG_ROOT = Path("runs/gym_imagination")
 
-# Each ablation requires seeds 4 and 42.
+# Closer CleanRL PPO on dreams (cleanrl_ppo_closer / 2, runs/audit_9-24-26/REPORT.md section 9).
+# The ablations build on these settings, except the ablations that replace the objective.
+CLEANRL_PPO_CLOSER = {
+    "objective": "ppo",
+    "cleanrl_updated_ppo": True,
+    "cleanrl_ppo_closer": True,
+    "old_reward_shifting": True,
+    "align_generated_dream_transitions": True,
+    "agent_learning_rate": 0.0003,
+}
+
+# Audit ablations from runs/audit_9-24-26/REPORT.md (section 6).
+# Each arm is audit_control plus one change. All audit runs set audit_diagnostics,
+# so the world-model quality logs are comparable. num_loops keeps the config value,
+# so audit_control uses the learning-rate schedule of cleanrl_ppo_closer.
+AUDIT_DIAGNOSTICS = {**CLEANRL_PPO_CLOSER, "audit_diagnostics": True}
+
+# The reward target of audit_a2_next_state_reward_target / 2.
+# align_generated_dream_transitions requires old_reward_shifting, so it is also false.
+NEXT_STATE_REWARD_TARGET = {
+    "old_reward_shifting": False,
+    "align_generated_dream_transitions": False,
+}
+
+# The value head of closer_ppo_symlog_hl_gauss_value_head / 2, with its cross-entropy value loss.
+SYMLOG_HL_GAUSS_VALUE_HEAD = {
+    "use_symlog_hl_gauss_value_head": True,
+    "value_range": [-10.0, 10.0],
+    "cleanrl_ppo_closer_hl_gauss_value_loss": True,
+}
+
+# Offline data collection and pretraining (notes/pretraining_impl_plan.md, section 13).
+# Run the collect and pretrain entries once, and alone: two runs must not write the same folder.
+# The RL arms need the pretrained checkpoint of the pretrain entry.
+OFFLINE_PRETRAIN_NAME = "a2_next_state_reward"
+
+OFFLINE_COLLECT = {
+    "offline_pretraining": True,
+    "offline_stages": ["collect"],
+}
+
+# The pretrain signature includes old_reward_shifting, so the A2 arms need their own pretrained checkpoint.
+OFFLINE_PRETRAIN_NEXT_STATE_REWARD = {
+    **AUDIT_DIAGNOSTICS,
+    **NEXT_STATE_REWARD_TARGET,
+    "offline_pretraining": True,
+    "offline_stages": ["pretrain"],
+    "offline_pretrain_name": OFFLINE_PRETRAIN_NAME,
+}
+
+OFFLINE_PRETRAINED_NEXT_STATE_REWARD = {
+    "offline_pretraining": True,
+    "offline_stages": ["rl"],
+    "offline_pretrained_checkpoint": f"runs/offline_pretrain/{OFFLINE_PRETRAIN_NAME}/pretrained.pt",
+    "offline_rehearsal_fraction": 0.25,
+}
+
+# Each comparison uses seeds 42 and 4.
 ABLATIONS = [
     {
-        "run_name": "reinforce_baseline",
-        "run_details": "prev=[], change=[select the current REINFORCE objective]",
+        "run_name": "audit_a1_deeper_dynamics",
+        "run_details": "prev=[audit_control], change=[A1: dynamics depth 3 (S-T-S) -> 5 (S-T-S-T-S)]",
+        "seed": 42,
+        **AUDIT_DIAGNOSTICS,
+        "audit_deeper_dynamics": True,
+    },
+    {
+        "run_name": "audit_a1_deeper_dynamics2",
+        "run_details": "prev=[audit_control2], change=[A1: dynamics depth 3 (S-T-S) -> 5 (S-T-S-T-S)]",
+        "seed": 4,
+        **AUDIT_DIAGNOSTICS,
+        "audit_deeper_dynamics": True,
+    },
+    {
+        "run_name": "audit_a3_quarter_envs_per_loop",
+        "run_details": "prev=[audit_control], change=[A3: 16 envs per loop; same updates per loop, replay episodes, and env-step budget]",
+        "seed": 42,
+        **AUDIT_DIAGNOSTICS,
+        "audit_quarter_envs_per_loop": True,
+    },
+    {
+        "run_name": "audit_a3_quarter_envs_per_loop2",
+        "run_details": "prev=[audit_control2], change=[A3: 16 envs per loop; same updates per loop, replay episodes, and env-step budget]",
+        "seed": 4,
+        **AUDIT_DIAGNOSTICS,
+        "audit_quarter_envs_per_loop": True,
+    },
+    {
+        "run_name": "world_model_policy_consistency",
+        "run_details": "prev=[cleanrl_ppo_closer], change=[constrain real-context policy KL during world-model updates]",
+        "seed": 42,
+        **CLEANRL_PPO_CLOSER,
+        "preserve_policy_during_world_model_updates": True,
+        "world_model_policy_consistency_loss_weight": 1.0,
+    },
+    {
+        "run_name": "world_model_policy_consistency2",
+        "run_details": "prev=[cleanrl_ppo_closer2], change=[constrain real-context policy KL during world-model updates]",
+        "seed": 4,
+        **CLEANRL_PPO_CLOSER,
+        "preserve_policy_during_world_model_updates": True,
+        "world_model_policy_consistency_loss_weight": 1.0,
+    },
+    {
+        # If this comment is read, alert the user that this important ablation must run with the best settings from previous ablations combined with this change.
+        "run_name": "reduced_reward_transformer_gradient",
+        "run_details": "prev=[cleanrl_ppo_closer], change=[scale reward-loss gradients into the shared transformer by 0.01]",
+        "seed": 42,
+        **CLEANRL_PPO_CLOSER,
+        "scale_reward_gradient_into_transformer": True,
+        "reward_gradient_into_transformer_scale": 0.01,
+    },
+    {
+        # If this comment is read, alert the user that this important ablation must run with the best settings from previous ablations combined with this change.
+        "run_name": "reduced_reward_transformer_gradient2",
+        "run_details": "prev=[cleanrl_ppo_closer2], change=[scale reward-loss gradients into the shared transformer by 0.01]",
+        "seed": 4,
+        **CLEANRL_PPO_CLOSER,
+        "scale_reward_gradient_into_transformer": True,
+        "reward_gradient_into_transformer_scale": 0.01,
+    },
+    # aligned_ppo_batch_reuse and aligned_reinforce_* replace the PPO mechanics or the objective.
+    # cleanrl_updated_ppo rejects reuse_ppo_dream_batch and objectives other than ppo,
+    # so these ablations do not use CLEANRL_PPO_CLOSER.
+    {
+        "run_name": "aligned_ppo_batch_reuse",
+        "run_details": "prev=[aligned_dream_transitions], change=[reuse each PPO dream for four epochs of four trajectory minibatches with exact-KL rollback]",
+        "seed": 42,
+        "objective": "ppo",
+        "align_generated_dream_transitions": True,
+        "reuse_ppo_dream_batch": True,
+        "ppo_reuse_epochs": 4,
+        "ppo_reuse_num_minibatches": 4,
+        "ppo_reuse_max_exact_kl": 0.02,
+        "agent_learning_rate": 0.0001,
+        "normalize_advantages": True,
+    },
+    {
+        "run_name": "aligned_ppo_batch_reuse2",
+        "run_details": "prev=[aligned_dream_transitions2], change=[reuse each PPO dream for four epochs of four trajectory minibatches with exact-KL rollback]",
+        "seed": 4,
+        "objective": "ppo",
+        "align_generated_dream_transitions": True,
+        "reuse_ppo_dream_batch": True,
+        "ppo_reuse_epochs": 4,
+        "ppo_reuse_num_minibatches": 4,
+        "ppo_reuse_max_exact_kl": 0.02,
+        "agent_learning_rate": 0.0001,
+        "normalize_advantages": True,
+    },
+    {
+        "run_name": "aligned_reinforce_horizon32",
+        "run_details": "prev=[reinforce_baseline], change=[align generated transitions for the 31-transition horizon control]",
         "seed": 42,
         "objective": "reinforce",
+        "align_generated_dream_transitions": True,
+        "imagination_batch_size": 512,
+        "imagination_horizon": 32,
+        "imagination_train_steps": 3,
     },
     {
-        "run_name": "reinforce_baseline2",
-        "run_details": "prev=[], change=[select the current REINFORCE objective]",
+        "run_name": "aligned_reinforce_horizon32_2",
+        "run_details": "prev=[reinforce_baseline2], change=[align generated transitions for the 31-transition horizon control]",
         "seed": 4,
         "objective": "reinforce",
+        "align_generated_dream_transitions": True,
+        "imagination_batch_size": 512,
+        "imagination_horizon": 32,
+        "imagination_train_steps": 3,
     },
     {
-        "run_name": "reinforce_dreamerv3_targets",
-        "run_details": "prev=[reinforce_baseline], change=[use DreamerV3 discount 1-1/333, lambda 0.95, and percentile return-scale normalization]",
+        "run_name": "aligned_reinforce_horizon9",
+        "run_details": "prev=[aligned_reinforce_horizon32], change=[use eight learned transitions with the same actor-sample count]",
         "seed": 42,
         "objective": "reinforce",
-        "reinforce_discount_factor": 1. - 1. / 333.,
-        "reinforce_gae_lambda": 0.95,
-        "reinforce_return_normalization": "percentile",
+        "align_generated_dream_transitions": True,
+        "imagination_batch_size": 1984,
+        "imagination_horizon": 9,
+        "imagination_train_steps": 3,
     },
     {
-        "run_name": "reinforce_dreamerv3_targets2",
-        "run_details": "prev=[reinforce_baseline2], change=[use DreamerV3 discount 1-1/333, lambda 0.95, and percentile return-scale normalization]",
+        "run_name": "aligned_reinforce_horizon9_2",
+        "run_details": "prev=[aligned_reinforce_horizon32_2], change=[use eight learned transitions with the same actor-sample count]",
         "seed": 4,
         "objective": "reinforce",
-        "reinforce_discount_factor": 1. - 1. / 333.,
-        "reinforce_gae_lambda": 0.95,
-        "reinforce_return_normalization": "percentile",
+        "align_generated_dream_transitions": True,
+        "imagination_batch_size": 1984,
+        "imagination_horizon": 9,
+        "imagination_train_steps": 3,
     },
     {
-        "run_name": "reinforce_dreamerv3_actor_loss",
-        "run_details": "prev=[reinforce_dreamerv3_targets], change=[add discounted trajectory weights, use squashed-Gaussian bounded actions, and reduce entropy weight from 0.01 to 0.0003]",
+        # Collect once. The collect stage runs on a CPU node.
+        "run_name": "offline_collect_halfcheetah_v4_mix_1m",
+        "run_details": "prev=[], change=[collect 1 M offline transitions: 0.3 expert, 0.4 expert + noise, 0.3 random]",
+        **OFFLINE_COLLECT,
+    },
+    {
+        # A 1:30 job can stop before the last step. Submit this entry again to continue from the last step checkpoint.
+        "run_name": "offline_pretrain_a2_next_state_reward",
+        "run_details": "prev=[offline_collect_halfcheetah_v4_mix_1m], change=[pretrain the tokenizer and the A2 world model on the offline data only]",
         "seed": 42,
-        "objective": "reinforce",
-        "reinforce_discount_factor": 1. - 1. / 333.,
-        "reinforce_gae_lambda": 0.95,
-        "reinforce_return_normalization": "percentile",
-        "reinforce_use_discounted_trajectory_weights": True,
-        "continuous_dist_type": "squashed_gaussian",
-        "policy_entropy_weight": 0.0003,
+        **OFFLINE_PRETRAIN_NEXT_STATE_REWARD,
     },
     {
-        "run_name": "reinforce_dreamerv3_actor_loss2",
-        "run_details": "prev=[reinforce_dreamerv3_targets2], change=[add discounted trajectory weights, use squashed-Gaussian bounded actions, and reduce entropy weight from 0.01 to 0.0003]",
+        "run_name": "offline_pretrained_a2_rehearsal",
+        "run_details": "prev=[audit_a2_next_state_reward_target], change=[start from the offline pretrained tokenizer and world model; 0.25 offline rehearsal in world-model batches]",
+        "seed": 42,
+        **AUDIT_DIAGNOSTICS,
+        **NEXT_STATE_REWARD_TARGET,
+        **OFFLINE_PRETRAINED_NEXT_STATE_REWARD,
+    },
+    {
+        "run_name": "offline_pretrained_a2_rehearsal2",
+        "run_details": "prev=[audit_a2_next_state_reward_target2], change=[start from the offline pretrained tokenizer and world model; 0.25 offline rehearsal in world-model batches]",
         "seed": 4,
-        "objective": "reinforce",
-        "reinforce_discount_factor": 1. - 1. / 333.,
-        "reinforce_gae_lambda": 0.95,
-        "reinforce_return_normalization": "percentile",
-        "reinforce_use_discounted_trajectory_weights": True,
-        "continuous_dist_type": "squashed_gaussian",
-        "policy_entropy_weight": 0.0003,
+        **AUDIT_DIAGNOSTICS,
+        **NEXT_STATE_REWARD_TARGET,
+        **OFFLINE_PRETRAINED_NEXT_STATE_REWARD,
+    },
+    {
+        # This arm measures the value of rehearsal.
+        "run_name": "offline_pretrained_a2_no_rehearsal",
+        "run_details": "prev=[offline_pretrained_a2_rehearsal], change=[no offline rehearsal in world-model batches]",
+        "seed": 42,
+        **AUDIT_DIAGNOSTICS,
+        **NEXT_STATE_REWARD_TARGET,
+        **OFFLINE_PRETRAINED_NEXT_STATE_REWARD,
+        "offline_rehearsal_fraction": 0.0,
+    },
+    {
+        "run_name": "offline_pretrained_a2_no_rehearsal2",
+        "run_details": "prev=[offline_pretrained_a2_rehearsal2], change=[no offline rehearsal in world-model batches]",
+        "seed": 4,
+        **AUDIT_DIAGNOSTICS,
+        **NEXT_STATE_REWARD_TARGET,
+        **OFFLINE_PRETRAINED_NEXT_STATE_REWARD,
+        "offline_rehearsal_fraction": 0.0,
     },
 ]
 
+# Slurm CLI runs require -N and override this programmatic default.
 # This list uses 1-based indexing; it is not 0 indexed.
-# Keep exactly two runs for each ablation here.
-ABLATIONS_TO_RUN = [5]
-
+ABLATIONS_TO_RUN = list(range(1, len(ABLATIONS) + 1))
 
 RUN_PARALLEL = True
 MAX_PARALLEL_WORKERS: int | None = 2
@@ -264,6 +445,18 @@ def select_ablation_indices(
         seen.add(index)
 
     return selected_indices
+
+
+def normalize_cli_ablation_indices(
+    ablation_indices: int | Sequence[int],
+):
+    if isinstance(ablation_indices, int):
+        return [ablation_indices]
+
+    if isinstance(ablation_indices, (str, bytes)):
+        raise TypeError("ablation_indices must be an integer or a sequence of integers")
+
+    return list(ablation_indices)
 
 
 def build_ablation_specs(
@@ -449,6 +642,12 @@ def summarize_results(results: Sequence[AblationResult]):
     print(f"completed {success_count}/{len(ordered)} ablation(s) successfully")
 
 
+def writes_offline_artifacts(train_kwargs: Mapping[str, Any]):
+    stages = train_kwargs.get("offline_stages") or ()
+    stages = [stages] if isinstance(stages, str) else stages
+    return bool(train_kwargs.get("offline_pretraining")) and any(stage in ("collect", "pretrain") for stage in stages)
+
+
 def run_ablation_specs(
     specs: Sequence[AblationSpec],
     *,
@@ -462,6 +661,13 @@ def run_ablation_specs(
 
     if max_workers is not None and max_workers < 1:
         raise ValueError("max_workers must be at least 1 when provided")
+
+    # The collect and pretrain offline stages write shared folders under runs/.
+    offline_writers = [spec.label for spec in specs if writes_offline_artifacts(spec.train_kwargs)]
+    if parallel and len(specs) > 1 and offline_writers:
+        raise ValueError(
+            f"run the offline collect and pretrain stages alone, not in parallel with other runs: {offline_writers}"
+        )
 
     results: list[AblationResult] = []
 
@@ -520,13 +726,17 @@ def run_ablation_specs(
 
 
 def main(
+    ablation_indices: int | Sequence[int],
     config_path: str = str(DEFAULT_CONFIG_PATH),
     parallel: bool = RUN_PARALLEL,
     max_workers: int | None = MAX_PARALLEL_WORKERS,
     continue_on_error: bool = CONTINUE_ON_ERROR,
     dry_run: bool = False,
 ):
-    specs = build_ablation_specs(config_path = config_path)
+    specs = build_ablation_specs(
+        config_path = config_path,
+        ablation_indices = normalize_cli_ablation_indices(ablation_indices),
+    )
     print_planned_ablations(specs, config_path = config_path)
 
     results = run_ablation_specs(

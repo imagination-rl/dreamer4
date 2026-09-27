@@ -158,6 +158,8 @@ class Experience:
     log_probs: Actions | None = None
     old_action_unembeds: Actions | None = None
     values: MaybeTensor = None
+    frozen_returns: MaybeTensor = None
+    frozen_advantages: MaybeTensor = None
     step_size: int | None = None
     lens: MaybeTensor = None
     is_truncated: MaybeTensor = None
@@ -5481,6 +5483,8 @@ class DynamicsWorldModel(Module):
         latent_flow_loss_weight = 1.,
         shortcut_loss_weight = 1.,
         reward_loss_weight: float | list[float] = 1.,
+        scale_reward_gradient_into_transformer = False,
+        reward_gradient_into_transformer_scale = 0.01,
         predict_terminals: bool = True,
         predict_terminal_mlp_kwargs: dict = dict(depth = 1),
         terminal_loss_weight: float = 1.,
@@ -5505,6 +5509,8 @@ class DynamicsWorldModel(Module):
         normalize_advantages = None,
         value_clip = 0.4,
         clip_values = False,
+        cleanrl_ppo_closer = False,
+        cleanrl_ppo_closer_hl_gauss_value_loss = False,
         policy_entropy_weight = .01,
         agent_policy_gradient_frac = 1.,
         agent_value_gradient_frac = 1.,
@@ -5584,10 +5590,21 @@ class DynamicsWorldModel(Module):
         if use_hl_gauss_actor_critic and clip_values:
             raise ValueError('`use_hl_gauss_actor_critic` does not support value clipping')
 
+        if cleanrl_ppo_closer_hl_gauss_value_loss and not cleanrl_ppo_closer:
+            raise ValueError('`cleanrl_ppo_closer_hl_gauss_value_loss` requires `cleanrl_ppo_closer`')
+
         self.dim = dim
         self.depth = depth
         self.add_action_embed_to_agent_token = add_action_embed_to_agent_token
         self.old_reward_shifting = old_reward_shifting
+        self.scale_reward_gradient_into_transformer = scale_reward_gradient_into_transformer
+        self.reward_gradient_into_transformer_scale = reward_gradient_into_transformer_scale
+
+        if (
+            scale_reward_gradient_into_transformer and
+            not 0. <= reward_gradient_into_transformer_scale <= 1.
+        ):
+            raise ValueError('reward_gradient_into_transformer_scale must be between 0 and 1')
         self.old_pmpo = old_pmpo
         self.old_reward_head = old_reward_head
         self.old_terminal_head = old_terminal_head
@@ -6270,6 +6287,8 @@ class DynamicsWorldModel(Module):
         self.ppo_eps_clip = ppo_eps_clip
         self.value_clip = value_clip
         self.clip_values = clip_values
+        self.cleanrl_ppo_closer = cleanrl_ppo_closer
+        self.cleanrl_ppo_closer_hl_gauss_value_loss = cleanrl_ppo_closer_hl_gauss_value_loss
         self.policy_entropy_weight = policy_entropy_weight
 
         self.agent_policy_gradient_frac = agent_policy_gradient_frac
@@ -7119,6 +7138,8 @@ class DynamicsWorldModel(Module):
         critic_state = experience.critic_state
         old_log_probs = experience.log_probs
         old_values = experience.values
+        frozen_returns = experience.frozen_returns
+        frozen_advantages = experience.frozen_advantages
         rewards = experience.rewards
         agent_embeds = experience.agent_embed
         policy_inputs = experience.policy_input if self.policy_all_tokens else None
@@ -7166,15 +7187,18 @@ class DynamicsWorldModel(Module):
         return_discount_factor = self.reinforce_discount_factor if objective == 'reinforce' else self.gae_discount_factor
         return_gae_lambda = self.reinforce_gae_lambda if objective == 'reinforce' else self.gae_lambda
 
-        returns = calc_gae(
-            rewards,
-            old_values,
-            masks = gae_masks,
-            learn_masks = mask,
-            gamma = return_discount_factor,
-            lam = return_gae_lambda,
-            use_accelerated = self.gae_use_accelerated
-        )
+        if exists(frozen_returns):
+            returns = frozen_returns
+        else:
+            returns = calc_gae(
+                rewards,
+                old_values,
+                masks = gae_masks,
+                learn_masks = mask,
+                gamma = return_discount_factor,
+                lam = return_gae_lambda,
+                use_accelerated = self.gae_use_accelerated
+            )
 
         # determine whether to finetune entire transformer or just learn the heads
 
@@ -7182,7 +7206,9 @@ class DynamicsWorldModel(Module):
 
         # maybe keep track returns statistics and normalize returns and values before calculating advantage, as done in dreamer v3
 
-        if objective == 'reinforce' and self.reinforce_return_normalization == 'percentile':
+        if exists(frozen_advantages):
+            advantage = frozen_advantages
+        elif objective == 'reinforce' and self.reinforce_return_normalization == 'percentile':
             returns_for_stats = returns[mask] if exists(mask) else returns.flatten()
             return_quantiles = torch.quantile(
                 returns_for_stats.detach().float(),
@@ -7231,7 +7257,7 @@ class DynamicsWorldModel(Module):
 
         normalize_advantages = default(normalize_advantages, self.normalize_advantages, objective != 'pmpo')
 
-        if normalize_advantages:
+        if normalize_advantages and not exists(frozen_advantages):
             advantage = z_score(advantage, mask = mask, eps = eps)
 
         # https://arxiv.org/abs/2410.04166v1
@@ -7621,33 +7647,50 @@ class DynamicsWorldModel(Module):
                     (primary_advantages > 0.) != (actor_critic_advantages > 0.)
                 ).float().mean().detach()
 
-        return_bins = self.value_encoder(returns)
-        return_bin_entropy = -(return_bins * return_bins.clamp_min(eps).log()).sum(dim = -1)
+        if self.cleanrl_ppo_closer and not self.cleanrl_ppo_closer_hl_gauss_value_loss:
+            value_loss = (values - returns).square()
 
-        value_bins, return_bins = tuple(rearrange(t, 'b t l -> b l t') for t in (value_bins, return_bins))
+            if self.clip_values:
+                clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
+                clipped_value_loss = (clipped_values - returns).square()
+                value_loss = torch.maximum(value_loss, clipped_value_loss)
 
-        value_loss = -(return_bins * value_bins.log_softmax(dim = 1)).sum(dim = 1)
+            value_loss = .5 * value_loss[mask].mean()
 
-        # maybe clip values
+            if return_diagnostics:
+                diagnostics['extra/value_mse'] = (values[mask] - returns[mask]).square().mean().detach()
+        else:
+            return_bins = self.value_encoder(returns)
+            return_bin_entropy = -(return_bins * return_bins.clamp_min(eps).log()).sum(dim = -1)
 
-        if self.clip_values:
-            clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
-            clipped_value_bins = self.value_encoder(clipped_values)
-            clipped_value_bins = rearrange(clipped_value_bins, 'b t l -> b l t')
+            value_bins, return_bins = tuple(rearrange(t, 'b t l -> b l t') for t in (value_bins, return_bins))
 
-            clipped_value_loss = -(return_bins * log(clipped_value_bins)).sum(dim = 1)
-            value_loss = torch.maximum(value_loss, clipped_value_loss)
+            value_loss = -(return_bins * value_bins.log_softmax(dim = 1)).sum(dim = 1)
 
-        # mask out bootstrapped terminal step from bounds seamlessly
+            # maybe clip values
+            # the closer PPO HL-Gauss loss does not clip, because a raw-value clip has no distributional form
 
-        primary_value_loss = value_loss[mask].mean()
-        value_loss = primary_value_loss
+            if self.clip_values and not self.cleanrl_ppo_closer_hl_gauss_value_loss:
+                clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
+                clipped_value_bins = self.value_encoder(clipped_values)
+                clipped_value_bins = rearrange(clipped_value_bins, 'b t l -> b l t')
 
-        if return_diagnostics:
-            diagnostics['extra/value_target_entropy'] = return_bin_entropy[mask].mean().detach()
-            diagnostics['extra/value_excess_cross_entropy'] = (
-                primary_value_loss.detach() - diagnostics['extra/value_target_entropy']
-            )
+                clipped_value_loss = -(return_bins * log(clipped_value_bins)).sum(dim = 1)
+                value_loss = torch.maximum(value_loss, clipped_value_loss)
+
+            # mask out bootstrapped terminal step from bounds seamlessly
+
+            primary_value_loss = value_loss[mask].mean()
+            value_loss = primary_value_loss
+
+            if return_diagnostics:
+                if self.cleanrl_ppo_closer_hl_gauss_value_loss:
+                    diagnostics['extra/value_mse'] = (values[mask] - returns[mask]).square().mean().detach()
+
+                diagnostics['extra/value_target_entropy'] = return_bin_entropy[mask].mean().detach()
+                diagnostics['extra/value_excess_cross_entropy'] = (
+                    primary_value_loss.detach() - diagnostics['extra/value_target_entropy']
+                )
 
         if self.use_hl_gauss_actor_critic:
             actor_critic_return_bins = self.actor_critic_value_encoder(returns)
@@ -9287,6 +9330,11 @@ class DynamicsWorldModel(Module):
         if exists(rewards):
 
             reward_prediction_tokens = agent_tokens_shifted
+            if self.scale_reward_gradient_into_transformer:
+                reward_prediction_tokens = frac_gradient(
+                    reward_prediction_tokens,
+                    self.reward_gradient_into_transformer_scale
+                )
             reward_target_values = rewards[:, :-1] if self.old_reward_shifting else rewards[:, 1:]
             reward_target_encoding = two_hot_encoding[:, :-1] if self.old_reward_shifting else two_hot_encoding[:, 1:]
             reward_target_mask = loss_mask_without_first if self.old_reward_shifting else loss_mask_without_last
@@ -9336,6 +9384,11 @@ class DynamicsWorldModel(Module):
             # lightweight MTP objective and generation semantics intact.
             if not self.old_reward_head:
                 pooled_latents = reduce(latents[:, 1:], 'b t v n d -> b t d', 'mean')
+                if self.scale_reward_gradient_into_transformer:
+                    pooled_latents = frac_gradient(
+                        pooled_latents,
+                        self.reward_gradient_into_transformer_scale
+                    )
                 latent_reward_pred = self.to_latent_state_reward_pred(pooled_latents)
                 latent_reward_targets = two_hot_encoding[:, :-1] if self.old_reward_shifting else two_hot_encoding[:, 1:]
 

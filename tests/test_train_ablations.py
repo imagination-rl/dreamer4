@@ -218,22 +218,3 @@ def test_execute_ablation_logs_worker_exception_immediately(monkeypatch, capsys)
     assert "RuntimeError: test failure" in result.error
     assert "[ablation 7] worker error for broken:" in captured.err
     assert "RuntimeError: test failure" in captured.err
-
-
-def test_selected_reinforce_ablations_cover_three_paired_concepts():
-    selected = [ablations.ABLATIONS[index - 1] for index in ablations.ABLATIONS_TO_RUN]
-    specs = build_ablation_specs()
-
-    assert len(specs) == 6
-    assert [item["seed"] for item in selected] == [42, 4, 42, 4, 42, 4]
-    assert all(item["objective"] == "reinforce" for item in selected)
-    assert all(item["run_details"].startswith("prev=[") for item in selected)
-    assert all(", change=[" in item["run_details"] for item in selected)
-
-    baseline, targets, actor_loss = selected[:2], selected[2:4], selected[4:]
-    assert all("reinforce_gae_lambda" not in item for item in baseline)
-    assert all(item["reinforce_gae_lambda"] == 0.95 for item in targets)
-    assert all(item["reinforce_return_normalization"] == "percentile" for item in targets)
-    assert all(item["reinforce_use_discounted_trajectory_weights"] is True for item in actor_loss)
-    assert all(item["continuous_dist_type"] == "squashed_gaussian" for item in actor_loss)
-    assert all(item["policy_entropy_weight"] == 0.0003 for item in actor_loss)

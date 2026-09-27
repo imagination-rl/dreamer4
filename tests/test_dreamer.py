@@ -577,6 +577,141 @@ def test_old_behavior_flags_leave_model_default_state_unchanged_when_disabled():
     assert all(torch.equal(implicit_state[key], explicit_state[key]) for key in implicit_state)
 
 
+def test_cleanrl_ppo_closer_keeps_model_parameters_and_uses_scalar_value_loss():
+    from dreamer4.dreamer4 import Actions, Experience
+
+    torch.manual_seed(123)
+    baseline = _small_flag_dynamics(
+        num_continuous_actions = 2,
+        continuous_dist_type = 'beta',
+    )
+    torch.manual_seed(123)
+    closer = _small_flag_dynamics(
+        num_continuous_actions = 2,
+        continuous_dist_type = 'beta',
+        cleanrl_ppo_closer = True,
+        clip_values = True,
+        value_clip = .2,
+        policy_entropy_weight = 0.,
+    )
+
+    baseline_parameters = dict(baseline.named_parameters())
+    closer_parameters = dict(closer.named_parameters())
+    assert baseline_parameters.keys() == closer_parameters.keys()
+    assert {
+        name: parameter.shape
+        for name, parameter in baseline_parameters.items()
+    } == {
+        name: parameter.shape
+        for name, parameter in closer_parameters.items()
+    }
+    assert sum(parameter.numel() for parameter in baseline_parameters.values()) == sum(
+        parameter.numel() for parameter in closer_parameters.values()
+    )
+
+    batch = 4
+    agent_embed = torch.randn(batch, 1, 16)
+    with torch.no_grad():
+        predicted_values = closer.value_encoder.bins_to_scalar_value(
+            closer.value_head(agent_embed)
+        )
+
+    old_values = predicted_values.detach() + torch.tensor((-.5, -.1, .3, .6)).reshape(batch, 1)
+    returns = torch.tensor((1., -1., 2., -2.)).reshape(batch, 1)
+    clipped_values = old_values + (predicted_values - old_values).clamp(-.2, .2)
+    expected_value_loss = .5 * torch.maximum(
+        (predicted_values - returns).square(),
+        (clipped_values - returns).square(),
+    ).mean()
+    experience = Experience(
+        latents = torch.randn(batch, 1, 2, 8),
+        agent_embed = agent_embed,
+        rewards = torch.zeros(batch, 1),
+        actions = Actions(None, torch.rand(batch, 1, 2)),
+        log_probs = Actions(None, torch.zeros(batch, 1, 2)),
+        values = old_values,
+        frozen_returns = returns,
+        frozen_advantages = torch.zeros(batch, 1),
+        step_size = 1,
+        lens = torch.ones(batch, dtype = torch.long),
+        is_truncated = torch.zeros(batch, dtype = torch.bool),
+        terminals = torch.zeros(batch, dtype = torch.bool),
+        is_from_world_model = True,
+    )
+
+    _, value_loss, diagnostics = closer.learn_from_experience(
+        experience,
+        objective = 'ppo',
+        return_diagnostics = True,
+    )
+
+    assert value_loss.item() == pytest.approx(expected_value_loss.item())
+    assert diagnostics['extra/value_mse'] == pytest.approx(
+        (predicted_values - returns).square().mean().item()
+    )
+    assert 'extra/value_target_entropy' not in diagnostics
+
+
+def test_cleanrl_ppo_closer_hl_gauss_value_loss_uses_unclipped_cross_entropy():
+    from dreamer4.dreamer4 import Actions, Experience
+
+    closer = _small_flag_dynamics(
+        num_continuous_actions = 2,
+        continuous_dist_type = 'beta',
+        cleanrl_ppo_closer = True,
+        cleanrl_ppo_closer_hl_gauss_value_loss = True,
+        clip_values = True,
+        value_clip = .2,
+        policy_entropy_weight = 0.,
+        use_symlog_hl_gauss_value_head = True,
+        value_encoder_kwargs = dict(
+            reward_range = (-10., 10.),
+            num_bins = 7,
+            use_symlog = True,
+            decode_symlog_expected_raw = True,
+        ),
+    )
+
+    batch = 4
+    agent_embed = torch.randn(batch, 1, 16)
+    returns = torch.tensor((1., -1., 20., -20.)).reshape(batch, 1)
+
+    with torch.no_grad():
+        value_logits = closer.value_head(agent_embed)
+        predicted_values = closer.value_encoder.bins_to_scalar_value(value_logits)
+        expected_value_loss = -(closer.value_encoder(returns) * value_logits.log_softmax(dim = -1)).sum(dim = -1).mean()
+
+    # old_values far from the prediction would change a clipped loss.
+    experience = Experience(
+        latents = torch.randn(batch, 1, 2, 8),
+        agent_embed = agent_embed,
+        rewards = torch.zeros(batch, 1),
+        actions = Actions(None, torch.rand(batch, 1, 2)),
+        log_probs = Actions(None, torch.zeros(batch, 1, 2)),
+        values = predicted_values + 5.,
+        frozen_returns = returns,
+        frozen_advantages = torch.zeros(batch, 1),
+        step_size = 1,
+        lens = torch.ones(batch, dtype = torch.long),
+        is_truncated = torch.zeros(batch, dtype = torch.bool),
+        terminals = torch.zeros(batch, dtype = torch.bool),
+        is_from_world_model = True,
+    )
+
+    _, value_loss, diagnostics = closer.learn_from_experience(
+        experience,
+        objective = 'ppo',
+        return_diagnostics = True,
+    )
+
+    assert value_loss.item() == pytest.approx(expected_value_loss.item(), rel = 1e-5)
+    assert diagnostics['extra/value_mse'] == pytest.approx((predicted_values - returns).square().mean().item(), rel = 1e-5)
+    assert 'extra/value_target_entropy' in diagnostics
+
+    with pytest.raises(ValueError, match = 'requires `cleanrl_ppo_closer`'):
+        _small_flag_dynamics(cleanrl_ppo_closer_hl_gauss_value_loss = True)
+
+
 def _paper_shortcut_dynamics(**kwargs):
     from dreamer4.dreamer4 import DynamicsWorldModel
 

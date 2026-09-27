@@ -355,6 +355,8 @@ class ImaginationLearningLoss(nn.Module):
         preservation_actions_discrete: Tensor | None,
         preservation_actions_continuous: Tensor | None,
         preservation_lens: Tensor | None,
+        frozen_returns: Tensor | None = None,
+        frozen_advantages: Tensor | None = None,
     ):
         if (
             self.full_transformer_finetuning and
@@ -375,6 +377,8 @@ class ImaginationLearningLoss(nn.Module):
             log_probs = Actions(log_probs_discrete, log_probs_continuous),
             old_action_unembeds = Actions(old_action_unembeds_discrete, old_action_unembeds_continuous),
             values = values,
+            frozen_returns = frozen_returns,
+            frozen_advantages = frozen_advantages,
             step_size = step_size,
             lens = lens,
             is_truncated = is_truncated,

@@ -282,7 +282,7 @@ def install_fake_main_runtime(monkeypatch):
     monkeypatch.setattr(train_gym, "train_tokenizer", lambda *args, **kwargs: None)
     monkeypatch.setattr(train_gym, "ObservationTokenizer", FakeTokenizer)
     monkeypatch.setattr(train_gym, "DynamicsWorldModel", FakeWorldModel)
-    monkeypatch.setattr(train_gym, "make_optimizer", lambda *args, **kwargs: object())
+    monkeypatch.setattr(train_gym, "make_optimizer", lambda *args, **kwargs: SimpleNamespace(param_groups = []))
     monkeypatch.setattr(train_gym, "make_env", lambda *args, **kwargs: environment)
     monkeypatch.setattr(train_gym.Experience, "create_memmap_replay_buffer", lambda *args, **kwargs: replay)
     monkeypatch.setattr(train_gym, "train_world_model", fake_train_world_model)

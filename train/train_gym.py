@@ -27,7 +27,7 @@ import warnings
 from contextlib import nullcontext
 from copy import deepcopy
 from contextvars import ContextVar
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Literal, Mapping
@@ -43,7 +43,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.utils import clip_grad_norm_
-from torch.optim import AdamW, Optimizer
+from torch.optim import Adam, AdamW, Optimizer
 from torch.utils.data import DataLoader, RandomSampler, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils._pytree import tree_map
@@ -60,13 +60,17 @@ from dreamer4.dreamer4 import (
     Experience,
     ShortcutTrainMode,
     StateTokenizer,
+    calc_gae,
+    combine_experiences,
     divisible_by,
     exists,
-    tree_map_tensor
+    tree_map_tensor,
+    z_score,
 )
 
 from .compile_runtime import (
     CallTiming,
+    WorldModelTrainingLoss,
     action_pair_or_empty,
     build_compile_runtime,
     compile_mode_uses_cuda_graphs,
@@ -78,6 +82,8 @@ from .compile_runtime import (
     synchronize_if_cuda,
 )
 from .profiling import PROFILE_TOTAL_STEPS, TrainingProfiler
+from .audit_ablations import AUDIT_ABLATION_FLAGS, AuditDiagnostics, isolated_rng, resolve_audit_ablations
+from . import offline_pretraining as offline
 
 
 _runtime_cleanups = ContextVar("runtime_cleanups", default = None)
@@ -582,12 +588,98 @@ def make_optimizer(
     if len(muon_params) == 0:
         return AdamW(params, lr = lr, weight_decay = weight_decay, fused = fused)
 
+    # MuonAdamAtan2 removes the Muon parameters through a set, which gives a
+    # different parameter order in each process. A saved optimizer state then
+    # maps to the wrong parameters on load. Keep the module order instead.
+    #
+    # Compatibility is broken: checkpoints saved before this change used a
+    # random order that was not saved. Many non-Muon parameters have the same
+    # shape, so the order cannot be recovered. Their optimizer state loads into
+    # the wrong parameters, or fails with a shape error.
+    muon_param_set = set(muon_params)
+
     return MuonAdamAtan2(
         muon_params = muon_params,
-        params = params,
+        params = [param for param in params if param not in muon_param_set],
         lr = lr,
         weight_decay = weight_decay,
+        remove_muon_params_from_params = False,
     )
+
+
+def make_ppo_reuse_optimizer(
+    world_model: DynamicsWorldModel,
+    *,
+    lr: float,
+    weight_decay: float,
+):
+    policy_params = unique_parameters(world_model.policy_head_parameters())
+    value_params = unique_parameters(world_model.value_head_parameters())
+    overlap = set(policy_params) & set(value_params)
+    if overlap:
+        raise ValueError("PPO reuse requires separate policy and value parameters")
+
+    fused = all(param.is_cuda for param in (*policy_params, *value_params))
+    return AdamW(
+        [
+            {"params": policy_params, "ppo_role": "policy"},
+            {"params": value_params, "ppo_role": "value"},
+        ],
+        lr = lr,
+        weight_decay = weight_decay,
+        fused = fused,
+    )
+
+
+def make_cleanrl_updated_ppo_optimizer(
+    world_model: DynamicsWorldModel,
+    *,
+    lr: float,
+):
+    """Build the optimizer from CleanRL updated PPO for the main model heads."""
+
+    policy_params = unique_parameters(world_model.policy_head_parameters())
+    value_params = unique_parameters(world_model.value_head_parameters())
+    overlap = set(policy_params) & set(value_params)
+    if overlap:
+        raise ValueError("CleanRL updated PPO requires separate policy and value parameters")
+
+    params = unique_parameters((*policy_params, *value_params))
+    fused = len(params) > 0 and all(param.is_cuda for param in params)
+    return Adam(params, lr = lr, eps = 1e-5, fused = fused)
+
+
+def ppo_optimizer_role_parameters(optimizer: Optimizer, role: str):
+    return [
+        param
+        for group in optimizer.param_groups
+        if group.get("ppo_role") == role
+        for param in group["params"]
+    ]
+
+
+def snapshot_optimizer_parameters(optimizer: Optimizer, params: list[nn.Parameter]):
+    return [
+        (
+            param.detach().clone(),
+            deepcopy(optimizer.state[param]) if param in optimizer.state else None,
+        )
+        for param in params
+    ]
+
+
+@torch.no_grad()
+def restore_optimizer_parameters(
+    optimizer: Optimizer,
+    params: list[nn.Parameter],
+    snapshot,
+):
+    for param, (value, state) in zip(params, snapshot):
+        param.copy_(value)
+        if state is None:
+            optimizer.state.pop(param, None)
+        else:
+            optimizer.state[param] = deepcopy(state)
 
 
 def module_parameters(module: nn.Module | None):
@@ -784,6 +876,229 @@ def trim_prompt_from_dream(dream: Experience, prompt_length: int, horizon: int):
     )
 
 
+def align_dream_transition_rewards(dream: Experience):
+    """Pair each generated action with its next generated arrival reward."""
+    if not exists(dream.rewards) or dream.rewards.shape[1] < 2:
+        raise ValueError("dream transition alignment requires at least two generated states")
+
+    aligned_rewards = torch.zeros_like(dream.rewards)
+    aligned_rewards[:, :-1] = dream.rewards[:, 1:]
+    dream.rewards = aligned_rewards
+
+    if exists(dream.terminals) and dream.terminals.ndim > 1:
+        aligned_terminals = torch.zeros_like(dream.terminals)
+        aligned_terminals[:, :-1] = dream.terminals[:, 1:]
+        dream.terminals = aligned_terminals
+
+    if exists(dream.lens):
+        reward_mask = lens_to_mask(dream.lens, dream.rewards.shape[1])
+        dream.episode_return = (dream.rewards * reward_mask.float()).sum(dim = 1)
+    else:
+        dream.episode_return = dream.rewards.sum(dim = 1)
+
+    return dream
+
+
+def select_experience_batch(experience: Experience, indices: Tensor):
+    batch_size = experience.latents.shape[0]
+
+    def select(value):
+        if isinstance(value, Actions):
+            return Actions(*(select(item) for item in value))
+
+        if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == batch_size:
+            return value.index_select(0, indices)
+
+        return value
+
+    return Experience(**{name: select(value) for name, value in vars(experience).items()})
+
+
+@torch.no_grad()
+def freeze_ppo_targets(
+    world_model: DynamicsWorldModel,
+    dream: Experience,
+    *,
+    normalize_advantages: bool = True,
+):
+    rewards = dream.rewards.clone()
+    values = dream.values.clone()
+    batch, time = rewards.shape[:2]
+    lens = dream.lens if exists(dream.lens) else torch.full(
+        (batch,), time, device = rewards.device, dtype = torch.long
+    )
+    is_truncated = dream.is_truncated if exists(dream.is_truncated) else torch.ones(
+        (batch,), device = rewards.device, dtype = torch.bool
+    )
+
+    valid_mask = lens_to_mask(lens, time)
+    rewards.masked_fill_(~valid_mask, 0.)
+    values.masked_fill_(~valid_mask, 0.)
+
+    learn_mask = lens_to_mask(lens - is_truncated.long(), time)
+    gae_mask = lens_to_mask((lens - 1).clamp(min = 0), time)
+
+    if exists(dream.terminals):
+        terminals = dream.terminals
+        if terminals.ndim == 1:
+            positions = (lens - 1).clamp(min = 0)
+            terminals = torch.arange(time, device = rewards.device)[None, :] == positions[:, None]
+            terminals = terminals & dream.terminals[:, None]
+        gae_mask.masked_fill_(terminals.bool(), 0.)
+
+    returns = calc_gae(
+        rewards,
+        values,
+        masks = gae_mask,
+        learn_masks = learn_mask,
+        gamma = world_model.gae_discount_factor,
+        lam = world_model.gae_lambda,
+        use_accelerated = world_model.gae_use_accelerated,
+    )
+    advantages = returns - values
+    if normalize_advantages:
+        advantages = z_score(advantages, mask = learn_mask, eps = 1e-6)
+
+    dream.frozen_returns = returns
+    dream.frozen_advantages = advantages
+    return dream
+
+
+@torch.no_grad()
+def flatten_cleanrl_updated_ppo_transitions(
+    world_model: DynamicsWorldModel,
+    dream: Experience,
+):
+    """Freeze GAE targets and flatten valid dream transitions into one batch."""
+
+    dream = freeze_ppo_targets(
+        world_model,
+        dream,
+        normalize_advantages = False,
+    )
+    batch, time = dream.rewards.shape[:2]
+    lens = dream.lens if exists(dream.lens) else torch.full(
+        (batch,),
+        time,
+        device = dream.rewards.device,
+        dtype = torch.long,
+    )
+    is_truncated = dream.is_truncated if exists(dream.is_truncated) else torch.ones(
+        batch,
+        device = dream.rewards.device,
+        dtype = torch.bool,
+    )
+    learn_mask = lens_to_mask((lens - is_truncated.long()).clamp(min = 0), time)
+    transition_count = int(learn_mask.sum().item())
+    if transition_count == 0:
+        raise ValueError("CleanRL updated PPO needs at least one valid dream transition")
+
+    def flatten(value):
+        if not exists(value):
+            return None
+        if isinstance(value, Actions):
+            return Actions(*(flatten(item) for item in value))
+        if (
+            torch.is_tensor(value)
+            and value.ndim >= 2
+            and tuple(value.shape[:2]) == (batch, time)
+        ):
+            return value[learn_mask].unsqueeze(1)
+        return value
+
+    return Experience(
+        latents = flatten(dream.latents),
+        video = flatten(dream.video),
+        proprio = flatten(dream.proprio),
+        critic_state = flatten(dream.critic_state),
+        agent_embed = flatten(dream.agent_embed),
+        policy_input = flatten(dream.policy_input),
+        rewards = flatten(dream.rewards),
+        terminals = None,
+        actions = flatten(dream.actions),
+        log_probs = flatten(dream.log_probs),
+        old_action_unembeds = flatten(dream.old_action_unembeds),
+        values = flatten(dream.values),
+        frozen_returns = flatten(dream.frozen_returns),
+        frozen_advantages = flatten(dream.frozen_advantages),
+        step_size = dream.step_size,
+        lens = torch.ones(transition_count, device = dream.rewards.device, dtype = torch.long),
+        is_truncated = torch.zeros(
+            transition_count,
+            device = dream.rewards.device,
+            dtype = torch.bool,
+        ),
+        agent_index = dream.agent_index,
+        is_from_world_model = dream.is_from_world_model,
+        episode_return = None,
+    )
+
+
+def policy_unembeds_from_inputs(
+    world_model: DynamicsWorldModel,
+    policy_inputs: Tensor,
+):
+    policy_embed = world_model.policy_head(policy_inputs.detach())
+    return Actions(*world_model.action_embedder.unembed(policy_embed, pred_head_index = 0))
+
+
+def exact_policy_kl(
+    world_model: DynamicsWorldModel,
+    policy_inputs: Tensor,
+    behavior_unembeds: Actions,
+    *,
+    lens: Tensor | None = None,
+    is_truncated: Tensor | None = None,
+):
+    current_unembeds = policy_unembeds_from_inputs(world_model, policy_inputs)
+    return mean_action_distribution_kl(
+        world_model.action_embedder,
+        behavior_unembeds,
+        current_unembeds,
+        lens = lens,
+        is_truncated = is_truncated,
+    )
+
+
+def mean_action_distribution_kl(
+    action_embedder: nn.Module,
+    behavior_unembeds: Actions,
+    current_unembeds: Actions,
+    *,
+    lens: Tensor | None = None,
+    is_truncated: Tensor | None = None,
+):
+    kl_terms = action_embedder.kl_div(behavior_unembeds, current_unembeds)
+    kl_values = None
+
+    for kl_term in kl_terms:
+        if not exists(kl_term):
+            continue
+
+        if kl_term.ndim > 2:
+            kl_term = kl_term.flatten(start_dim = 2).sum(dim = -1)
+
+        kl_values = kl_term if not exists(kl_values) else kl_values + kl_term
+
+    if not exists(kl_values):
+        raise ValueError("exact policy KL requires at least one action distribution")
+
+    if exists(lens):
+        if not exists(is_truncated):
+            is_truncated = torch.ones_like(lens, dtype = torch.bool)
+        learnable_lens = (lens - is_truncated.long()).clamp(min = 0, max = kl_values.shape[1])
+        mask = lens_to_mask(learnable_lens, kl_values.shape[1])
+        kl_values = kl_values[mask]
+    else:
+        kl_values = kl_values.reshape(-1)
+
+    if kl_values.numel() == 0:
+        reference = next(value for value in behavior_unembeds if exists(value))
+        return reference.new_zeros(())
+
+    return kl_values.mean()
+
+
 class FrozenPolicyPrior(nn.Module):
     def __init__(self, world_model: DynamicsWorldModel):
         super().__init__()
@@ -802,14 +1117,43 @@ class FrozenPolicyPrior(nn.Module):
         self.requires_grad_(False)
         self.eval()
 
-    @torch.no_grad()
-    def action_unembeds(self, policy_inputs: Tensor):
-        policy_embed = self.policy_head(policy_inputs.detach())
+    def action_unembeds(self, policy_inputs: Tensor, *, detach_inputs: bool = True):
+        if detach_inputs:
+            policy_inputs = policy_inputs.detach()
+        policy_embed = self.policy_head(policy_inputs)
         return self.action_embedder.unembed(policy_embed, pred_head_index = 0)
 
 
+def policy_inputs_from_replay_context(
+    world_model: DynamicsWorldModel,
+    experience: Experience,
+    *,
+    step_size: int,
+):
+    actions = action_pair_or_empty(experience.actions)
+    _, (embeds, _) = world_model(
+        latents = experience.latents,
+        signal_levels = world_model.max_steps - 1,
+        step_sizes = step_size,
+        rewards = experience.rewards,
+        discrete_actions = actions.discrete,
+        continuous_actions = actions.continuous,
+        proprio = experience.proprio,
+        latent_is_noised = True,
+        latent_has_view_dim = experience.latents.ndim == 5,
+        return_pred_only = True,
+        return_intermediates = True,
+    )
+    return world_model.select_policy_input(embeds, experience.agent_index)
+
+
 @torch.no_grad()
-def agent_approx_kl_metrics(world_model: DynamicsWorldModel, dream: Experience):
+def agent_approx_kl_metrics(
+    world_model: DynamicsWorldModel,
+    dream: Experience,
+    *,
+    include_cleanrl_metrics: bool = False,
+):
     assert exists(dream.agent_embed)
     assert exists(dream.actions)
     assert exists(dream.log_probs)
@@ -840,7 +1184,8 @@ def agent_approx_kl_metrics(world_model: DynamicsWorldModel, dream: Experience):
     log_probs = safe_cat(log_probs, dim = -1)
 
     log_ratio = log_probs.sum(dim = -1) - old_log_probs.sum(dim = -1)
-    approx_kl = log_ratio.exp() - 1. - log_ratio
+    ratio = log_ratio.exp()
+    approx_kl = ratio - 1. - log_ratio
 
     lens = dream.lens
     if exists(lens):
@@ -848,17 +1193,35 @@ def agent_approx_kl_metrics(world_model: DynamicsWorldModel, dream: Experience):
         learnable_lens = (lens - is_truncated.long()).clamp(min = 0, max = policy_time)
         mask = lens_to_mask(learnable_lens, policy_time)
         approx_kl = approx_kl[mask]
+        if include_cleanrl_metrics:
+            log_ratio = log_ratio[mask]
+            ratio = ratio[mask]
     else:
         approx_kl = approx_kl.reshape(-1)
+        if include_cleanrl_metrics:
+            log_ratio = log_ratio.reshape(-1)
+            ratio = ratio.reshape(-1)
 
     if approx_kl.numel() == 0:
-        approx_kl = log_ratio.new_zeros((1,))
+        approx_kl = policy_inputs.new_zeros((1,))
 
-    return {
+    metrics = {
         "approx_kl_mean": approx_kl.mean(),
         "approx_kl_min": approx_kl.min(),
         "approx_kl_max": approx_kl.max(),
     }
+
+    if include_cleanrl_metrics:
+        if log_ratio.numel() == 0:
+            log_ratio = policy_inputs.new_zeros((1,))
+            ratio = policy_inputs.new_ones((1,))
+
+        metrics.update({
+            "old_approx_kl": (-log_ratio).mean(),
+            "clip_fraction": ((ratio - 1.).abs() > world_model.ppo_eps_clip).float().mean(),
+        })
+
+    return metrics
 
 
 @torch.no_grad()
@@ -1004,6 +1367,75 @@ def eval_tokenizer_on_experience(
     return loss.item(), sample_count
 
 
+def replay_batch_to_experience(batch, device: torch.device):
+    exp = Experience.from_buffer_dict(batch)
+    exp.lens = batch.get('_lens')
+    exp = exp.to(device)
+
+    # Mask episode flags when the sampled window does not reach its end.
+    reaches_episode_end = batch.get('_reaches_episode_end')
+    if exists(reaches_episode_end):
+        reaches_episode_end = reaches_episode_end.to(device)
+        if exists(exp.terminals): exp.terminals = exp.terminals & reaches_episode_end
+        if exists(exp.is_truncated): exp.is_truncated = exp.is_truncated & reaches_episode_end
+
+    return exp
+
+
+def world_model_loss_metrics(loss: Tensor, losses) -> dict[str, float]:
+    return {
+        "world_model/loss": loss.item(),
+        "world_model/flow_loss": losses.flow.item(),
+        "world_model/shortcut_loss": losses.shortcut.item(),
+        "world_model/reward_loss": (losses.agent_embed_reward.mean() + losses.latent_state_reward.mean()).item(),
+        "world_model/reward_mae": losses.reward_mae.item(),
+        "world_model/terminal_loss": (losses.agent_embed_terminal.mean() + losses.latent_state_terminal.mean()).item(),
+        "world_model/agent_state_pred_loss": losses.agent_state_pred.item(),
+    }
+
+
+@torch.no_grad()
+def world_model_validation_metrics(
+    world_model: DynamicsWorldModel,
+    replay: ReplayBuffer,
+    *,
+    batch_size: int,
+    sequence_length: int | None,
+    num_batches: int,
+):
+    """Mean world-model loss terms on held-out replay windows, without an update.
+
+    The eager loss avoids a second compiled graph for no_grad calls. The RNG
+    state is restored, so validation does not change the training stream.
+    """
+
+    if len(replay) == 0 or num_batches <= 0:
+        return {}
+
+    loss_fn = WorldModelTrainingLoss(world_model)
+    dataset = ReplayDatasetTimeWindow(replay, window_length = sequence_length, include_metadata = True)
+    dataloader = DataLoader(dataset, batch_size = min(batch_size, len(dataset)), shuffle = True)
+    totals = {}
+
+    with isolated_rng(world_model.device):
+        for _, batch in zip(range(num_batches), cycle(dataloader)):
+            exp = replay_batch_to_experience(batch, world_model.device)
+            loss, losses = loss_fn(
+                exp.latents,
+                exp.rewards,
+                exp.terminals,
+                exp.actions.continuous if exists(exp.actions) else None,
+                exp.lens,
+                "combined",
+                False,
+            )
+
+            for key, value in world_model_loss_metrics(loss, losses).items():
+                totals[key] = totals.get(key, 0.) + value
+
+    return {key: value / num_batches for key, value in totals.items()}
+
+
 def train_world_model(
     world_model: DynamicsWorldModel,
     optimizer: Optimizer,
@@ -1024,12 +1456,25 @@ def train_world_model(
     desc: str,
     old_replay_sampling: bool = False,
     update_loss_ema: bool = True,
+    preserve_policy_during_world_model_updates: bool = False,
+    world_model_policy_consistency_loss_weight: float = 1.,
+    policy_consistency_step_size: int = 16,
+    rehearsal_replay: ReplayBuffer | None = None,
+    rehearsal_fraction: float = 0.,
 ):
     if len(replay) == 0 or steps <= 0:
         return global_step, {}
 
     last_metrics = {}
     grad_clip_groups = world_model_clip_groups(world_model, optimizer)
+
+    # Offline rehearsal replaces part of each batch with offline windows.
+    # The total batch size, and thus the static compile shape, does not change.
+    online_batch_size, rehearsal_batch_size = (
+        offline.rehearsal_batch_sizes(batch_size, rehearsal_fraction)
+        if exists(rehearsal_replay)
+        else (batch_size, 0)
+    )
 
     dataset = ReplayDatasetTimeWindow(
         replay,
@@ -1045,16 +1490,16 @@ def train_world_model(
         # that intentionally uses replacement.
         dataloader = DataLoader(
             dataset,
-            batch_size = batch_size,
+            batch_size = online_batch_size,
             shuffle = True,
             drop_last = False,
         )
     else:
         dataloader = DataLoader(
             dataset,
-            batch_size = batch_size,
+            batch_size = online_batch_size,
             shuffle = True,
-            drop_last = len(dataset) >= batch_size
+            drop_last = len(dataset) >= online_batch_size
         )
 
     dataloader_iter = (
@@ -1063,6 +1508,67 @@ def train_world_model(
         else cycle(dataloader) if len(dataloader) > 0
         else None
     )
+
+    rehearsal_iter = None
+    if rehearsal_batch_size > 0:
+        rehearsal_dataset = ReplayDatasetTimeWindow(
+            rehearsal_replay,
+            window_length = sequence_length,
+            include_metadata = True
+        )
+        rehearsal_iter = cycle(DataLoader(
+            rehearsal_dataset,
+            batch_size = rehearsal_batch_size,
+            shuffle = True,
+            drop_last = len(rehearsal_dataset) >= rehearsal_batch_size
+        ))
+
+    def load_batch():
+        batch = next(dataloader_iter)
+
+        if static_batch_shape and not old_replay_sampling:
+            batch = repeat_batch_to_size(batch, online_batch_size)
+
+        if exists(rehearsal_iter):
+            rehearsal_batch = next(rehearsal_iter)
+
+            if static_batch_shape and not old_replay_sampling:
+                rehearsal_batch = repeat_batch_to_size(rehearsal_batch, rehearsal_batch_size)
+
+            batch = offline.concat_replay_batches(batch, rehearsal_batch)
+
+        return batch
+
+    policy_snapshot = None
+    policy_context_exp = None
+    policy_context_is_truncated = None
+    policy_target_unembeds = None
+
+    if preserve_policy_during_world_model_updates:
+        if world_model_policy_consistency_loss_weight <= 0.:
+            raise ValueError("world_model_policy_consistency_loss_weight must be positive")
+
+        consistency_batch = next(dataloader_iter)
+        if static_batch_shape and not old_replay_sampling:
+            consistency_batch = repeat_batch_to_size(consistency_batch, batch_size)
+
+        policy_context_exp = Experience.from_buffer_dict(consistency_batch)
+        policy_context_exp.lens = consistency_batch.get("_lens")
+        policy_context_exp = policy_context_exp.to(world_model.device)
+        if exists(policy_context_exp.lens):
+            policy_context_is_truncated = torch.zeros_like(
+                policy_context_exp.lens,
+                dtype = torch.bool,
+            )
+        policy_snapshot = FrozenPolicyPrior(world_model).to(world_model.device)
+
+        with torch.no_grad():
+            target_policy_inputs = policy_inputs_from_replay_context(
+                world_model,
+                policy_context_exp,
+                step_size = policy_consistency_step_size,
+            )
+            policy_target_unembeds = Actions(*policy_snapshot.action_unembeds(target_policy_inputs))
 
     pbar = tqdm(range(steps), desc = desc, dynamic_ncols = True)
 
@@ -1077,22 +1583,10 @@ def train_world_model(
 
         with model_step("world_model/step", cuda = True):
             with record("world_model/data/load_batch"):
-                batch = next(dataloader_iter)
-
-                if static_batch_shape and not old_replay_sampling:
-                    batch = repeat_batch_to_size(batch, batch_size)
+                batch = load_batch()
 
             with record("world_model/data/prepare_experience", cuda = True):
-                exp = Experience.from_buffer_dict(batch)
-                exp.lens = batch.get('_lens')
-                exp = exp.to(world_model.device)
-
-                # Mask episode flags when the sampled window does not reach its end.
-                reaches_episode_end = batch.get('_reaches_episode_end')
-                if exists(reaches_episode_end):
-                    reaches_episode_end = reaches_episode_end.to(world_model.device)
-                    if exists(exp.terminals): exp.terminals = exp.terminals & reaches_episode_end
-                    if exists(exp.is_truncated): exp.is_truncated = exp.is_truncated & reaches_episode_end
+                exp = replay_batch_to_experience(batch, world_model.device)
 
             def forward_backward():
                 with record("world_model/model/forward", cuda = True):
@@ -1106,11 +1600,37 @@ def train_world_model(
                         update_loss_ema,
                     )
 
+                    policy_consistency_loss = None
+                    if preserve_policy_during_world_model_updates:
+                        current_policy_inputs = policy_inputs_from_replay_context(
+                            world_model,
+                            policy_context_exp,
+                            step_size = policy_consistency_step_size,
+                        )
+                        current_policy_unembeds = Actions(*policy_snapshot.action_unembeds(
+                            current_policy_inputs,
+                            detach_inputs = False,
+                        ))
+                        policy_consistency_loss = mean_action_distribution_kl(
+                            policy_snapshot.action_embedder,
+                        policy_target_unembeds,
+                        current_policy_unembeds,
+                        lens = policy_context_exp.lens,
+                        is_truncated = policy_context_is_truncated,
+                        )
+                        loss = loss + (
+                            policy_consistency_loss * world_model_policy_consistency_loss_weight
+                        )
+
                 with record("world_model/model/backward", cuda = True):
                     loss.backward()
-                return loss, losses
+                return loss, losses, policy_consistency_loss
 
-            loss, losses = record_timed_block(world_model_loss_timing, world_model.device, forward_backward)
+            loss, losses, policy_consistency_loss = record_timed_block(
+                world_model_loss_timing,
+                world_model.device,
+                forward_backward,
+            )
 
             with record("world_model/optimization/grad_clip", cuda = True):
                 norm, grad_metrics = clip_grad_norm_by_group(grad_clip_groups, max_grad_norm)
@@ -1118,15 +1638,29 @@ def train_world_model(
                 optimizer.step()
                 optimizer.zero_grad()
 
+            post_update_policy_kl = None
+            if preserve_policy_during_world_model_updates:
+                with torch.no_grad():
+                    post_update_policy_inputs = policy_inputs_from_replay_context(
+                        world_model,
+                        policy_context_exp,
+                        step_size = policy_consistency_step_size,
+                    )
+                    post_update_policy_unembeds = Actions(*policy_snapshot.action_unembeds(
+                        post_update_policy_inputs,
+                        detach_inputs = False,
+                    ))
+                    post_update_policy_kl = mean_action_distribution_kl(
+                        policy_snapshot.action_embedder,
+                        policy_target_unembeds,
+                        post_update_policy_unembeds,
+                        lens = policy_context_exp.lens,
+                        is_truncated = policy_context_is_truncated,
+                    )
+
             with record("world_model/metrics", cuda = True):
                 last_metrics = {
-                    "world_model/loss": loss.item(),
-                    "world_model/flow_loss": losses.flow.item(),
-                    "world_model/shortcut_loss": losses.shortcut.item(),
-                    "world_model/reward_loss": (losses.agent_embed_reward.mean() + losses.latent_state_reward.mean()).item(),
-                    "world_model/reward_mae": losses.reward_mae.item(),
-                    "world_model/terminal_loss": (losses.agent_embed_terminal.mean() + losses.latent_state_terminal.mean()).item(),
-                    "world_model/agent_state_pred_loss": losses.agent_state_pred.item(),
+                    **world_model_loss_metrics(loss, losses),
                     "world_model/grad_norm": float(norm),
                     "extra/flow_loss_raw": losses.diagnostics.raw_flow.item(),
                     "extra/shortcut_loss_raw": losses.diagnostics.raw_shortcut.item(),
@@ -1135,6 +1669,9 @@ def train_world_model(
                     "extra/reward_loss_raw": losses.diagnostics.raw_reward.item(),
                     "extra/terminal_loss_raw": losses.diagnostics.raw_terminal.item(),
                 }
+                if exists(policy_consistency_loss):
+                    last_metrics["world_model/policy_consistency_loss_kl"] = policy_consistency_loss.item()
+                    last_metrics["world_model/policy_consistency_kl"] = post_update_policy_kl.item()
                 last_metrics.update({
                     f"world_model/{key}": value
                     for key, value in grad_metrics.items()
@@ -1148,10 +1685,385 @@ def train_world_model(
                 synchronize_if_cuda(world_model.device)
                 world_model_step_timing.record(perf_counter() - step_start)
 
-            del exp, loss, losses, grad_metrics
+            del exp, loss, losses, grad_metrics, policy_consistency_loss, post_update_policy_kl
 
     if exists(training_profiler):
         training_profiler.flush_timings()
+
+    return global_step, last_metrics
+
+
+def call_learn_from_dream(
+    learn_from_dream_fn: Callable,
+    experience: Experience,
+):
+    actions = action_pair_or_empty(experience.actions)
+    log_probs = action_pair_or_empty(experience.log_probs)
+    old_action_unembeds = action_pair_or_empty(experience.old_action_unembeds)
+    return learn_from_dream_fn(
+        experience.latents,
+        experience.proprio,
+        experience.critic_state,
+        experience.agent_embed,
+        experience.policy_input,
+        experience.rewards,
+        experience.terminals,
+        actions.discrete,
+        actions.continuous,
+        log_probs.discrete,
+        log_probs.continuous,
+        old_action_unembeds.discrete,
+        old_action_unembeds.continuous,
+        experience.values,
+        experience.step_size,
+        experience.lens,
+        experience.is_truncated,
+        experience.is_from_world_model,
+        experience.episode_return,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        experience.frozen_returns,
+        experience.frozen_advantages,
+    )
+
+
+CLEANRL_UPDATED_PPO_EPOCHS = 10
+CLEANRL_UPDATED_PPO_NUM_MINIBATCHES = 32
+CLEANRL_UPDATED_PPO_VALUE_LOSS_WEIGHT = .5
+CLEANRL_UPDATED_PPO_MAX_GRAD_NORM = .5
+CLEANRL_PPO_CLOSER_DREAM_CHUNKS = 4
+
+
+def train_cleanrl_updated_ppo_dream(
+    world_model: DynamicsWorldModel,
+    optimizer: Optimizer,
+    dream: Experience,
+    *,
+    learn_from_dream_fn: Callable,
+    learn_from_dream_timing: CallTiming | None,
+    initial_learning_rate: float,
+    iteration: int,
+    total_iterations: int,
+    global_step: int,
+    writer: SummaryWriter | None,
+    record: Callable,
+    cleanrl_ppo_closer: bool = False,
+    shuffle_generator: torch.Generator | None = None,
+    metric_step: int | None = None,
+    epochs: int = CLEANRL_UPDATED_PPO_EPOCHS,
+    num_minibatches: int = CLEANRL_UPDATED_PPO_NUM_MINIBATCHES,
+    value_loss_weight: float = CLEANRL_UPDATED_PPO_VALUE_LOSS_WEIGHT,
+    max_grad_norm: float = CLEANRL_UPDATED_PPO_MAX_GRAD_NORM,
+):
+    """Apply updated CleanRL PPO to one flattened main-model dream batch."""
+
+    if epochs <= 0 or num_minibatches <= 0:
+        raise ValueError("CleanRL updated PPO epochs and minibatches must be positive")
+    if total_iterations <= 0 or not 0 <= iteration < total_iterations:
+        raise ValueError("CleanRL updated PPO iteration values are invalid")
+
+    transitions = flatten_cleanrl_updated_ppo_transitions(world_model, dream)
+    batch_size = transitions.latents.shape[0]
+    minibatch_size = batch_size // num_minibatches
+    if minibatch_size == 0:
+        raise ValueError("CleanRL updated PPO has fewer transitions than minibatches")
+    if minibatch_size < 2 or batch_size % minibatch_size == 1:
+        raise ValueError("CleanRL updated PPO advantage normalization needs two samples per minibatch")
+
+    learning_rate = (1. - iteration / total_iterations) * initial_learning_rate
+    for group in optimizer.param_groups:
+        group["lr"] = learning_rate
+
+    params = optimizer_parameters(optimizer)
+    dream_return = dream.episode_return.mean().item()
+    dream_length = dream.lens.float().mean().item()
+    action_values = safe_cat(action_pair_or_empty(dream.actions), dim = -1)
+    action_std = action_values.float().std().item()
+    last_metrics = {}
+    last_agent_metrics = {}
+    closer_clip_fractions = []
+
+    explained_variance = float("nan")
+    if cleanrl_ppo_closer:
+        flat_returns = transitions.frozen_returns.flatten()
+        flat_old_values = transitions.values.flatten()
+        target_variance = torch.var(flat_returns, correction = 0)
+        if target_variance != 0.:
+            explained_variance = 1. - torch.var(
+                flat_returns - flat_old_values,
+                correction = 0,
+            ).div(target_variance).item()
+
+    for epoch in range(epochs):
+        if cleanrl_ppo_closer:
+            permutation = torch.randperm(
+                batch_size,
+                device = transitions.latents.device,
+                generator = shuffle_generator,
+            )
+        else:
+            permutation = torch.randperm(
+                batch_size,
+                device = transitions.latents.device,
+            )
+        for minibatch_index, start in enumerate(range(0, batch_size, minibatch_size)):
+            indices = permutation[start:start + minibatch_size]
+            minibatch = select_experience_batch(transitions, indices)
+            advantages = minibatch.frozen_advantages
+            minibatch.frozen_advantages = (
+                (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            )
+
+            def forward_backward():
+                with record("imagination/model/learn_forward", cuda = True):
+                    policy_loss, value_loss, value_diagnostics = call_learn_from_dream(
+                        learn_from_dream_fn,
+                        minibatch,
+                    )
+                    loss = policy_loss + value_loss_weight * value_loss
+
+                optimizer.zero_grad(set_to_none = True)
+                with record("imagination/model/backward", cuda = True):
+                    loss.backward()
+                return policy_loss, value_loss, value_diagnostics, loss
+
+            policy_loss, value_loss, value_diagnostics, loss = record_timed_block(
+                learn_from_dream_timing,
+                world_model.device,
+                forward_backward,
+            )
+
+            with record("imagination/optimization/grad_clip", cuda = True):
+                grad_norm = float(clip_grad_norm_(params, max_grad_norm))
+            optimizer.step()
+
+            with torch.no_grad():
+                agent_metrics = agent_approx_kl_metrics(
+                    world_model,
+                    minibatch,
+                    include_cleanrl_metrics = cleanrl_ppo_closer,
+                )
+
+            imagination_metrics = {
+                "imagination/loss": loss.item(),
+                "imagination/policy_loss": policy_loss.detach().item(),
+                "imagination/value_loss": value_loss.item(),
+                "imagination/dream_return": dream_return,
+                "imagination/dream_length": dream_length,
+                "imagination/action_std": action_std,
+                "imagination/grad_norm": grad_norm,
+                "imagination/approx_kl_mean": agent_metrics["approx_kl_mean"].item(),
+                "imagination/approx_kl_min": agent_metrics["approx_kl_min"].item(),
+                "imagination/approx_kl_max": agent_metrics["approx_kl_max"].item(),
+                "imagination/cleanrl_updated_ppo_epoch": epoch,
+                "imagination/cleanrl_updated_ppo_minibatch": minibatch_index,
+                "imagination/cleanrl_updated_ppo_learning_rate": learning_rate,
+            }
+            imagination_metrics.update({key: value.item() for key, value in value_diagnostics.items()})
+            last_metrics = imagination_metrics
+            last_agent_metrics = agent_metrics
+            if cleanrl_ppo_closer:
+                closer_clip_fractions.append(agent_metrics["clip_fraction"])
+
+            if not cleanrl_ppo_closer:
+                log_scalars(writer, last_metrics, global_step)
+            global_step += 1
+
+            del minibatch, policy_loss, value_loss, value_diagnostics, loss, agent_metrics
+
+    if cleanrl_ppo_closer:
+        entropy = last_metrics["extra/policy_entropy"]
+        action_range = world_model.action_embedder.continuous_target_action_range
+        if action_range is not None:
+            low, high = action_range
+            entropy += world_model.action_embedder.num_continuous_action_types * np.log(high - low)
+
+        closer_metrics = {
+            "charts/learning_rate": learning_rate,
+            "cleanrl_updated_ppo/loss": last_metrics["imagination/loss"],
+            "cleanrl_updated_ppo/policy_loss": last_metrics["imagination/policy_loss"],
+            "cleanrl_updated_ppo/value_loss": last_metrics["imagination/value_loss"],
+            "cleanrl_updated_ppo/entropy": entropy,
+            "cleanrl_updated_ppo/old_approx_kl": last_agent_metrics["old_approx_kl"].item(),
+            "cleanrl_updated_ppo/approx_kl": last_agent_metrics["approx_kl_mean"].item(),
+            "cleanrl_updated_ppo/clip_fraction": torch.stack(closer_clip_fractions).mean().item(),
+            "cleanrl_updated_ppo/explained_variance": explained_variance,
+            "cleanrl_updated_ppo/grad_norm": last_metrics["imagination/grad_norm"],
+        }
+        log_scalars(
+            writer,
+            closer_metrics,
+            global_step if metric_step is None else metric_step,
+        )
+        last_metrics.update(closer_metrics)
+
+    return global_step, last_metrics
+
+
+def train_reused_ppo_dream(
+    world_model: DynamicsWorldModel,
+    optimizer: Optimizer,
+    dream: Experience,
+    *,
+    learn_from_dream_fn: Callable,
+    learn_from_dream_timing: CallTiming | None,
+    max_grad_norm: float,
+    epochs: int,
+    num_minibatches: int,
+    max_exact_kl: float,
+    lr_backoff: float,
+    max_backoffs: int,
+    global_step: int,
+    writer: SummaryWriter | None,
+    record: Callable,
+):
+    if epochs <= 0 or num_minibatches <= 0:
+        raise ValueError("PPO reuse epochs and minibatches must be positive")
+    if dream.latents.shape[0] < num_minibatches:
+        raise ValueError("PPO reuse needs at least one environment per minibatch")
+    if not 0. < lr_backoff < 1.:
+        raise ValueError("ppo_reuse_lr_backoff must be between 0 and 1")
+    if max_exact_kl <= 0.:
+        raise ValueError("ppo_reuse_max_exact_kl must be positive")
+
+    dream = freeze_ppo_targets(world_model, dream)
+    policy_params = ppo_optimizer_role_parameters(optimizer, "policy")
+    value_params = ppo_optimizer_role_parameters(optimizer, "value")
+    if not policy_params or not value_params:
+        raise ValueError("PPO reuse requires policy and value optimizer groups")
+
+    grad_clip_groups = agent_clip_groups(world_model, optimizer)
+    actor_updates_stopped = False
+    accepted_actor_updates = 0
+    completed_value_updates = 0
+    last_metrics = {}
+    full_policy_inputs = (
+        dream.policy_input
+        if world_model.policy_all_tokens and exists(dream.policy_input)
+        else dream.agent_embed
+    )
+    full_behavior_unembeds = action_pair_or_empty(dream.old_action_unembeds)
+
+    @torch.no_grad()
+    def full_dream_exact_kl():
+        return exact_policy_kl(
+            world_model,
+            full_policy_inputs,
+            full_behavior_unembeds,
+            lens = dream.lens,
+            is_truncated = dream.is_truncated,
+        )
+
+    for epoch in range(epochs):
+        permutation = torch.randperm(dream.latents.shape[0], device = dream.latents.device)
+        minibatch_indices = permutation.tensor_split(num_minibatches)
+
+        for minibatch_index, indices in enumerate(minibatch_indices):
+            minibatch = select_experience_batch(dream, indices)
+
+            def forward_backward():
+                with record("imagination/model/learn_forward", cuda = True):
+                    policy_loss, value_loss, value_diagnostics = call_learn_from_dream(
+                        learn_from_dream_fn,
+                        minibatch,
+                    )
+
+                loss = policy_loss + value_loss
+                with record("imagination/model/backward", cuda = True):
+                    loss.backward()
+                return policy_loss, value_loss, value_diagnostics, loss
+
+            policy_loss, value_loss, value_diagnostics, loss = record_timed_block(
+                learn_from_dream_timing,
+                world_model.device,
+                forward_backward,
+            )
+
+            with record("imagination/optimization/grad_clip", cuda = True):
+                norm, grad_metrics = clip_grad_norm_by_group(grad_clip_groups, max_grad_norm)
+
+            policy_gradients = [
+                param.grad.detach().clone() if exists(param.grad) else None
+                for param in policy_params
+            ]
+            policy_snapshot = snapshot_optimizer_parameters(optimizer, policy_params)
+            accepted_actor_update = False
+            backoff_count = 0
+
+            if actor_updates_stopped:
+                for param in policy_params:
+                    param.grad = None
+                optimizer.step()
+            else:
+                optimizer.step()
+                exact_kl = full_dream_exact_kl()
+
+                while exact_kl.item() > max_exact_kl and backoff_count < max_backoffs:
+                    restore_optimizer_parameters(optimizer, policy_params, policy_snapshot)
+                    backoff_count += 1
+                    for group in optimizer.param_groups:
+                        if group.get("ppo_role") == "policy":
+                            group["lr"] *= lr_backoff
+
+                    for param in value_params:
+                        param.grad = None
+                    for param, gradient in zip(policy_params, policy_gradients):
+                        param.grad = gradient
+
+                    optimizer.step()
+                    exact_kl = full_dream_exact_kl()
+
+                if exact_kl.item() <= max_exact_kl:
+                    accepted_actor_update = True
+                    accepted_actor_updates += 1
+                else:
+                    restore_optimizer_parameters(optimizer, policy_params, policy_snapshot)
+                    actor_updates_stopped = True
+                    exact_kl = full_dream_exact_kl()
+
+            completed_value_updates += 1
+            optimizer.zero_grad()
+
+            with torch.no_grad():
+                agent_metrics = agent_approx_kl_metrics(world_model, minibatch)
+                if actor_updates_stopped:
+                    exact_kl = full_dream_exact_kl()
+
+            policy_lr = next(
+                group["lr"] for group in optimizer.param_groups
+                if group.get("ppo_role") == "policy"
+            )
+            last_metrics = {
+                "imagination/loss": loss.item(),
+                "imagination/policy_loss": policy_loss.detach().item(),
+                "imagination/value_loss": value_loss.item(),
+                "imagination/dream_return": dream.episode_return.mean().item(),
+                "imagination/dream_length": dream.lens.float().mean().item(),
+                "imagination/action_std": dream.actions.continuous.std().item(),
+                "imagination/grad_norm": float(norm),
+                "imagination/approx_kl_mean": agent_metrics["approx_kl_mean"].item(),
+                "imagination/approx_kl_min": agent_metrics["approx_kl_min"].item(),
+                "imagination/approx_kl_max": agent_metrics["approx_kl_max"].item(),
+                "imagination/exact_policy_kl": exact_kl.item(),
+                "imagination/ppo_reuse_epoch": epoch,
+                "imagination/ppo_reuse_minibatch": minibatch_index,
+                "imagination/ppo_actor_update_accepted": float(accepted_actor_update),
+                "imagination/ppo_actor_updates": accepted_actor_updates,
+                "imagination/ppo_value_updates": completed_value_updates,
+                "imagination/ppo_lr_backoffs": backoff_count,
+                "imagination/ppo_policy_learning_rate": policy_lr,
+            }
+            last_metrics.update({key: value.item() for key, value in value_diagnostics.items()})
+            last_metrics.update({f"imagination/{key}": value for key, value in grad_metrics.items()})
+            log_scalars(writer, last_metrics, global_step)
+            global_step += 1
+
+            del minibatch, policy_loss, value_loss, value_diagnostics, loss
+            del agent_metrics, grad_metrics, policy_gradients, policy_snapshot
 
     return global_step, last_metrics
 
@@ -1183,6 +2095,20 @@ def train_agent_in_imagination(
     full_transformer_finetuning: bool = False,
     preservation_sequence_length: int | None = None,
     preservation_batch_size: int | None = None,
+    align_generated_dream_transitions: bool = False,
+    cleanrl_updated_ppo: bool = False,
+    cleanrl_ppo_closer: bool = False,
+    cleanrl_updated_ppo_iteration_offset: int = 0,
+    cleanrl_updated_ppo_total_iterations: int | None = None,
+    cleanrl_updated_ppo_initial_learning_rate: float | None = None,
+    cleanrl_updated_ppo_shuffle_generator: torch.Generator | None = None,
+    cleanrl_updated_ppo_metric_step: int | None = None,
+    reuse_ppo_dream_batch: bool = False,
+    ppo_reuse_epochs: int = 4,
+    ppo_reuse_num_minibatches: int = 4,
+    ppo_reuse_max_exact_kl: float = 0.02,
+    ppo_reuse_lr_backoff: float = 0.5,
+    ppo_reuse_max_backoffs: int = 6,
 ):
     if steps <= 0:
         return global_step, {}
@@ -1190,6 +2116,31 @@ def train_agent_in_imagination(
     last_metrics = {}
     pbar = tqdm(range(steps), desc = "imagination", leave = False)
     grad_clip_groups = agent_clip_groups(world_model, optimizer)
+
+    if reuse_ppo_dream_batch and objective != "ppo":
+        raise ValueError("reuse_ppo_dream_batch requires objective='ppo'")
+    if reuse_ppo_dream_batch and full_transformer_finetuning:
+        raise ValueError("reuse_ppo_dream_batch does not support full_transformer_finetuning")
+    if cleanrl_updated_ppo and objective != "ppo":
+        raise ValueError("cleanrl_updated_ppo requires objective='ppo'")
+    if cleanrl_updated_ppo and full_transformer_finetuning:
+        raise ValueError("cleanrl_updated_ppo does not support full_transformer_finetuning")
+    if cleanrl_updated_ppo and reuse_ppo_dream_batch:
+        raise ValueError("cleanrl_updated_ppo and reuse_ppo_dream_batch are mutually exclusive")
+    if cleanrl_ppo_closer and not cleanrl_updated_ppo:
+        raise ValueError("cleanrl_ppo_closer requires cleanrl_updated_ppo=true")
+
+    if cleanrl_updated_ppo:
+        cleanrl_updated_ppo_total_iterations = (
+            steps
+            if cleanrl_updated_ppo_total_iterations is None
+            else cleanrl_updated_ppo_total_iterations
+        )
+        cleanrl_updated_ppo_initial_learning_rate = (
+            optimizer.param_groups[0]["lr"]
+            if cleanrl_updated_ppo_initial_learning_rate is None
+            else cleanrl_updated_ppo_initial_learning_rate
+        )
 
     prompt_dataset = ReplayDatasetTimeWindow(
         replay_buffer = replay,
@@ -1228,6 +2179,58 @@ def train_agent_in_imagination(
         else cycle(prompt_dataloader) if prompt_length > 0 and len(prompt_dataloader) > 0
         else None
     )
+
+    def generate_cleanrl_ppo_closer_chunk(record):
+        use_prompt = prompt_length > 0 and (static_generate_shape or random.random() < prompt_probability)
+        prompts = None
+        prompt_batch = None
+
+        if use_prompt and exists(prompt_iterator):
+            with record("imagination/data/load_prompt", cuda = True):
+                prompt_batch = next(prompt_iterator)
+                prompt_batch = tree_map(
+                    lambda t: t.to(world_model.device) if torch.is_tensor(t) else t,
+                    prompt_batch,
+                )
+
+                if static_generate_shape:
+                    prompt_batch = repeat_batch_to_size(prompt_batch, batch_size)
+
+                prompts = dict(
+                    prompt_latents = prompt_batch.get("latents"),
+                    prompt_proprio = prompt_batch.get("proprio"),
+                    prompt_discrete_actions = prompt_batch.get("actions_discrete"),
+                    prompt_continuous_actions = prompt_batch.get("actions_continuous"),
+                    prompt_rewards = prompt_batch.get("rewards")[:, :-1] if exists(prompt_batch.get("rewards")) else None,
+                )
+
+        generation_horizon = horizon + prompt_length if exists(prompts) else horizon
+        actual_batch_size = prompt_batch.get("latents").shape[0] if exists(prompts) else batch_size
+        has_prompt = exists(prompts)
+        prompts = prompts or {}
+
+        if exists(getattr(generate_rollout_fn, "timing", None)) and generate_rollout_fn.timing.cuda_graphs:
+            cudagraph_mark_step_begin()
+
+        with record("imagination/model/generate", cuda = True):
+            chunk = generate_rollout_fn(
+                generation_horizon,
+                actual_batch_size,
+                prompts.get("prompt_latents"),
+                prompts.get("prompt_proprio"),
+                prompts.get("prompt_discrete_actions"),
+                prompts.get("prompt_continuous_actions"),
+                prompts.get("prompt_rewards"),
+            )
+
+        if has_prompt:
+            with record("imagination/data/trim_prompt", cuda = True):
+                chunk = trim_prompt_from_dream(chunk, prompt_length, horizon)
+
+        if align_generated_dream_transitions:
+            chunk = align_dream_transition_rewards(chunk)
+
+        return chunk
 
     preservation_iterator = None
     if full_transformer_finetuning:
@@ -1272,7 +2275,7 @@ def train_agent_in_imagination(
     if static_generate_shape and prompt_length > 0 and not exists(prompt_iterator):
         raise ValueError("static compiled generation requires at least one prompt window")
 
-    for _ in pbar:
+    for imagination_iteration in pbar:
         profiler = training_profiler
         record = profiler.record if exists(profiler) else lambda *_, **__: nullcontext()
         if exists(profiler):
@@ -1327,6 +2330,15 @@ def train_agent_in_imagination(
                 with record("imagination/data/trim_prompt", cuda = True):
                     dream = trim_prompt_from_dream(dream, prompt_length, horizon)
 
+            if align_generated_dream_transitions:
+                dream = align_dream_transition_rewards(dream)
+
+            if cleanrl_ppo_closer:
+                dream_chunks = [dream]
+                for _ in range(CLEANRL_PPO_CLOSER_DREAM_CHUNKS - 1):
+                    dream_chunks.append(generate_cleanrl_ppo_closer_chunk(record))
+                dream = combine_experiences(dream_chunks)
+
             if objective == "pmpo" and exists(policy_prior):
                 with record("imagination/model/policy_prior", cuda = True):
                     dream = attach_policy_prior_unembeds(dream, policy_prior)
@@ -1345,6 +2357,70 @@ def train_agent_in_imagination(
                     preservation_exp = Experience.from_buffer_dict(preservation_batch)
                     preservation_exp.lens = preservation_batch.get("_lens")
                     preservation_exp = preservation_exp.to(world_model.device)
+
+        if cleanrl_updated_ppo:
+            global_step, last_metrics = train_cleanrl_updated_ppo_dream(
+                world_model,
+                optimizer,
+                dream,
+                learn_from_dream_fn = learn_from_dream_fn,
+                learn_from_dream_timing = learn_from_dream_timing,
+                initial_learning_rate = cleanrl_updated_ppo_initial_learning_rate,
+                iteration = cleanrl_updated_ppo_iteration_offset + imagination_iteration,
+                total_iterations = cleanrl_updated_ppo_total_iterations,
+                global_step = global_step,
+                writer = writer,
+                record = record,
+                cleanrl_ppo_closer = cleanrl_ppo_closer,
+                shuffle_generator = cleanrl_updated_ppo_shuffle_generator,
+                metric_step = cleanrl_updated_ppo_metric_step,
+            )
+            pbar.set_postfix(
+                dream_return = f"{last_metrics['imagination/dream_return']:.1f}",
+                loss = f"{last_metrics['imagination/loss']:.3f}",
+            )
+
+            if exists(imagination_step_timing):
+                synchronize_if_cuda(world_model.device)
+                imagination_step_timing.record(perf_counter() - step_start)
+
+            if exists(profiler):
+                profiler.advance()
+
+            del dream
+            continue
+
+        if reuse_ppo_dream_batch:
+            global_step, last_metrics = train_reused_ppo_dream(
+                world_model,
+                optimizer,
+                dream,
+                learn_from_dream_fn = learn_from_dream_fn,
+                learn_from_dream_timing = learn_from_dream_timing,
+                max_grad_norm = max_grad_norm,
+                epochs = ppo_reuse_epochs,
+                num_minibatches = ppo_reuse_num_minibatches,
+                max_exact_kl = ppo_reuse_max_exact_kl,
+                lr_backoff = ppo_reuse_lr_backoff,
+                max_backoffs = ppo_reuse_max_backoffs,
+                global_step = global_step,
+                writer = writer,
+                record = record,
+            )
+            pbar.set_postfix(
+                dream_return = f"{last_metrics['imagination/dream_return']:.1f}",
+                loss = f"{last_metrics['imagination/loss']:.3f}",
+            )
+
+            if exists(imagination_step_timing):
+                synchronize_if_cuda(world_model.device)
+                imagination_step_timing.record(perf_counter() - step_start)
+
+            if exists(profiler):
+                profiler.advance()
+
+            del dream
+            continue
 
         dream_actions = action_pair_or_empty(dream.actions)
         dream_log_probs = action_pair_or_empty(dream.log_probs)
@@ -1381,6 +2457,8 @@ def train_agent_in_imagination(
                     preservation_actions.discrete,
                     preservation_actions.continuous,
                     preservation_exp.lens if exists(preservation_exp) else None,
+                    dream.frozen_returns,
+                    dream.frozen_advantages,
                 )
 
             loss = policy_loss + value_loss
@@ -1471,8 +2549,11 @@ def save_checkpoint(
     world_model: DynamicsWorldModel,
     world_optimizer: Optimizer,
     agent_optimizer: Optimizer,
+    progress: dict[str, int | float] | None = None,
+    optimizer_settings: dict[str, list[dict]] | None = None,
 ):
     path.parent.mkdir(parents = True, exist_ok = True)
+    temp_path = path.with_name(f"{path.name}.tmp")
     torch.save(
         dict(
             loop = loop,
@@ -1480,9 +2561,75 @@ def save_checkpoint(
             world_model = world_model.state_dict(),
             world_optimizer = optimizer_state_dict_for_checkpoint(world_optimizer),
             agent_optimizer = optimizer_state_dict_for_checkpoint(agent_optimizer),
+            progress = progress,
+            optimizer_settings = optimizer_settings,
         ),
-        str(path),
+        str(temp_path),
     )
+    os.replace(temp_path, path)
+
+
+REPLAY_SNAPSHOT_PREFIX = "replay_"
+
+
+def replay_snapshot_path(checkpoint_path: Path) -> Path:
+    """Return the replay snapshot folder of a loop checkpoint, for example replay_loop_25."""
+    return checkpoint_path.with_name(f"{REPLAY_SNAPSHOT_PREFIX}{checkpoint_path.stem}")
+
+
+def save_resume_checkpoint(path: Path, *, replay: ReplayBuffer, **checkpoint):
+    """Save a loop checkpoint and a copy of the replay at the same loop.
+
+    The replay folder of the run receives each rollout. A resume discards it and
+    copies the snapshot back, so the model and the replay agree. Only the newest
+    snapshot is kept, because each snapshot is a full copy of the replay.
+    """
+    snapshot = replay_snapshot_path(path)
+    temp_snapshot = snapshot.with_name(f"{snapshot.name}.tmp")
+
+    replay.flush()
+    shutil.rmtree(temp_snapshot, ignore_errors = True)
+    shutil.copytree(replay.folder, temp_snapshot)
+    shutil.rmtree(snapshot, ignore_errors = True)
+    temp_snapshot.rename(snapshot)
+
+    # Save the checkpoint after its snapshot is complete, and remove older
+    # snapshots last. A crash at any point keeps one checkpoint that can resume.
+    save_checkpoint(path, **checkpoint)
+
+    for old_snapshot in path.parent.glob(f"{REPLAY_SNAPSHOT_PREFIX}loop_*"):
+        if old_snapshot != snapshot and old_snapshot.is_dir():
+            shutil.rmtree(old_snapshot)
+
+
+def restore_replay_snapshot(checkpoint_path: Path, replay_folder: Path) -> ReplayBuffer:
+    snapshot = replay_snapshot_path(checkpoint_path)
+    if not snapshot.is_dir():
+        raise FileNotFoundError(
+            f"{checkpoint_path} has no replay snapshot at {snapshot}. Only the newest "
+            "checkpoint keeps a snapshot, and checkpoints saved before snapshots existed "
+            "cannot resume."
+        )
+
+    shutil.rmtree(replay_folder, ignore_errors = True)
+    shutil.copytree(snapshot, replay_folder)
+    return ReplayBuffer.from_folder(replay_folder)
+
+
+# These keys select a kernel, not the update, so a resume on another device can change them.
+OPTIMIZER_IMPLEMENTATION_KEYS = frozenset({"fused", "foreach", "capturable", "differentiable"})
+
+
+def optimizer_group_settings(optimizer: Optimizer) -> list[dict]:
+    """Return the hyperparameters of each parameter group, such as lr and weight_decay."""
+    return [
+        {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in sorted(group.items())
+            if key != "params" and key not in OPTIMIZER_IMPLEMENTATION_KEYS and not callable(value)
+        }
+        for group in optimizer.param_groups
+    ]
 
 
 def optimizer_state_dict_for_checkpoint(optimizer: Optimizer):
@@ -1552,6 +2699,15 @@ def resolve_log_dir(
 
 def serialize_hyperparameters(hyperparameters: dict):
     return "```json\n" + json.dumps(hyperparameters, indent = 2, sort_keys = True, default = str) + "\n```"
+
+
+def configure_matmul_precision(allow_tf32: bool, device: torch.device):
+    """Use TF32 and 'high' float32 matmul precision on CUDA. Every trainer calls this."""
+
+    if allow_tf32 and device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
 
 def validate_dynamics_loss_normalization(
@@ -1708,8 +2864,79 @@ def main(
     activation_memory_budget: float = 0.9,
     small_model_only: bool = False,
     small_model: Mapping[str, Any] | None = None,
+    align_generated_dream_transitions: bool = False,
+    preserve_policy_during_world_model_updates: bool = False,
+    world_model_policy_consistency_loss_weight: float = 1.,
+    cleanrl_updated_ppo: bool = False,
+    cleanrl_ppo_closer: bool = False,
+    cleanrl_ppo_closer_hl_gauss_value_loss: bool = False,
+    reuse_ppo_dream_batch: bool = False,
+    ppo_reuse_epochs: int = 4,
+    ppo_reuse_num_minibatches: int = 4,
+    ppo_reuse_max_exact_kl: float = 0.02,
+    ppo_reuse_lr_backoff: float = 0.5,
+    ppo_reuse_max_backoffs: int = 6,
+    scale_reward_gradient_into_transformer: bool = False,
+    reward_gradient_into_transformer_scale: float = 0.01,
+    audit_deeper_dynamics: bool = False,
+    audit_arrival_reward_target: bool = False,
+    audit_quarter_envs_per_loop: bool = False,
+    audit_diagnostics: bool = False,
+    audit_diagnostics_every_env_steps: int = 640_000,
+    offline_pretraining: bool = False,
+    offline_stages: tuple[str, ...] = offline.OFFLINE_STAGES,
+    offline_expert_repo: str = "cleanrl/HalfCheetah-v4-td3_continuous_action-seed1",
+    offline_expert_revision: str = "85477545d6db77ae3c7ca8e4e0b48f515d4c1432",
+    offline_expert_filename: str = "td3_continuous_action.cleanrl_model",
+    offline_expert_cache_dir: str = "runs/offline_data/experts",
+    offline_expert_path: str | None = None,
+    offline_expert_min_return: float = 8000.,
+    offline_data_dir: str = "runs/offline_data",
+    offline_dataset_name: str = "halfcheetah_v4_mix_1m",
+    offline_data_steps: int = 1_000_000,
+    offline_data_mix: Mapping[str, float] | None = None,
+    offline_expert_noise_stds: tuple[float, ...] = (0.1, 0.2, 0.4, 0.8),
+    offline_data_seed: int = 10042,
+    offline_data_num_envs: int = 64,
+    offline_pretrain_dir: str = "runs/offline_pretrain",
+    offline_pretrain_name: str | None = None,
+    offline_world_model_steps: int = 20000,
+    offline_world_model_finetune_steps: int = 0,
+    offline_validation_fraction: float = 0.05,
+    offline_pretrain_checkpoint_every: int = 2000,
+    offline_pretrained_checkpoint: str | None = None,
+    offline_load_world_optimizer: bool = True,
+    offline_rehearsal_fraction: float = 0.25,
 ):
     hyperparameters = dict(locals())
+
+    if offline_data_mix is None:
+        offline_data_mix = offline.DEFAULT_DATA_MIX
+
+    # Offline data collection and pretraining (notes/pretraining_impl_plan.md).
+    # The stages are empty unless offline_pretraining is true.
+    offline_stages = offline.validate_offline_config(
+        offline_pretraining = offline_pretraining,
+        small_model_only = small_model_only,
+        offline_stages = offline_stages,
+        offline_pretrained_checkpoint = offline_pretrained_checkpoint,
+        checkpoint_path = checkpoint_path,
+        offline_rehearsal_fraction = offline_rehearsal_fraction,
+        offline_data_mix = offline_data_mix,
+        offline_expert_noise_stds = offline_expert_noise_stds,
+        offline_data_steps = offline_data_steps,
+        offline_data_num_envs = offline_data_num_envs,
+        offline_validation_fraction = offline_validation_fraction,
+        offline_world_model_steps = offline_world_model_steps,
+        offline_world_model_finetune_steps = offline_world_model_finetune_steps,
+        offline_pretrain_checkpoint_every = offline_pretrain_checkpoint_every,
+        continuous_dist_type = continuous_dist_type,
+    )
+    offline_pretrain_stage = "pretrain" in offline_stages
+    offline_rl_stage = "rl" in offline_stages
+
+    if small_model_only and (audit_diagnostics or any(hyperparameters[flag] for flag in AUDIT_ABLATION_FLAGS)):
+        raise ValueError("audit ablation and diagnostics flags require small_model_only=false")
 
     # Keep the standard Dreamer path untouched unless the explicit benchmark
     # flag selects the state-only trainer before tokenizer setup.
@@ -1720,11 +2947,72 @@ def main(
     if not run_details:
         raise ValueError("run_details is required and must be non-empty")
 
+    # Audit ablations (runs/audit_9-24-26/REPORT.md). The overrides are empty
+    # unless an audit flag is set. Tokenizer pretraining keeps the configured
+    # environment count, so every arm pretrains on the same random data.
+    tokenizer_pretrain_num_envs = num_envs
+    audit_overrides = resolve_audit_ablations(
+        audit_deeper_dynamics = audit_deeper_dynamics,
+        audit_arrival_reward_target = audit_arrival_reward_target,
+        audit_quarter_envs_per_loop = audit_quarter_envs_per_loop,
+        depth = depth,
+        time_block_every = time_block_every,
+        old_reward_shifting = old_reward_shifting,
+        align_generated_dream_transitions = align_generated_dream_transitions,
+        num_envs = num_envs,
+        replay_size = replay_size,
+        num_loops = num_loops,
+        checkpoint_every = checkpoint_every,
+    )
+
+    if len(audit_overrides) > 0:
+        hyperparameters["audit_effective_overrides"] = audit_overrides
+        depth = audit_overrides.get("depth", depth)
+        old_reward_shifting = audit_overrides.get("old_reward_shifting", old_reward_shifting)
+        align_generated_dream_transitions = audit_overrides.get("align_generated_dream_transitions", align_generated_dream_transitions)
+        num_envs = audit_overrides.get("num_envs", num_envs)
+        replay_size = audit_overrides.get("replay_size", replay_size)
+        num_loops = audit_overrides.get("num_loops", num_loops)
+        checkpoint_every = audit_overrides.get("checkpoint_every", checkpoint_every)
+
     if full_transformer_finetuning and objective != "pmpo":
         raise ValueError("full_transformer_finetuning requires objective='pmpo' for the policy-prior loss")
 
     if full_transformer_finetuning and pmpo_kl_div_loss_weight <= 0.:
         raise ValueError("full_transformer_finetuning requires pmpo_kl_div_loss_weight > 0")
+
+    if align_generated_dream_transitions and not old_reward_shifting:
+        raise ValueError("align_generated_dream_transitions requires old_reward_shifting=true")
+
+    if preserve_policy_during_world_model_updates and world_model_policy_consistency_loss_weight <= 0.:
+        raise ValueError("world_model_policy_consistency_loss_weight must be positive")
+
+    if reuse_ppo_dream_batch and objective != "ppo":
+        raise ValueError("reuse_ppo_dream_batch requires objective='ppo'")
+
+    if reuse_ppo_dream_batch and not normalize_advantages:
+        raise ValueError("reuse_ppo_dream_batch requires normalize_advantages=true")
+
+    if cleanrl_updated_ppo and objective != "ppo":
+        raise ValueError("cleanrl_updated_ppo requires objective='ppo'")
+
+    if cleanrl_updated_ppo and reuse_ppo_dream_batch:
+        raise ValueError("cleanrl_updated_ppo and reuse_ppo_dream_batch are mutually exclusive")
+
+    if cleanrl_updated_ppo and full_transformer_finetuning:
+        raise ValueError("cleanrl_updated_ppo does not support full_transformer_finetuning")
+
+    if cleanrl_updated_ppo and continuous_dist_type != "beta":
+        raise ValueError("cleanrl_updated_ppo requires continuous_dist_type='beta'")
+
+    if cleanrl_updated_ppo and use_delight_gating:
+        raise ValueError("cleanrl_updated_ppo requires use_delight_gating=false")
+
+    if cleanrl_ppo_closer and not cleanrl_updated_ppo:
+        raise ValueError("cleanrl_ppo_closer requires cleanrl_updated_ppo=true")
+
+    if cleanrl_ppo_closer_hl_gauss_value_loss and not cleanrl_ppo_closer:
+        raise ValueError("cleanrl_ppo_closer_hl_gauss_value_loss requires cleanrl_ppo_closer=true")
 
     validate_dynamics_loss_normalization(
         use_dynamics_loss_normalization,
@@ -1734,13 +3022,26 @@ def main(
     if exists(checkpoint_path) and clear_log_dir:
         raise ValueError("clear_log_dir must be false when checkpoint_path is set, otherwise resume state would be deleted")
 
+    effective_imagination_train_steps = 1 if cleanrl_ppo_closer else imagination_train_steps
+    # The offline rl stage replaces the in-loop world-model pretraining.
+    in_loop_world_model_pretrain_steps = (
+        0 if offline_rl_stage
+        else pretrain_world_model_finetune_steps + pretrain_world_model_combined_steps
+    )
+    offline_pretrain_steps = (
+        offline_world_model_finetune_steps + offline_world_model_steps
+        if offline_pretrain_stage
+        else 0
+    )
+    runs_online_loop = not offline_pretraining or offline_rl_stage
     configured_profile_steps = (
-        (
-            pretrain_world_model_finetune_steps + pretrain_world_model_combined_steps
-            if not exists(checkpoint_path) and num_loops > 0
+        offline_pretrain_steps
+        + (
+            in_loop_world_model_pretrain_steps
+            if not exists(checkpoint_path) and num_loops > 0 and runs_online_loop
             else 0
         )
-        + num_loops * (world_model_train_steps + imagination_train_steps)
+        + (num_loops * (world_model_train_steps + effective_imagination_train_steps) if runs_online_loop else 0)
     )
     if profile and configured_profile_steps < PROFILE_TOTAL_STEPS:
         raise ValueError(
@@ -1750,6 +3051,82 @@ def main(
 
     compile_mode = normalize_compile_mode(compile_mode)
     obs_dim, action_dim, action_range = inspect_env_spaces(env_name, obs_dim)
+
+    # The collect stage runs before the CUDA check, so a collect-only run works on a CPU node.
+    offline_dataset_dir = offline.offline_dataset_dir(offline_data_dir, env_name, offline_dataset_name)
+
+    if "collect" in offline_stages:
+        offline.collect_offline_dataset(
+            env_name = env_name,
+            obs_dim = obs_dim,
+            action_dim = action_dim,
+            action_range = action_range,
+            data_dir = offline_data_dir,
+            dataset_name = offline_dataset_name,
+            data_steps = offline_data_steps,
+            data_mix = offline_data_mix,
+            noise_stds = offline_expert_noise_stds,
+            data_seed = offline_data_seed,
+            num_envs = offline_data_num_envs,
+            expert_repo = offline_expert_repo,
+            expert_revision = offline_expert_revision,
+            expert_filename = offline_expert_filename,
+            expert_cache_dir = offline_expert_cache_dir,
+            expert_path = offline_expert_path,
+            expert_min_return = offline_expert_min_return,
+        )
+
+        if offline_stages == ("collect",):
+            return None
+
+    offline_signature = None
+    offline_dataset = None
+    offline_data_split = None
+    offline_pretrain_path = None
+    offline_package = None
+    offline_env_steps = None
+
+    if offline_pretraining:
+        offline_signature = offline.pretrain_signature({
+            **hyperparameters,
+            "obs_dim": obs_dim,
+            "depth": depth,
+            "old_reward_shifting": old_reward_shifting,
+        })
+        offline_overrides = {}
+
+        if offline_pretrain_stage:
+            offline_dataset = offline.load_offline_dataset(offline_dataset_dir)
+            offline_data_split = offline.offline_split(offline_dataset, offline_validation_fraction, offline_data_seed)
+            offline_pretrain_path = Path(offline_pretrain_dir) / (offline_pretrain_name or run_name)
+            offline_env_steps = offline_dataset.env_steps
+
+            if (offline_pretrain_path / offline.PRETRAINED_FILE).exists():
+                raise FileExistsError(
+                    f"{offline_pretrain_path / offline.PRETRAINED_FILE} exists. Use offline_stages=[rl] with "
+                    "offline_pretrained_checkpoint, or choose a new offline_pretrain_name."
+                )
+
+            offline_overrides["pretrain_tokenizer_observations"] = int(
+                (offline_dataset.lens[offline_data_split.train] + 1).sum()
+            )
+        elif offline_rl_stage:
+            # Check the signature before any expensive setup. A resumed run
+            # reads only the metadata; its loop checkpoint holds the models.
+            offline_package = offline.load_offline_pretrained(offline_pretrained_checkpoint, signature = offline_signature)
+            offline_env_steps = int(offline_package["offline_env_steps"])
+
+            if exists(checkpoint_path):
+                offline_package = None
+            else:
+                offline_overrides.update(pretrain_tokenizer_steps = 0, pretrain_tokenizer_observations = 0)
+
+        if offline_rl_stage:
+            offline_overrides.update(pretrain_world_model_finetune_steps = 0, pretrain_world_model_combined_steps = 0)
+
+        hyperparameters["offline_effective_overrides"] = offline_overrides
+        hyperparameters["offline_env_steps"] = offline_env_steps
+        hyperparameters["offline_signature"] = offline_signature
 
     torch.manual_seed(seed)
     random.seed(seed)
@@ -1768,17 +3145,21 @@ def main(
     if env_vectorization_mode not in ("async", "sync"):
         raise ValueError(f"env_vectorization_mode must be 'async' or 'sync', got {env_vectorization_mode!r}")
 
+    effective_env_vectorization_mode = "sync" if cleanrl_ppo_closer else env_vectorization_mode
+    if cleanrl_ppo_closer:
+        hyperparameters["effective_env_vectorization_mode"] = effective_env_vectorization_mode
+
     allocated_cpus = available_cpu_count()
-    if env_vectorization_mode == "async" and num_envs > allocated_cpus:
+    if effective_env_vectorization_mode == "async" and num_envs > allocated_cpus:
         print(
             f"warning: async vectorization requested {num_envs} environment workers, "
             f"but this process can use only {allocated_cpus} CPUs"
         )
 
-    if allow_tf32 and device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+    if cleanrl_ppo_closer:
+        torch.backends.cudnn.deterministic = True
+
+    configure_matmul_precision(allow_tf32, device)
 
     run_log_dir = resolve_log_dir(
         log_dir,
@@ -1793,7 +3174,10 @@ def main(
         else Path(checkpoint_folder)
     )
 
-    if not exists(checkpoint_path) and run_log_dir.exists():
+    # A restart of the pretrain stage continues in the same run directory.
+    resumes_offline_pretrain = offline_pretrain_stage and offline.pretrain_can_resume(offline_pretrain_path)
+
+    if not exists(checkpoint_path) and run_log_dir.exists() and not resumes_offline_pretrain:
         raise FileExistsError(
             f"run directory already exists for run_name={run_name!r}: {run_log_dir}. "
             "Use a new run_name or pass checkpoint_path to continue the existing run."
@@ -1831,13 +3215,38 @@ def main(
 
     tokenizer_loss = None
 
-    if not exists(checkpoint_path):
+    if offline_pretrain_stage:
+        # Fit the normalization and train the tokenizer on the offline data.
+        tokenizer_loss = offline.prepare_offline_tokenizer(
+            tokenizer,
+            dataset = offline_dataset,
+            split = offline_data_split,
+            pretrain_dir = offline_pretrain_path,
+            signature = offline_signature,
+            train_tokenizer_fn = lambda model, observations: train_tokenizer(
+                model,
+                observations,
+                steps = pretrain_tokenizer_steps,
+                batch_size = tokenizer_batch_size,
+                learning_rate = tokenizer_learning_rate,
+                max_grad_norm = max_grad_norm,
+                device = device,
+                writer = writer,
+                training_profiler = training_profiler,
+            ),
+            writer = writer,
+            device = device,
+        )
+    elif offline_rl_stage:
+        # The pretrained checkpoint, or the loop checkpoint on resume, holds the tokenizer.
+        pass
+    elif not exists(checkpoint_path):
         pretrain_obs = collect_random_observations(
             env_name,
-            num_steps = max(1, pretrain_tokenizer_observations // num_envs),
-            num_envs = num_envs,
+            num_steps = max(1, pretrain_tokenizer_observations // tokenizer_pretrain_num_envs),
+            num_envs = tokenizer_pretrain_num_envs,
             seed = seed,
-            env_vectorization_mode = env_vectorization_mode,
+            env_vectorization_mode = effective_env_vectorization_mode,
         )[:pretrain_tokenizer_observations]
 
         assert pretrain_obs.shape[-1] == obs_dim, f"{env_name} produced obs dim {pretrain_obs.shape[-1]}, expected {obs_dim}"
@@ -1858,15 +3267,17 @@ def main(
     for param in tokenizer.parameters():
         param.requires_grad_(False)
 
-    env = make_env(
-        env_name,
-        seed,
-        vectorized = True,
-        num_envs = num_envs,
-        episode_stats_buffer_length = max(100, num_envs * max_timesteps),
-        env_vectorization_mode = env_vectorization_mode,
-    )
-    register_runtime_cleanup(env.close)
+    env = None
+    if runs_online_loop:
+        env = make_env(
+            env_name,
+            seed,
+            vectorized = True,
+            num_envs = num_envs,
+            episode_stats_buffer_length = max(100, num_envs * max_timesteps),
+            env_vectorization_mode = effective_env_vectorization_mode,
+        )
+        register_runtime_cleanup(env.close)
 
     value_encoder_kwargs = dict(
         reward_range = value_range,
@@ -1941,6 +3352,10 @@ def main(
         pmpo_pos_to_neg_weight = pmpo_pos_to_neg_weight,
         pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight,
         ppo_eps_clip = 0.2,
+        value_clip = 0.2 if cleanrl_updated_ppo else 0.4,
+        clip_values = cleanrl_updated_ppo,
+        cleanrl_ppo_closer = cleanrl_ppo_closer,
+        cleanrl_ppo_closer_hl_gauss_value_loss = cleanrl_ppo_closer_hl_gauss_value_loss,
         normalize_advantages = normalize_advantages,
         add_action_embed_to_agent_token = add_action_embed_to_agent_token,
         old_continuous_action_encoder = old_continuous_action_encoder,
@@ -1953,7 +3368,9 @@ def main(
         old_value_head = old_value_head,
         old_embedding_init = old_embedding_init,
         value_head_init_value = value_head_init_value,
-        policy_entropy_weight = policy_entropy_weight,
+        policy_entropy_weight = 0. if cleanrl_updated_ppo else policy_entropy_weight,
+        scale_reward_gradient_into_transformer = scale_reward_gradient_into_transformer,
+        reward_gradient_into_transformer_scale = reward_gradient_into_transformer_scale,
         use_loss_normalization = use_dynamics_loss_normalization,
         use_paper_aligned_shortcut_objective = use_paper_aligned_shortcut_objective,
         attn_heads = attn_heads,
@@ -1972,30 +3389,97 @@ def main(
         use_muon = use_muon_optimizer,
         muon_params = world_model.muon_parameters(),
     )
-    agent_optimizer = make_optimizer(
-        agent_params,
-        lr = agent_learning_rate,
-        weight_decay = optimizer_weight_decay,
-        use_muon = use_muon_optimizer,
-        muon_params = world_model.muon_parameters(),
+    if cleanrl_updated_ppo:
+        agent_optimizer = make_cleanrl_updated_ppo_optimizer(
+            world_model,
+            lr = agent_learning_rate,
+        )
+    elif reuse_ppo_dream_batch:
+        agent_optimizer = make_ppo_reuse_optimizer(
+            world_model,
+            lr = agent_learning_rate,
+            weight_decay = optimizer_weight_decay,
+        )
+    else:
+        agent_optimizer = make_optimizer(
+            agent_params,
+            lr = agent_learning_rate,
+            weight_decay = optimizer_weight_decay,
+            use_muon = use_muon_optimizer,
+            muon_params = world_model.muon_parameters(),
+        )
+
+    cleanrl_updated_ppo_shuffle_generator = (
+        torch.Generator(device = device).manual_seed(seed)
+        if cleanrl_ppo_closer
+        else None
+    )
+
+    # Checkpoints keep the settings from the config, not the settings at save
+    # time. Schedules and PPO backoff change lr during training.
+    optimizer_settings = dict(
+        world = optimizer_group_settings(world_optimizer),
+        agent = optimizer_group_settings(agent_optimizer),
     )
 
     start_loop = 0
+    resume_progress = None
+    replay = None
+    memmap_path = run_log_dir / "replay_buffer"
     if exists(checkpoint_path):
         pkg = torch.load(checkpoint_path, map_location = device, weights_only = True)
+        resume_progress = pkg.get("progress")
+        if resume_progress is None:
+            raise ValueError(
+                f"{checkpoint_path} has no step counters. Checkpoints saved before resume "
+                "support existed cannot resume."
+            )
+
+        # load_state_dict replaces lr, weight_decay, and the other group settings
+        # with the saved values, so a changed config value has no effect.
+        assert pkg["optimizer_settings"] == optimizer_settings, (
+            "the optimizer settings of the config differ from the checkpoint. A resume "
+            "keeps the checkpoint settings, so restore the config values. "
+            f"checkpoint: {pkg['optimizer_settings']}, config: {optimizer_settings}"
+        )
+
         tokenizer.load_state_dict(pkg["tokenizer"])
         world_model.load_state_dict(pkg["world_model"])
+        # Muon optimizer states in checkpoints saved before the fixed parameter
+        # order are not compatible (see make_optimizer).
         load_optimizer_state_if_compatible(world_optimizer, pkg["world_optimizer"], "world")
         load_optimizer_state_if_compatible(agent_optimizer, pkg["agent_optimizer"], "agent")
         start_loop = int(pkg.get("loop", 0)) + 1
 
+        # Episodes collected after the checkpoint were not seen by the saved
+        # model, so the replay goes back to the snapshot from the same loop.
+        replay = restore_replay_snapshot(Path(checkpoint_path), memmap_path)
+
+    if exists(offline_package):
+        # The world-model keys and the tokenizer come from the pretrained checkpoint.
+        # The policy and value heads keep their initialization.
+        offline.apply_offline_pretrained(
+            offline_package,
+            tokenizer = tokenizer,
+            world_model = world_model,
+            world_optimizer = world_optimizer,
+            load_world_optimizer = offline_load_world_optimizer,
+        )
+        print(f"loaded offline pretrained checkpoint: {offline_pretrained_checkpoint}")
+        del offline_package
+
     remaining_profile_steps = (
-        (
-            pretrain_world_model_finetune_steps + pretrain_world_model_combined_steps
-            if start_loop == 0 and num_loops > 0
+        offline_pretrain_steps
+        + (
+            in_loop_world_model_pretrain_steps
+            if start_loop == 0 and num_loops > 0 and runs_online_loop
             else 0
         )
-        + max(0, num_loops - start_loop) * (world_model_train_steps + imagination_train_steps)
+        + (
+            max(0, num_loops - start_loop) * (world_model_train_steps + effective_imagination_train_steps)
+            if runs_online_loop
+            else 0
+        )
     )
     if profile and remaining_profile_steps < PROFILE_TOTAL_STEPS:
         raise ValueError(
@@ -2007,7 +3491,7 @@ def main(
     compile_interact = compile or compile_interact
     compile_world_model = compile or compile_world_model
     compile_generate = compile or compile_generate
-    compile_learn = compile or compile_learn
+    compile_learn = False if cleanrl_ppo_closer else compile or compile_learn
     static_compile_shapes = compile_dynamic is False
 
     if compile_generate and static_compile_shapes and imagination_prompt_length > 0 and imagination_prompt_probability != 1.:
@@ -2035,22 +3519,82 @@ def main(
         imagination_max_timesteps = imagination_horizon + imagination_prompt_length,
         objective = objective,
         use_delight_gating = use_delight_gating,
-        store_old_action_unembeds = objective == "pmpo" and not exists(policy_prior),
+        store_old_action_unembeds = (
+            (objective == "pmpo" and not exists(policy_prior)) or
+            (objective == "ppo" and reuse_ppo_dream_batch)
+        ),
         full_transformer_finetuning = full_transformer_finetuning,
     )
 
-    memmap_path = run_log_dir / "replay_buffer"
+    if offline_pretrain_stage:
+        # Use the world optimizer, compiled loss, and batch shape of the online
+        # loop, so the rl stage reuses the same compiled graphs.
+        offline_pretrained_checkpoint = offline.pretrain_offline(
+            tokenizer = tokenizer,
+            world_model = world_model,
+            world_optimizer = world_optimizer,
+            dataset = offline_dataset,
+            split = offline_data_split,
+            pretrain_dir = offline_pretrain_path,
+            signature = offline_signature,
+            action_range = action_range,
+            device = device,
+            train_steps = partial(
+                train_world_model,
+                world_model,
+                world_optimizer,
+                world_model_loss_fn = compile_runtime.world_model_loss,
+                world_model_loss_timing = compile_runtime.world_model_loss_timing,
+                world_model_step_timing = compile_runtime.world_model_step_timing,
+                batch_size = world_model_batch_size,
+                sequence_length = world_model_train_sequence_length,
+                static_batch_shape = compile_world_model and static_compile_shapes,
+                max_grad_norm = max_grad_norm,
+                writer = offline.PrefixedScalarWriter(writer, "offline_pretrain/train/") if exists(writer) else None,
+                training_profiler = training_profiler,
+                old_replay_sampling = old_replay_sampling,
+                update_loss_ema = True,
+            ),
+            validate = partial(
+                world_model_validation_metrics,
+                world_model,
+                batch_size = world_model_batch_size,
+                sequence_length = world_model_train_sequence_length,
+                num_batches = offline.WORLD_MODEL_VALIDATION_BATCHES,
+            ),
+            world_model_steps = offline_world_model_steps,
+            finetune_steps = offline_world_model_finetune_steps,
+            checkpoint_every = offline_pretrain_checkpoint_every,
+            writer = writer,
+        )
+
+        if not offline_rl_stage:
+            training_profiler.flush_timings(flush_writer = True)
+            print_compile_timing_report(compile_runtime.timings)
+
+            if exists(event_writer):
+                event_writer.flush()
+
+            return compile_runtime.timings if return_compile_timings else None
+
+    # Rehearsal keeps offline windows in each online world-model batch.
+    # Parallel runs share the offline replay, so it opens read-only.
+    offline_rehearsal_replay = None
+    if offline_rl_stage and offline_rehearsal_fraction > 0.:
+        offline_rehearsal_replay = offline.open_rehearsal_replay(offline_pretrained_checkpoint)
 
     if start_loop == 0:
         shutil.rmtree(memmap_path, ignore_errors=True)
-        replay = None
-    else:
-        replay = ReplayBuffer.from_folder(memmap_path)
 
-    wm_step = 0
-    imagination_step = 0
-    env_step = 0
-    did_world_model_pretrain = start_loop > 0
+    # A resume continues the counters, so the TensorBoard steps, the audit
+    # schedule, and the closer-PPO metric step do not restart at zero.
+    resume_progress = resume_progress or {}
+    wm_step = int(resume_progress.get("wm_step", 0))
+    imagination_step = int(resume_progress.get("imagination_step", 0))
+    env_step = int(resume_progress.get("env_step", 0))
+    # The offline rl stage starts from a pretrained world model, so the
+    # in-loop pretraining on the first rollout does not run.
+    did_world_model_pretrain = start_loop > 0 or offline_rl_stage
 
     print(f"training {env_name} from {obs_dim} raw observations on {device}")
     print(f"tensorboard log dir: {run_log_dir.absolute()}" if exists(event_writer) else "tensorboard disabled")
@@ -2087,6 +3631,31 @@ def main(
             print(f"torch.compile mode fallback for: {', '.join(fallback_paths)}")
     if exists(tokenizer_loss):
         print(f"tokenizer pretrain recon loss: {tokenizer_loss:.4f}")
+
+    audit_runner = None
+    if audit_diagnostics:
+        audit_runner = AuditDiagnostics(
+            env_name = env_name,
+            obs_dim = obs_dim,
+            action_range = action_range,
+            prompt_length = imagination_prompt_length,
+            horizon = imagination_horizon,
+            generate_steps = imagination_generate_steps,
+            use_time_cache = imagination_use_time_cache,
+            old_reward_shifting = old_reward_shifting,
+            every_env_steps = audit_diagnostics_every_env_steps,
+            seed = seed,
+            device = device,
+        )
+        register_runtime_cleanup(audit_runner.close)
+        if start_loop == 0:
+            log_scalars(
+                writer,
+                {"audit/world_model/parameters": sum(param.numel() for param in world_params)},
+                0,
+            )
+        audit_runner.next_env_step = int(resume_progress.get("audit_next_env_step", audit_runner.next_env_step))
+        audit_start_time = perf_counter() - float(resume_progress.get("audit_elapsed_seconds", 0.))
 
     pbar = tqdm(range(start_loop, num_loops), desc = "loops")
 
@@ -2161,6 +3730,9 @@ def main(
 
                 env_step += rollout_steps * cpu_exp.rewards.shape[0]
 
+                if exists(audit_runner):
+                    log_scalars(writer, audit_runner.rollout_metrics(cpu_exp, rollout_lengths), env_step)
+
                 for episode_return, episode_length in zip(rollout_returns, rollout_lengths):
                     log_scalars(
                         writer,
@@ -2170,6 +3742,14 @@ def main(
                         },
                         env_step,
                     )
+
+                    # Sample-efficiency comparisons with model-free runs count the offline env steps too.
+                    if exists(offline_env_steps):
+                        log_scalars(
+                            writer,
+                            {"charts/episodic_return_offline_inclusive": episode_return},
+                            env_step + offline_env_steps,
+                        )
 
             avg_return = float(np.mean(episodic_returns)) if len(episodic_returns) > 0 else None
             avg_horizon_return = float(np.mean(rollout_horizon_returns)) if len(rollout_horizon_returns) > 0 else 0.
@@ -2190,6 +3770,19 @@ def main(
                 },
                 loop,
             )
+
+        # The world model has not trained on this rollout yet, so these
+        # metrics use held-out current-policy data.
+        if exists(audit_runner) and did_world_model_pretrain and audit_runner.is_due(env_step):
+            with training_profiler.record("audit/diagnostics"):
+                audit_metrics = audit_runner.model_metrics(
+                    world_model,
+                    tokenizer,
+                    replay,
+                    cpu_exp,
+                    rollout_lengths,
+                )
+            log_scalars(writer, audit_metrics, env_step)
 
         if not did_world_model_pretrain:
             wm_step, _ = train_world_model(
@@ -2255,6 +3848,11 @@ def main(
             desc = "world model",
             old_replay_sampling = old_replay_sampling,
             update_loss_ema = not freeze_dynamics_loss_normalization_after_pretraining,
+            preserve_policy_during_world_model_updates = preserve_policy_during_world_model_updates,
+            world_model_policy_consistency_loss_weight = world_model_policy_consistency_loss_weight,
+            policy_consistency_step_size = world_model.max_steps // imagination_generate_steps,
+            rehearsal_replay = offline_rehearsal_replay,
+            rehearsal_fraction = offline_rehearsal_fraction,
         )
 
         world_model.train()
@@ -2270,7 +3868,7 @@ def main(
             learn_from_dream_fn = compile_runtime.learn_from_dream,
             learn_from_dream_timing = compile_runtime.learn_from_dream_timing,
             imagination_step_timing = compile_runtime.imagination_step_timing,
-            steps = imagination_train_steps,
+            steps = effective_imagination_train_steps,
             batch_size = imagination_batch_size,
             horizon = imagination_horizon,
             prompt_length = imagination_prompt_length,
@@ -2287,7 +3885,35 @@ def main(
             full_transformer_finetuning = full_transformer_finetuning,
             preservation_sequence_length = preservation_sequence_length,
             preservation_batch_size = world_model_batch_size,
+            align_generated_dream_transitions = align_generated_dream_transitions,
+            cleanrl_updated_ppo = cleanrl_updated_ppo,
+            cleanrl_ppo_closer = cleanrl_ppo_closer,
+            cleanrl_updated_ppo_iteration_offset = loop if cleanrl_ppo_closer else loop * imagination_train_steps,
+            cleanrl_updated_ppo_total_iterations = num_loops if cleanrl_ppo_closer else num_loops * imagination_train_steps,
+            cleanrl_updated_ppo_initial_learning_rate = agent_learning_rate,
+            cleanrl_updated_ppo_shuffle_generator = cleanrl_updated_ppo_shuffle_generator,
+            cleanrl_updated_ppo_metric_step = env_step if cleanrl_ppo_closer else None,
+            reuse_ppo_dream_batch = reuse_ppo_dream_batch,
+            ppo_reuse_epochs = ppo_reuse_epochs,
+            ppo_reuse_num_minibatches = ppo_reuse_num_minibatches,
+            ppo_reuse_max_exact_kl = ppo_reuse_max_exact_kl,
+            ppo_reuse_lr_backoff = ppo_reuse_lr_backoff,
+            ppo_reuse_max_backoffs = ppo_reuse_max_backoffs,
         )
+
+        if exists(audit_runner):
+            log_scalars(
+                writer,
+                audit_runner.progress_metrics(
+                    loop = loop,
+                    elapsed_seconds = perf_counter() - audit_start_time,
+                    world_model_updates = wm_step,
+                    imagination_updates = imagination_step,
+                    world_model_metrics = wm_metrics,
+                    imagination_metrics = imagination_metrics,
+                ),
+                env_step,
+            )
 
         postfix_return = avg_return if exists(avg_return) else avg_horizon_return
         postfix = {"return": f"{postfix_return:.1f}", "replay": len(replay)}
@@ -2299,13 +3925,23 @@ def main(
 
         if checkpoint_every > 0 and divisible_by(loop + 1, checkpoint_every):
             with training_profiler.record("checkpoint/save"):
-                save_checkpoint(
+                progress = dict(env_step = env_step, wm_step = wm_step, imagination_step = imagination_step)
+                if exists(audit_runner):
+                    progress.update(
+                        audit_next_env_step = audit_runner.next_env_step,
+                        audit_elapsed_seconds = perf_counter() - audit_start_time,
+                    )
+
+                save_resume_checkpoint(
                     checkpoint_root / f"loop_{loop + 1}.pt",
+                    replay = replay,
                     loop = loop,
                     tokenizer = tokenizer,
                     world_model = world_model,
                     world_optimizer = world_optimizer,
                     agent_optimizer = agent_optimizer,
+                    progress = progress,
+                    optimizer_settings = optimizer_settings,
                 )
 
         training_profiler.flush_timings(flush_writer = True)

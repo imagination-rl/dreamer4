@@ -15,6 +15,8 @@ small_model:
   minibatch_num_envs: null
   observation_normalization: fixed_random
   normalization_observations: 16384
+  # Run the isolated bounded-action Beta PPO reference path.
+  cleanrl_updated_ppo: false
   cleanrl_pmpo: false
   cleanrl_pmpo_constant_learning_rate: false
   cleanrl_pmpo_joint_log_prob: false
@@ -95,6 +97,9 @@ pretrain_world_model_combined_steps: 256
 world_model_train_steps: 13
 world_model_train_sequence_length: 200
 world_model_learning_rate: 0.0006
+# Keep the real observation-to-action function near its pre-phase policy.
+preserve_policy_during_world_model_updates: false
+world_model_policy_consistency_loss_weight: 1.0
 # Normalize world-model losses with running RMS statistics.
 use_dynamics_loss_normalization: false
 # Stop RMS-statistic updates after the initial world-model pretrain phase.
@@ -110,6 +115,8 @@ imagination_prompt_probability: 1.0
 imagination_train_steps: 3
 imagination_generate_steps: 4
 imagination_use_time_cache: true
+# Pair each generated action with the next generated arrival reward.
+align_generated_dream_transitions: false
 # Use long real-replay contexts for full-transformer preservation losses.
 preservation_sequence_length: 200
 
@@ -117,6 +124,19 @@ preservation_sequence_length: 200
 agent_learning_rate: 0.0006
 # Select pmpo, ppo, spo, or reinforce.
 objective: pmpo
+# Apply updated CleanRL PPO to flattened main-model dream transitions.
+cleanrl_updated_ppo: false
+# Match the isolated CleanRL PPO mechanics while retaining the main model.
+cleanrl_ppo_closer: false
+# Train the closer PPO value head with its HL-Gauss cross-entropy loss instead of scalar MSE.
+cleanrl_ppo_closer_hl_gauss_value_loss: false
+# Reuse each PPO dream across trajectory minibatches and update epochs.
+reuse_ppo_dream_batch: false
+ppo_reuse_epochs: 4
+ppo_reuse_num_minibatches: 4
+ppo_reuse_max_exact_kl: 0.02
+ppo_reuse_lr_backoff: 0.5
+ppo_reuse_max_backoffs: 6
 # Keep these values for the current REINFORCE baseline.
 reinforce_discount_factor: 0.99
 reinforce_gae_lambda: 1.0
@@ -126,6 +146,9 @@ pmpo_pos_to_neg_weight: 0.5
 pmpo_kl_div_loss_weight: 0.3
 use_delight_gating: false
 policy_entropy_weight: 0.01
+# Scale only reward-loss gradients that enter the shared transformer.
+scale_reward_gradient_into_transformer: false
+reward_gradient_into_transformer_scale: 0.01
 # Apply full-transformer updates with replay dynamics, reward, and policy-prior preservation losses.
 full_transformer_finetuning: false
 agent_predicts_state: false
@@ -155,7 +178,7 @@ compile_generate_with_time_cache: true
 track_compile_performance: false
 return_compile_timings: false
 # Selective activation recomputation: 0 recomputes most; 1 is torch.compile's default.
-activation_memory_budget: 0.9
+activation_memory_budget: 0.825
 
 # Profiling. Lightweight record_function timings are enabled by default.
 # Full profile mode always exits after 5 warmup + 4 measured model steps.
@@ -165,6 +188,51 @@ profile_memory: false
 profile_record_shapes: false
 profile_with_stack: false
 profile_with_flops: false
+
+# Audit ablations from runs/audit_9-24-26/REPORT.md. Each flag is off by default.
+# A1: add one temporal and one spatial dynamics layer (depth 3 S-T-S -> depth 5 S-T-S-T-S).
+audit_deeper_dynamics: false
+# A2: train the reward head on the arrival reward, and pair it with the action that caused it.
+audit_arrival_reward_target: false
+# A3: divide num_envs by 4. Multiply replay_size, num_loops, and checkpoint_every by 4.
+audit_quarter_envs_per_loop: false
+# Log real-rollout behavior and world-model quality against env steps.
+audit_diagnostics: false
+audit_diagnostics_every_env_steps: 640000
+
+# Offline data collection and pretraining (notes/pretraining_impl_plan.md).
+# These keys are inactive unless offline_pretraining is true.
+offline_pretraining: false
+# Ordered subset of [collect, pretrain, rl].
+offline_stages: [collect, pretrain, rl]
+# Expert policy source (CleanRL TD3, HalfCheetah-v4).
+offline_expert_repo: cleanrl/HalfCheetah-v4-td3_continuous_action-seed1
+offline_expert_revision: 85477545d6db77ae3c7ca8e4e0b48f515d4c1432
+offline_expert_filename: td3_continuous_action.cleanrl_model
+offline_expert_cache_dir: runs/offline_data/experts
+# A local expert file. It replaces the download when set.
+offline_expert_path: null
+offline_expert_min_return: 8000.0
+# Data collection.
+offline_data_dir: runs/offline_data
+offline_dataset_name: halfcheetah_v4_mix_1m
+offline_data_steps: 1000000
+offline_data_mix: {expert: 0.3, expert_noise: 0.4, random: 0.3}
+# Gaussian noise std in units of half the action range. Each expert_noise episode samples one value.
+offline_expert_noise_stds: [0.1, 0.2, 0.4, 0.8]
+offline_data_seed: 10042
+offline_data_num_envs: 64
+# Pretraining. A null offline_pretrain_name uses run_name.
+offline_pretrain_dir: runs/offline_pretrain
+offline_pretrain_name: null
+offline_world_model_steps: 20000
+offline_world_model_finetune_steps: 0
+offline_validation_fraction: 0.05
+offline_pretrain_checkpoint_every: 2000
+# RL stage. A null offline_pretrained_checkpoint uses the checkpoint of the pretrain stage in this process.
+offline_pretrained_checkpoint: null
+offline_load_world_optimizer: true
+offline_rehearsal_fraction: 0.25
 
 # Logging and checkpoints
 use_tensorboard: true
