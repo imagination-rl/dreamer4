@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 
 import train.train_gym as train_gym
 import dreamer4.dreamer4 as dreamer4_module
-from dreamer4.dreamer4 import Actions, DynamicsWorldModel
+from dreamer4.dreamer4 import Actions, DynamicsWorldModel, LossNormalizer
 from train.compile_runtime import (
     DynamicTimeCacheCallable,
     ImaginationGenerateRollout,
@@ -170,6 +170,84 @@ def test_compiled_paper_shortcut_objective_supports_mixed_batches(reset_compile_
     assert loss.ndim == 0
     assert losses.diagnostics.raw_flow > 0.
     assert losses.diagnostics.raw_shortcut > 0.
+
+
+def test_grouped_dynamics_loss_normalization_keeps_the_flow_to_bootstrap_ratio():
+    torch.manual_seed(42)
+    model = make_tiny_world_model(
+        continuous_action_loss_weight = 0.,
+        discrete_action_loss_weight = 0.,
+        prob_shortcut_train = 1.,
+        use_loss_normalization = True,
+        group_dynamics_loss_normalization = True,
+    )
+    loss_fn = WorldModelTrainingLoss(model)
+    batch = (
+        torch.randn(16, 4, 1, 4),
+        torch.randn(16, 4),
+        torch.zeros(16, dtype = torch.bool),
+        torch.rand(16, 4, 2),
+        torch.full((16,), 4),
+        "combined",
+        True,
+    )
+
+    # The statistic starts at 1. The first call moves it to the scale of the flow and bootstrap sum.
+    loss_fn(*batch)
+    rms = model.dynamics_loss_normalizer.exp_avg_sq.sqrt().item()
+    assert rms < 1.
+
+    _, losses = loss_fn(*batch)
+    diagnostics = losses.diagnostics
+
+    assert diagnostics.raw_shortcut > 0.
+    assert losses.flow.item() == pytest.approx(diagnostics.raw_flow.item() / rms, rel = 1e-5)
+    assert losses.shortcut.item() == pytest.approx(diagnostics.raw_shortcut.item() / rms, rel = 1e-5)
+    assert diagnostics.normalized_dynamics.item() == pytest.approx(diagnostics.raw_dynamics.item() / rms, rel = 1e-5)
+
+    # The separate statistics of the default path stay unused.
+    assert model.flow_loss_normalizer.exp_avg_sq.item() == 1.
+    assert model.shortcut_flow_loss_normalizer.exp_avg_sq.item() == 1.
+
+
+def test_loss_normalization_warmup_gives_the_plain_sum_and_updates_the_statistics():
+    batch = (
+        torch.randn(16, 4, 1, 4),
+        torch.randn(16, 4),
+        torch.zeros(16, dtype = torch.bool),
+        torch.rand(16, 4, 2),
+        torch.full((16,), 4),
+        "combined",
+        True,
+    )
+
+    def loss_of(apply_loss_normalization = None):
+        torch.manual_seed(42)
+        normalize = apply_loss_normalization is not None
+        model = make_tiny_world_model(
+            continuous_action_loss_weight = 0.,
+            discrete_action_loss_weight = 0.,
+            prob_shortcut_train = 1.,
+            **(dict(use_loss_normalization = True, group_dynamics_loss_normalization = True) if normalize else dict()),
+        )
+        if normalize:
+            model.apply_loss_normalization = apply_loss_normalization
+            # Statistics away from their start value 1, so the normalized loss differs from the plain sum.
+            for module in model.modules():
+                if isinstance(module, LossNormalizer):
+                    module.exp_avg_sq.fill_(.25)
+        torch.manual_seed(0)
+        loss, _ = WorldModelTrainingLoss(model)(*batch)
+        return model, loss
+
+    _, plain_loss = loss_of()
+    _, normalized_loss = loss_of(apply_loss_normalization = True)
+    model, warmup_loss = loss_of(apply_loss_normalization = False)
+
+    assert normalized_loss.item() != pytest.approx(plain_loss.item(), rel = 1e-3)
+    assert warmup_loss.item() == pytest.approx(plain_loss.item(), rel = 1e-6)
+    assert model.dynamics_loss_normalizer.exp_avg_sq.item() != .25
+    assert (model.agent_embed_reward_loss_normalizer.exp_avg_sq != .25).all()
 
 
 def make_tiny_imagination_runtime(monkeypatch, *, denoising_steps):
@@ -1275,3 +1353,17 @@ def test_cpu_imagination_compilations_do_not_scale_with_config_values(monkeypatc
             "cold_totals": cold_totals,
             "measurements": measurements,
         }
+
+
+def test_eager_without_time_cache_callable_selects_the_forward_by_the_time_cache():
+    from train.compile_runtime import EagerWithoutTimeCacheCallable
+
+    forward = EagerWithoutTimeCacheCallable(
+        lambda **kwargs: "compiled",
+        lambda **kwargs: "eager",
+    )
+
+    # The first generated frame has no time cache. On CUDA the compiled forward is wrong there.
+    assert forward(latents = None, time_cache = None) == "eager"
+    assert forward(latents = None) == "eager"
+    assert forward(latents = None, time_cache = (1, ())) == "compiled"

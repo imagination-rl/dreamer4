@@ -23,6 +23,7 @@ import shutil
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 
 import gymnasium as gym
@@ -44,11 +45,27 @@ from .audit_ablations import (
     HALF_CHEETAH_X_VELOCITY_INDEX,
     _wrap_angle,
     env_to_native_actions,
+    native_to_env_actions,
 )
 
 OFFLINE_STAGES = ("collect", "pretrain", "rl")
-OFFLINE_MODES = ("expert", "expert_noise", "random")
+# past_runs: episodes from the replays of earlier online runs (the policies of those runs, from loop 0 to the end).
+# expert_scaled: the expert with its actions multiplied by one scale for each episode (closed loop). It gives actions of
+# moderate size at speed (scale 0.4 to 0.7: mean |a| 0.33 to 0.58, 1.7 to 5.9 m/s,
+# report/9-30-26-past-runs/scripts/probe_scaled_expert.py), which the other modes do not give. The action shape stays
+# the expert's bang-bang shape (about 62 % of the dims at 0.95 * scale or more), and each scale gives one steady gait.
+# bang_bang: random actions at the bounds of the action range. Each action dim keeps its sign for a random number of
+# steps (geometric, mean = the hold steps of the episode). It gives saturated actions at low speed (|vx| p90 0.5-1.8 m/s)
+# and flips from upright states (first flip at step 50-120, then 70-90 % flipped steps). The other modes give
+# saturated actions only at speed (expert, expert_noise), which teaches "saturated means fast"
+# (report/10-1-26-realistic-data-analysis).
+OFFLINE_MODES = ("expert", "expert_noise", "random", "past_runs", "expert_scaled", "bang_bang")
 OFFLINE_MODE_IDS = {mode: index for index, mode in enumerate(OFFLINE_MODES)}
+# The modes of the first datasets. A collection config lists a later mode only if its fraction is above 0,
+# so the datasets collected before that mode existed still agree with their configs.
+FIRST_OFFLINE_MODES = ("expert", "expert_noise", "random")
+PAST_RUN_SOURCE_FILE = "past_run_source.npy"
+ACTION_SCALE_FILE = "action_scale.npy"
 DEFAULT_DATA_MIX = {"expert": 0.3, "expert_noise": 0.4, "random": 0.3}
 
 OFFLINE_DATASET_FORMAT_VERSION = 1
@@ -118,6 +135,12 @@ PRETRAIN_SIGNATURE_KEYS = (
     "use_paper_aligned_shortcut_objective",
     "use_dynamics_loss_normalization",
     "scale_reward_gradient_into_transformer",
+)
+
+# Signature keys added later. A key with the value None (the default) is left out of the signature,
+# so pretrained checkpoints saved before the key existed still agree with default configs.
+OPTIONAL_PRETRAIN_SIGNATURE_KEYS = (
+    "terminal_head_mlp_dim",
 )
 
 # World-model state that only the agent uses. These keys are not part of a
@@ -237,6 +260,13 @@ def validate_offline_config(
     offline_world_model_finetune_steps: int,
     offline_pretrain_checkpoint_every: int,
     continuous_dist_type: str,
+    offline_past_run_replays: Sequence[str] = (),
+    offline_past_run_return_buckets: Sequence[Sequence[float]] = (),
+    offline_expert_action_scales: Sequence[float] = (),
+    offline_expert_scale_change_steps: int = 0,
+    offline_expert_scaled_noise_std: float = 0.,
+    offline_past_run_flip_episode_fraction: float = 0.,
+    offline_bang_bang_hold_steps: Sequence[float] = (),
 ) -> tuple[str, ...]:
     """Return the selected stages, or an empty tuple if the offline path is off."""
 
@@ -266,6 +296,31 @@ def validate_offline_config(
         stds = list(offline_expert_noise_stds or ())
         if len(stds) == 0 or any(float(std) <= 0. for std in stds):
             raise ValueError(f"offline_expert_noise_stds must be a non-empty list of positive values, got {offline_expert_noise_stds!r}")
+
+    if mix["past_runs"] > 0. and len(list(offline_past_run_replays or ())) == 0:
+        raise ValueError("offline_data_mix has past_runs episodes, so offline_past_run_replays must list replay folders")
+
+    if mix["expert_scaled"] > 0.:
+        scales = list(offline_expert_action_scales or ())
+        if len(scales) == 0 or any(not 0. < float(scale) <= 1. for scale in scales):
+            raise ValueError(f"offline_expert_action_scales must be a non-empty list of values in (0, 1], got {offline_expert_action_scales!r}")
+        if int(offline_expert_scale_change_steps) < 0 or float(offline_expert_scaled_noise_std) < 0.:
+            raise ValueError("offline_expert_scale_change_steps and offline_expert_scaled_noise_std must not be negative")
+        if int(offline_expert_scale_change_steps) > 0 and min(scales) == max(scales):
+            raise ValueError("offline_expert_scale_change_steps > 0 draws scales from [min, max] of offline_expert_action_scales; give two different values")
+
+    if mix["bang_bang"] > 0.:
+        holds = list(offline_bang_bang_hold_steps or ())
+        if len(holds) == 0 or any(float(hold) < 1. for hold in holds):
+            raise ValueError(f"offline_bang_bang_hold_steps must be a non-empty list of values of 1 or more, got {offline_bang_bang_hold_steps!r}")
+
+    check_return_buckets(offline_past_run_return_buckets or ())
+
+    if not 0. <= float(offline_past_run_flip_episode_fraction) < 1.:
+        raise ValueError(f"offline_past_run_flip_episode_fraction must be in [0, 1), got {offline_past_run_flip_episode_fraction}")
+
+    if float(offline_past_run_flip_episode_fraction) > 0. and (mix["past_runs"] <= 0. or len(list(offline_past_run_return_buckets or ())) == 0):
+        raise ValueError("offline_past_run_flip_episode_fraction > 0 needs past_runs episodes and offline_past_run_return_buckets")
 
     if offline_data_steps <= 0:
         raise ValueError(f"offline_data_steps must be positive, got {offline_data_steps}")
@@ -393,7 +448,9 @@ def expert_actions(actor: CleanRLTD3Actor | None, obs: np.ndarray, action_dim: i
     if not exists(actor):
         return np.zeros((obs.shape[0], action_dim), dtype = np.float32)
 
-    return actor(torch.from_numpy(obs)).numpy()
+    # The actor runs on its own device. The env data stays in numpy on the CPU.
+    device = actor.fc1.weight.device
+    return actor(torch.from_numpy(obs).to(device)).cpu().numpy()
 
 
 def run_episode_batch(
@@ -407,11 +464,24 @@ def run_episode_batch(
     action_range: tuple[float, float],
     max_episode_steps: int,
     action_dim: int,
+    action_scales: np.ndarray | None = None,
+    scale_change_steps: int = 0,
+    scale_range: tuple[float, float] | None = None,
+    scale_rng: np.random.Generator | None = None,
+    hold_steps: np.ndarray | None = None,
+    bang_rng: np.random.Generator | None = None,
 ) -> dict[str, np.ndarray]:
     """Run one episode in each env of a vector env. Record each env until its first episode ends.
 
     modes holds one OFFLINE_MODE_IDS value per env. noise_stds holds the
-    noise std of each env in units of half the action range.
+    noise std of each env in units of half the action range. action_scales
+    holds the factor of the expert actions of each expert_scaled env.
+    With scale_change_steps > 0, each expert_scaled env draws a new factor from
+    scale_range (uniform, with scale_rng) every scale_change_steps steps. An
+    expert_scaled env with a noise std above 0 also gets the Gaussian noise
+    (after the factor). hold_steps holds the mean hold of each bang_bang env:
+    each step, each action dim of the env draws a new sign (with bang_rng) with
+    probability 1 / hold_steps.
     """
 
     num_envs = env.num_envs
@@ -433,12 +503,35 @@ def run_episode_batch(
     observations[:, 0] = obs
     is_noise = modes == OFFLINE_MODE_IDS["expert_noise"]
     is_random = modes == OFFLINE_MODE_IDS["random"]
+    is_scaled = modes == OFFLINE_MODE_IDS["expert_scaled"]
+    # Noise for the expert_scaled envs only if their std is above 0, so the older datasets do not change.
+    gets_noise = is_noise | (is_scaled & (noise_stds > 0.))
+    if is_scaled.any():
+        action_scales = np.array(action_scales, dtype = np.float32)
+    is_bang = modes == OFFLINE_MODE_IDS["bang_bang"]
+    if is_bang.any():
+        # A separate generator, so the other modes get the same values with or without bang_bang envs.
+        signs = bang_rng.choice(np.array([-1., 1.], dtype = np.float32), size = (num_envs, action_dim))
+        sign_change = 1. / np.asarray(hold_steps, dtype = np.float64)[:, None]
 
     for t in range(max_episode_steps):
+        if is_scaled.any() and scale_change_steps > 0 and t > 0 and t % scale_change_steps == 0:
+            # A separate generator: the main generator gives the same values with or without these draws.
+            new_scales = scale_rng.uniform(*scale_range, size = num_envs).astype(np.float32)
+            action_scales = np.where(is_scaled, new_scales, action_scales)
+
         action = expert_actions(actor, obs, action_dim)
+        # The random generator gives the same values with or without expert_scaled envs.
+        if is_scaled.any():
+            action = np.where(is_scaled[:, None], action * action_scales[:, None], action)
         noise = rng.normal(0., 1., size = action.shape) * (noise_stds[:, None] * half_range)
-        action = np.where(is_noise[:, None], action + noise, action)
+        action = np.where(gets_noise[:, None], action + noise, action)
         action = np.where(is_random[:, None], rng.uniform(low, high, size = action.shape), action)
+        if is_bang.any():
+            if t > 0:
+                change = bang_rng.random((num_envs, action_dim)) < sign_change
+                signs = np.where(change, bang_rng.choice(np.array([-1., 1.], dtype = np.float32), size = signs.shape), signs)
+            action = np.where(is_bang[:, None], np.where(signs > 0., high, low), action)
         action = np.clip(action, low, high).astype(np.float32)
 
         next_obs, reward, term, trunc, _ = env.step(action)
@@ -551,18 +644,46 @@ def collection_config(
     expert_revision: str,
     expert_filename: str,
     expert_path: str | None,
+    past_run_replays: Sequence[str] = (),
+    past_run_return_buckets: Sequence[Sequence[float]] = (),
+    expert_action_scales: Sequence[float] = (),
+    expert_scale_change_steps: int = 0,
+    expert_scaled_noise_std: float = 0.,
+    past_run_flip_episode_fraction: float = 0.,
+    bang_bang_hold_steps: Sequence[float] = (),
 ) -> dict[str, Any]:
     """The config values that decide the collected data."""
 
     mix = normalize_data_mix(data_mix)
-    uses_expert = mix["expert"] + mix["expert_noise"] > 0.
+    uses_expert = mix["expert"] + mix["expert_noise"] + mix["expert_scaled"] > 0.
+    uses_past_runs = mix["past_runs"] > 0.
+    listed_mix = {mode: fraction for mode, fraction in mix.items() if mode in FIRST_OFFLINE_MODES or fraction > 0.}
+    past_runs = dict(past_run_replays = [str(path) for path in past_run_replays]) if uses_past_runs else {}
+    # Only a config with return buckets lists them, so a dataset collected before the buckets keeps its config.
+    if uses_past_runs and len(past_run_return_buckets) > 0:
+        past_runs["past_run_return_buckets"] = [[float(low), float(high)] for low, high in past_run_return_buckets]
+    # Only a config that uses it lists the flip share, so the earlier datasets keep their configs.
+    if uses_past_runs and float(past_run_flip_episode_fraction) > 0.:
+        past_runs["past_run_flip_episode_fraction"] = float(past_run_flip_episode_fraction)
+    # As for past_runs: only a config with expert_scaled episodes lists the scales.
+    if mix["expert_scaled"] > 0.:
+        past_runs["expert_action_scales"] = [float(scale) for scale in expert_action_scales]
+        # Only a config that uses them lists these, so the earlier expert_scaled datasets keep their configs.
+        if int(expert_scale_change_steps) > 0:
+            past_runs["expert_scale_change_steps"] = int(expert_scale_change_steps)
+        if float(expert_scaled_noise_std) > 0.:
+            past_runs["expert_scaled_noise_std"] = float(expert_scaled_noise_std)
+    # Only a config with bang_bang episodes lists the hold steps.
+    if mix["bang_bang"] > 0.:
+        past_runs["bang_bang_hold_steps"] = [float(hold) for hold in bang_bang_hold_steps]
 
     return json_normalize(dict(
         format_version = OFFLINE_DATASET_FORMAT_VERSION,
         env_name = env_name,
         dataset_name = dataset_name,
         data_steps = int(data_steps),
-        data_mix = mix,
+        data_mix = listed_mix,
+        **past_runs,
         noise_stds = [float(std) for std in noise_stds] if mix["expert_noise"] > 0. else [],
         data_seed = int(data_seed),
         num_envs = int(num_envs),
@@ -583,6 +704,8 @@ def mode_statistics(
     lens: np.ndarray,
     modes: np.ndarray,
     noise_stds: np.ndarray,
+    action_scales: np.ndarray | None = None,
+    hold_steps: np.ndarray | None = None,
 ) -> dict[str, Any]:
     statistics = {}
 
@@ -602,6 +725,20 @@ def mode_statistics(
         if mode == "expert_noise":
             values, counts = np.unique(noise_stds[indices], return_counts = True)
             entry["noise_std_episodes"] = {f"{value:g}": int(count) for value, count in zip(values, counts)}
+
+        if mode == "expert_scaled":
+            values, counts = np.unique(action_scales[indices], return_counts = True)
+            if len(values) <= 16:
+                entry["action_scale_episodes"] = {f"{value:g}": int(count) for value, count in zip(values, counts)}
+            else:
+                # Scales from a range: the first scale of each episode.
+                entry["first_action_scale"] = dict(
+                    min = float(values.min()), max = float(values.max()), mean = float(action_scales[indices].mean()),
+                )
+
+        if mode == "bang_bang":
+            values, counts = np.unique(hold_steps[indices], return_counts = True)
+            entry["hold_steps_episodes"] = {f"{value:g}": int(count) for value, count in zip(values, counts)}
 
         if env_name.startswith("HalfCheetah"):
             states = np.concatenate([obs[index, :lens[index] + 1] for index in indices])
@@ -632,6 +769,239 @@ def package_versions() -> dict[str, str | None]:
     )
 
 
+def check_return_buckets(buckets: Sequence[Sequence[float]]):
+    """Each bucket is [low, high) with low < high. The buckets must not overlap: an episode must be in one bucket only."""
+
+    for bucket in buckets:
+        if len(bucket) != 2 or not float(bucket[0]) < float(bucket[1]):
+            raise ValueError(f"each offline_past_run_return_buckets entry must be [low, high] with low < high, got {bucket!r}")
+
+    ordered = sorted((float(low), float(high)) for low, high in buckets)
+    for (_, high), (low, _) in zip(ordered, ordered[1:]):
+        if low < high:
+            raise ValueError(f"offline_past_run_return_buckets must not overlap, got {[list(bucket) for bucket in buckets]!r}")
+
+
+def balanced_counts(total: int, capacity: np.ndarray) -> np.ndarray:
+    """Split total into counts as equal as possible, each at most its capacity. The first entries get the remainder."""
+
+    capacity = np.asarray(capacity, dtype = np.int64)
+    if total > capacity.sum():
+        raise ValueError(f"{total} episodes are necessary, but only {capacity.sum()} are available")
+
+    counts = np.zeros_like(capacity)
+    remaining = total
+
+    while remaining > 0:
+        # Each pass gives the open entries an equal share. An entry at its capacity gives its share to the others.
+        open_entries = np.flatnonzero(counts < capacity)
+        share = np.full(len(open_entries), remaining // len(open_entries))
+        share[:remaining % len(open_entries)] += 1
+        share = np.minimum(share, capacity[open_entries] - counts[open_entries])
+        counts[open_entries] += share
+        remaining -= int(share.sum())
+
+    return counts
+
+
+PAST_RUN_FIELDS = ("critic_state", "actions_continuous", "rewards")
+PAST_RUN_META_FIELDS = ("episode_lens", "is_truncated", "terminals", "is_from_world_model")
+
+
+def open_past_run_replay(folder: Path) -> SimpleNamespace:
+    """Open the fields of a replay that past_run_episodes reads, read-only.
+
+    ReplayBuffer.from_folder opens each field file with mode 'r+', and creates a field file that does not exist. The
+    queues delete latents.data.npy of finished runs, so from_folder would write a zero latents file into the run folder.
+    """
+
+    missing = [
+        name for name in (
+            *(f"{field}.data.npy" for field in PAST_RUN_FIELDS),
+            *(f"{field}.data.meta.npy" for field in PAST_RUN_META_FIELDS),
+            "num_episodes.state.npy", "episode_index.state.npy",
+        )
+        if not (folder / name).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(f"{folder} has no {missing}")
+
+    return SimpleNamespace(
+        data = {field: np.load(folder / f"{field}.data.npy", mmap_mode = "r") for field in PAST_RUN_FIELDS},
+        meta_data = {field: np.load(folder / f"{field}.data.meta.npy", mmap_mode = "r") for field in PAST_RUN_META_FIELDS},
+        num_episodes = int(np.load(folder / "num_episodes.state.npy")),
+        episode_index = int(np.load(folder / "episode_index.state.npy")),
+    )
+
+
+def past_run_episodes(
+    replay_folders: Sequence[str | Path],
+    count: int,
+    *,
+    rng: np.random.Generator,
+    max_episode_steps: int,
+    obs_dim: int,
+    action_dim: int,
+    action_range: tuple[float, float],
+    return_buckets: Sequence[Sequence[float]] = (),
+    flip_episode_fraction: float = 0.,
+) -> tuple[dict[str, np.ndarray], np.ndarray, list[dict[str, Any]]]:
+    """Take count episodes from the replays of earlier online runs.
+
+    Without return buckets, each folder gives count / len(folders) episodes, drawn uniformly from all loops of
+    that run: the first random policy, the learned policies, and the collapsed gait of a run that collapsed.
+    With return buckets [low, high), each bucket gets count / len(buckets) episodes with a return in it. The
+    folders share the episodes of a bucket equally, and a folder with too few gives its share to the others.
+    The first buckets and folders get the remainder.
+    A replay row t holds obs_t, the native action a_t, and r_t. The last row of a truncated episode is the
+    bootstrap row (final observation, zero action). Only full real episodes of max_episode_steps transitions
+    are used. Returns the episodes in the dataset layout, the (folder index, replay episode index) of each
+    episode, and one summary for each folder.
+    With flip_episode_fraction > 0 (return buckets only), that share of each bucket comes from the episodes of the
+    bucket in which the cheetah flips (an upright-to-flipped transition of the root angle), shared equally by the
+    folders as above. If a bucket has too few of them, the other episodes of the bucket fill its count. The rest of
+    the bucket comes from all its other episodes.
+    """
+
+    folders = [Path(folder) for folder in replay_folders]
+    if len(folders) == 0:
+        raise ValueError("past_runs episodes need at least one replay folder")
+
+    check_return_buckets(return_buckets)
+    buckets = [(float(low), float(high)) for low, high in return_buckets]
+    if flip_episode_fraction > 0. and len(buckets) == 0:
+        raise ValueError("flip_episode_fraction > 0 needs return buckets")
+
+    replays, candidates, returns, has_flip = [], [], [], []
+
+    for folder in folders:
+        replay = open_past_run_replay(folder)
+        meta = replay.meta_data
+
+        if replay.data["critic_state"].shape[-1] != obs_dim or replay.data["actions_continuous"].shape[-1] != action_dim:
+            raise ValueError(f"{folder} has observations or actions of another size than the env")
+
+        # _initted is not a stored flag: the replay clears it on the next slot to write, which can hold a full
+        # episode. A slot that was never written has episode length 0.
+        usable = (
+            (np.asarray(meta["episode_lens"]) == max_episode_steps + 1) &
+            np.asarray(meta["is_truncated"], dtype = np.bool_) &
+            ~np.asarray(meta["terminals"], dtype = np.bool_) &
+            ~np.asarray(meta["is_from_world_model"], dtype = np.bool_)
+        )
+        episodes = np.flatnonzero(usable)
+        replays.append(replay)
+        candidates.append(episodes)
+        returns.append(np.asarray(replay.data["rewards"][episodes, :max_episode_steps], dtype = np.float64).sum(-1) if len(buckets) else None)
+        if flip_episode_fraction > 0.:
+            angle = np.asarray(replay.data["critic_state"][episodes, :max_episode_steps + 1, HALF_CHEETAH_ROOT_ANGLE_INDEX])
+            flipped = np.abs(_wrap_angle(angle)) > np.pi / 2
+            has_flip.append((~flipped[:, :-1] & flipped[:, 1:]).any(axis = 1))
+
+    # chosen[f]: the replay episodes of folder f. bucket_of[f]: the bucket index of each (-1 without buckets).
+    chosen = [np.zeros(0, dtype = np.int64) for _ in folders]
+    bucket_of = [np.zeros(0, dtype = np.int64) for _ in folders]
+
+    if len(buckets) == 0:
+        per_folder = [count // len(folders) + int(index < count % len(folders)) for index in range(len(folders))]
+        for index, (folder, take) in enumerate(zip(folders, per_folder)):
+            if len(candidates[index]) < take:
+                raise ValueError(f"{folder} has {len(candidates[index])} full episodes; {take} are necessary")
+            chosen[index] = rng.choice(candidates[index], size = take, replace = False)
+            bucket_of[index] = np.full(take, -1)
+    elif flip_episode_fraction <= 0.:
+        per_bucket = [count // len(buckets) + int(index < count % len(buckets)) for index in range(len(buckets))]
+        for bucket_index, ((low, high), total) in enumerate(zip(buckets, per_bucket)):
+            in_bucket = [episodes[(folder_returns >= low) & (folder_returns < high)] for episodes, folder_returns in zip(candidates, returns)]
+            try:
+                takes = balanced_counts(total, np.array([len(episodes) for episodes in in_bucket]))
+            except ValueError as error:
+                raise ValueError(f"return bucket [{low:g}, {high:g}): {error}") from None
+            for index, take in enumerate(takes):
+                picked = rng.choice(in_bucket[index], size = int(take), replace = False)
+                chosen[index] = np.concatenate([chosen[index], picked])
+                bucket_of[index] = np.concatenate([bucket_of[index], np.full(int(take), bucket_index)])
+    else:
+        per_bucket = [count // len(buckets) + int(index < count % len(buckets)) for index in range(len(buckets))]
+        flip_chosen = [np.zeros(0, dtype = np.int64) for _ in folders]
+        for bucket_index, ((low, high), total) in enumerate(zip(buckets, per_bucket)):
+            masks = [(folder_returns >= low) & (folder_returns < high) for folder_returns in returns]
+            flip_pools = [episodes[mask & flips] for episodes, mask, flips in zip(candidates, masks, has_flip)]
+            flip_total = min(int(round(flip_episode_fraction * total)), sum(len(pool) for pool in flip_pools))
+            flip_takes = balanced_counts(flip_total, np.array([len(pool) for pool in flip_pools])) if flip_total > 0 else np.zeros(len(folders), dtype = np.int64)
+            for index, take in enumerate(flip_takes):
+                picked = rng.choice(flip_pools[index], size = int(take), replace = False)
+                chosen[index] = np.concatenate([chosen[index], picked])
+                flip_chosen[index] = np.concatenate([flip_chosen[index], picked])
+                bucket_of[index] = np.concatenate([bucket_of[index], np.full(int(take), bucket_index)])
+            # The rest of the bucket: all its episodes that are not chosen yet, with or without a flip.
+            rest = [np.setdiff1d(episodes[mask], chosen[index]) for index, (episodes, mask) in enumerate(zip(candidates, masks))]
+            try:
+                takes = balanced_counts(total - flip_total, np.array([len(episodes) for episodes in rest]))
+            except ValueError as error:
+                raise ValueError(f"return bucket [{low:g}, {high:g}): {error}") from None
+            for index, take in enumerate(takes):
+                picked = rng.choice(rest[index], size = int(take), replace = False)
+                chosen[index] = np.concatenate([chosen[index], picked])
+                bucket_of[index] = np.concatenate([bucket_of[index], np.full(int(take), bucket_index)])
+
+    arrays = dict(
+        obs = np.zeros((count, max_episode_steps + 1, obs_dim), dtype = np.float32),
+        actions = np.zeros((count, max_episode_steps, action_dim), dtype = np.float32),
+        rewards = np.zeros((count, max_episode_steps), dtype = np.float32),
+        terminated = np.zeros(count, dtype = np.bool_),
+        truncated = np.ones(count, dtype = np.bool_),
+        lens = np.full(count, max_episode_steps, dtype = np.int32),
+    )
+    source = np.zeros((count, 2), dtype = np.int64)
+    summaries = []
+    row = 0
+
+    for folder_index, (folder, replay) in enumerate(zip(folders, replays)):
+        # Sorted, so the reads go forward through the memmap.
+        order = np.argsort(chosen[folder_index], kind = "stable")
+        episodes, episode_buckets = chosen[folder_index][order], bucket_of[folder_index][order]
+        take = len(episodes)
+
+        for episode in episodes:
+            arrays["obs"][row] = replay.data["critic_state"][episode, :max_episode_steps + 1]
+            native = np.asarray(replay.data["actions_continuous"][episode, :max_episode_steps], dtype = np.float32)
+            arrays["actions"][row] = np.clip(native_to_env_actions(native, action_range), *action_range)
+            arrays["rewards"][row] = replay.data["rewards"][episode, :max_episode_steps]
+            source[row] = (folder_index, episode)
+            row += 1
+
+        episode_returns = arrays["rewards"][row - take:row].sum(axis = 1)
+        summary = dict(
+            folder = str(folder),
+            stored_episodes = int((np.asarray(replay.meta_data["episode_lens"]) > 0).sum()),
+            # The replay state that the episode indices of past_run_source.npy refer to. A resumed run adds episodes.
+            replay_num_episodes = int(replay.num_episodes),
+            replay_episode_index = int(replay.episode_index),
+            full_episodes = int(len(candidates[folder_index])),
+            episodes = int(take),
+            return_mean = float(episode_returns.mean()) if take else None,
+            return_min = float(episode_returns.min()) if take else None,
+            return_max = float(episode_returns.max()) if take else None,
+        )
+        if len(buckets):
+            summary["episodes_per_bucket"] = {
+                f"[{low:g}, {high:g})": int((episode_buckets == index).sum()) for index, (low, high) in enumerate(buckets)
+            }
+            summary["available_per_bucket"] = {
+                f"[{low:g}, {high:g})": int(((returns[folder_index] >= low) & (returns[folder_index] < high)).sum())
+                for low, high in buckets
+            }
+        if flip_episode_fraction > 0.:
+            in_flip_share = np.isin(episodes, flip_chosen[folder_index])
+            summary["flip_share_episodes_per_bucket"] = {
+                f"[{low:g}, {high:g})": int((in_flip_share & (episode_buckets == index)).sum()) for index, (low, high) in enumerate(buckets)
+            }
+        summaries.append(summary)
+
+    return arrays, source, summaries
+
+
 def collect_offline_dataset(
     *,
     env_name: str,
@@ -651,8 +1021,21 @@ def collect_offline_dataset(
     expert_cache_dir: str | Path,
     expert_path: str | None,
     expert_min_return: float,
+    expert_device: str | torch.device = "cpu",
+    storage_dir: str | Path | None = None,
+    past_run_replays: Sequence[str] = (),
+    past_run_return_buckets: Sequence[Sequence[float]] = (),
+    expert_action_scales: Sequence[float] = (),
+    expert_scale_change_steps: int = 0,
+    expert_scaled_noise_std: float = 0.,
+    past_run_flip_episode_fraction: float = 0.,
+    bang_bang_hold_steps: Sequence[float] = (),
 ) -> Path:
-    """Collect the offline dataset. Skip the stage if an agreeing dataset exists."""
+    """Collect the offline dataset. Skip the stage if an agreeing dataset exists.
+
+    The expert actor runs on expert_device. The envs step on the CPU.
+    With storage_dir, write the new dataset to storage_dir and symlink dataset_dir to it.
+    """
 
     dataset_dir = offline_dataset_dir(data_dir, env_name, dataset_name)
     config = collection_config(
@@ -667,6 +1050,13 @@ def collect_offline_dataset(
         expert_revision = expert_revision,
         expert_filename = expert_filename,
         expert_path = expert_path,
+        past_run_replays = past_run_replays,
+        past_run_return_buckets = past_run_return_buckets,
+        expert_action_scales = expert_action_scales,
+        expert_scale_change_steps = expert_scale_change_steps,
+        expert_scaled_noise_std = expert_scaled_noise_std,
+        past_run_flip_episode_fraction = past_run_flip_episode_fraction,
+        bang_bang_hold_steps = bang_bang_hold_steps,
     )
 
     if dataset_dir.exists():
@@ -707,13 +1097,35 @@ def collect_offline_dataset(
     if is_noise.any():
         episode_noise_stds[is_noise] = rng.choice(np.asarray(noise_stds, dtype = np.float32), size = int(is_noise.sum()))
 
+    # Each expert_scaled episode samples one action scale. Without these episodes, the generator is not used here.
+    episode_action_scales = np.ones(num_episodes, dtype = np.float32)
+    is_scaled = modes == OFFLINE_MODE_IDS["expert_scaled"]
+    scale_range = (float(min(expert_action_scales, default = 1.)), float(max(expert_action_scales, default = 1.)))
+    if is_scaled.any() and expert_scale_change_steps > 0:
+        # Scales from the range [min, max] of the list; the scale changes every expert_scale_change_steps steps.
+        episode_action_scales[is_scaled] = rng.uniform(*scale_range, size = int(is_scaled.sum())).astype(np.float32)
+    elif is_scaled.any():
+        episode_action_scales[is_scaled] = rng.choice(np.asarray(expert_action_scales, dtype = np.float32), size = int(is_scaled.sum()))
+    if is_scaled.any() and expert_scaled_noise_std > 0.:
+        episode_noise_stds[is_scaled] = expert_scaled_noise_std
+
+    # Each bang_bang episode samples one mean hold, with a separate generator: without these episodes, the main
+    # generator gives the same values as before this mode existed.
+    episode_hold_steps = np.ones(num_episodes, dtype = np.float32)
+    is_bang = modes == OFFLINE_MODE_IDS["bang_bang"]
+    if is_bang.any():
+        hold_rng = np.random.default_rng([data_seed, OFFLINE_MODE_IDS["bang_bang"]])
+        episode_hold_steps[is_bang] = hold_rng.choice(np.asarray(bang_bang_hold_steps, dtype = np.float32), size = int(is_bang.sum()))
+
     permutation = rng.permutation(num_episodes)
     modes, episode_noise_stds = modes[permutation], episode_noise_stds[permutation]
+    episode_action_scales = episode_action_scales[permutation]
+    episode_hold_steps = episode_hold_steps[permutation]
 
     actor = None
     expert_info = None
 
-    if counts["expert"] + counts["expert_noise"] > 0:
+    if counts["expert"] + counts["expert_noise"] + counts["expert_scaled"] > 0:
         path, digest = download_expert(
             repo = expert_repo,
             revision = expert_revision,
@@ -721,7 +1133,7 @@ def collect_offline_dataset(
             cache_dir = expert_cache_dir,
             expert_path = expert_path,
         )
-        actor = load_expert_actor(path, obs_dim = obs_dim, action_dim = action_dim)
+        actor = load_expert_actor(path, obs_dim = obs_dim, action_dim = action_dim).to(expert_device)
         validation_return = validate_expert(
             actor,
             env_name = env_name,
@@ -737,6 +1149,7 @@ def collect_offline_dataset(
             path = str(path),
             sha256 = digest,
             validation_mean_return = validation_return,
+            device = str(expert_device),
         )
 
     arrays = dict(
@@ -756,16 +1169,25 @@ def collect_offline_dataset(
         env_vectorization_mode = "sync",
     )
 
+    # The env steps only the expert, expert_noise, and random episodes. Without past_runs episodes, the env
+    # episodes are all episodes, in the same order and with the same seeds as before that mode existed.
+    env_episodes = np.flatnonzero(modes != OFFLINE_MODE_IDS["past_runs"])
+
     try:
-        for start in tqdm(range(0, num_episodes, num_envs), desc = "offline collect"):
-            stop = min(start + num_envs, num_episodes)
+        for start in tqdm(range(0, len(env_episodes), num_envs), desc = "offline collect"):
+            stop = min(start + num_envs, len(env_episodes))
             count = stop - start
+            batch_episodes = env_episodes[start:stop]
 
             # A partial last batch fills the unused envs with random episodes and drops them.
             batch_modes = np.full(num_envs, OFFLINE_MODE_IDS["random"], dtype = np.int8)
             batch_noise_stds = np.zeros(num_envs, dtype = np.float32)
-            batch_modes[:count] = modes[start:stop]
-            batch_noise_stds[:count] = episode_noise_stds[start:stop]
+            batch_action_scales = np.ones(num_envs, dtype = np.float32)
+            batch_hold_steps = np.ones(num_envs, dtype = np.float32)
+            batch_modes[:count] = modes[batch_episodes]
+            batch_hold_steps[:count] = episode_hold_steps[batch_episodes]
+            batch_noise_stds[:count] = episode_noise_stds[batch_episodes]
+            batch_action_scales[:count] = episode_action_scales[batch_episodes]
 
             # The vector env seeds env i with seed + i, so each episode has its own seed.
             out = run_episode_batch(
@@ -778,12 +1200,39 @@ def collect_offline_dataset(
                 action_range = action_range,
                 max_episode_steps = max_episode_steps,
                 action_dim = action_dim,
+                action_scales = batch_action_scales,
+                scale_change_steps = expert_scale_change_steps,
+                scale_range = scale_range,
+                scale_rng = np.random.default_rng([data_seed, OFFLINE_MODE_IDS["expert_scaled"], start]),
+                hold_steps = batch_hold_steps,
+                bang_rng = np.random.default_rng([data_seed, OFFLINE_MODE_IDS["bang_bang"], start]),
             )
 
             for key, value in out.items():
-                arrays[key][start:stop] = value[:count]
+                arrays[key][batch_episodes] = value[:count]
     finally:
         env.close()
+
+    past_run_source = None
+    past_run_summaries = None
+    if counts["past_runs"] > 0:
+        # A separate generator, so the env episodes do not depend on the past_runs episodes.
+        past_episodes = np.flatnonzero(modes == OFFLINE_MODE_IDS["past_runs"])
+        past_arrays, past_source, past_run_summaries = past_run_episodes(
+            past_run_replays,
+            len(past_episodes),
+            rng = np.random.default_rng([data_seed, OFFLINE_MODE_IDS["past_runs"]]),
+            max_episode_steps = max_episode_steps,
+            obs_dim = obs_dim,
+            action_dim = action_dim,
+            action_range = action_range,
+            return_buckets = past_run_return_buckets,
+            flip_episode_fraction = past_run_flip_episode_fraction,
+        )
+        for key, value in past_arrays.items():
+            arrays[key][past_episodes] = value
+        past_run_source = np.full((num_episodes, 2), -1, dtype = np.int64)
+        past_run_source[past_episodes] = past_source
 
     statistics = mode_statistics(
         env_name,
@@ -792,22 +1241,26 @@ def collect_offline_dataset(
         lens = arrays["lens"],
         modes = modes,
         noise_stds = episode_noise_stds,
+        action_scales = episode_action_scales,
+        hold_steps = episode_hold_steps,
     )
     manifest = dict(
         config = config,
         max_episode_steps = max_episode_steps,
         num_episodes = num_episodes,
         env_steps = int(arrays["lens"].sum()),
-        episodes_per_mode = counts,
+        episodes_per_mode = {mode: count for mode, count in counts.items() if mode in FIRST_OFFLINE_MODES or count > 0},
         obs_dim = obs_dim,
         action_dim = action_dim,
         action_range = list(action_range),
         versions = package_versions(),
         expert = expert_info,
         statistics = statistics,
+        **(dict(past_runs = past_run_summaries) if exists(past_run_summaries) else {}),
     )
 
-    tmp_dir = dataset_dir.with_name(dataset_dir.name + ".tmp")
+    final_dir = dataset_dir if storage_dir is None else Path(storage_dir)
+    tmp_dir = final_dir.with_name(final_dir.name + ".tmp")
     shutil.rmtree(tmp_dir, ignore_errors = True)
     tmp_dir.mkdir(parents = True)
 
@@ -816,8 +1269,18 @@ def collect_offline_dataset(
 
     np.save(tmp_dir / "mode.npy", modes)
     np.save(tmp_dir / "noise_std.npy", episode_noise_stds)
+    if exists(past_run_source):
+        # (replay folder index in manifest["past_runs"], replay episode index); -1 for the other modes.
+        np.save(tmp_dir / PAST_RUN_SOURCE_FILE, past_run_source)
+    if counts["expert_scaled"] > 0:
+        # The action scale of each episode (the first scale if the scale changes); 1 for the other modes.
+        np.save(tmp_dir / ACTION_SCALE_FILE, episode_action_scales)
     (tmp_dir / "manifest.json").write_text(json.dumps(manifest, indent = 2, sort_keys = True) + "\n")
-    os.replace(tmp_dir, dataset_dir)
+    os.replace(tmp_dir, final_dir)
+
+    if final_dir != dataset_dir:
+        dataset_dir.parent.mkdir(parents = True, exist_ok = True)
+        dataset_dir.symlink_to(final_dir, target_is_directory = True)
 
     print(f"offline dataset: {num_episodes} episodes, {manifest['env_steps']} env steps -> {dataset_dir}")
     for mode, entry in statistics.items():
@@ -1111,7 +1574,13 @@ def concat_replay_batches(first: Mapping[str, Any], second: Mapping[str, Any]) -
 # checkpoints
 
 def pretrain_signature(values: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: json_normalize(values[key]) for key in PRETRAIN_SIGNATURE_KEYS}
+    signature = {key: json_normalize(values[key]) for key in PRETRAIN_SIGNATURE_KEYS}
+    signature.update({
+        key: json_normalize(values[key])
+        for key in OPTIONAL_PRETRAIN_SIGNATURE_KEYS
+        if values.get(key) is not None
+    })
+    return signature
 
 
 def check_pretrain_signature(saved: Mapping[str, Any], current: Mapping[str, Any], *, source: str):
@@ -1501,10 +1970,11 @@ def pretrain_offline(
         )
 
         if checkpoint_every > 0 and step % checkpoint_every == 0 and step < total_steps:
-            log_validation(step)
+            # Save first: a failed validation (for example out of GPU memory) does not lose the steps.
             save_torch_atomic(package_at(step), step_checkpoint_path(pretrain_dir, step))
+            log_validation(step)
 
-    log_validation(step)
     save_torch_atomic(package_at(step), final_path)
+    log_validation(step)
     print(f"offline pretrained checkpoint: {final_path}")
     return final_path

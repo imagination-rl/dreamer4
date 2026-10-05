@@ -188,6 +188,28 @@ class DynamicTimeCacheCallable:
         return self.fn(*args, **kwargs)
 
 
+class EagerWithoutTimeCacheCallable:
+    """Run the eager forward for a call without a time cache, and the compiled forward for the other calls.
+
+    A rollout calls its forward without a time cache for the first generated frame (prompt and new frame together).
+    On CUDA, the compiled forward gives other outputs than the eager forward for a short sequence of two or more
+    frames: frame 0 agrees, each later frame differs (flex attention selects its decode kernel for fewer than 128
+    queries, and the causal time attention is wrong there inside a compiled forward). The calls with a time cache
+    process one frame and agree with the eager forward.
+    """
+
+    def __init__(self, fn: Callable, eager_fn: Callable):
+        self.fn = fn
+        self.eager_fn = eager_fn
+        self.timing = getattr(fn, "timing", None)
+
+    def __call__(self, *args, **kwargs):
+        if not exists(kwargs.get("time_cache")):
+            return self.eager_fn(*args, **kwargs)
+
+        return self.fn(*args, **kwargs)
+
+
 class InteractWithEnvForward(nn.Module):
     def __init__(self, world_model: DynamicsWorldModel):
         super().__init__()
@@ -264,10 +286,13 @@ class ImaginationGenerateRollout(nn.Module):
         preallocate_outputs: bool,
         optimize_generate_compilation: bool = False,
         forward_for_generate: Callable | None = None,
+        clamp_generated_latents: bool = True,
     ):
         super().__init__()
         self.world_model = world_model
         self.generate_steps = generate_steps
+        # False only with fixed_full_transformer_finetuning: the learner reads the latents that the rollout read.
+        self.clamp_generated_latents = clamp_generated_latents
         self.store_old_action_unembeds = store_old_action_unembeds
         self.use_time_cache = use_time_cache
         self.preallocate_outputs = preallocate_outputs
@@ -304,6 +329,7 @@ class ImaginationGenerateRollout(nn.Module):
             prompt_discrete_actions = prompt_discrete_actions,
             prompt_continuous_actions = prompt_continuous_actions,
             prompt_rewards = prompt_rewards,
+            **({} if self.clamp_generated_latents else dict(clamp_generated_latents = False)),
         )
 
 
@@ -590,6 +616,8 @@ def build_compile_runtime(
     compile_interact: bool = False,
     interact_max_timesteps: int = 16,
     full_transformer_finetuning: bool = False,
+    clamp_generated_latents: bool = True,
+    eager_generate_without_time_cache: bool = False,
 ) -> CompileRuntime:
     timings = []
 
@@ -663,6 +691,11 @@ def build_compile_runtime(
             cached_generate_forward,
             max_time = imagination_max_timesteps,
         )
+        if eager_generate_without_time_cache:
+            cached_generate_forward = EagerWithoutTimeCacheCallable(
+                cached_generate_forward,
+                world_model._forward_for_generate_impl,
+            )
         timings.append(timing)
 
     generate_rollout_module = ImaginationGenerateRollout(
@@ -673,6 +706,7 @@ def build_compile_runtime(
         preallocate_outputs = compile_generate or optimize_generate_compilation,
         optimize_generate_compilation = optimize_generate_compilation,
         forward_for_generate = cached_generate_forward,
+        clamp_generated_latents = clamp_generated_latents,
     )
 
     generate_rollout, timing = maybe_compile_and_time(

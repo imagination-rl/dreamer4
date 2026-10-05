@@ -326,7 +326,7 @@ def main_kwargs(tmp_path, run_name, *, profile, world_model_train_steps):
         compile_learn = False,
         num_loops = 1,
         rollouts_per_loop = 1,
-        num_envs = 1,
+        total_envs = 1,
         max_timesteps = 1,
         pretrain_tokenizer_steps = 0,
         pretrain_tokenizer_observations = 1,

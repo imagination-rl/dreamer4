@@ -85,7 +85,10 @@ tokenizer_eval_batch_size: 2048
 # Environment rollout collection
 num_loops: 500
 rollouts_per_loop: 1
-num_envs: 64
+# Episodes per rollout (the rollout batch size).
+total_envs: 64
+# Async env worker processes. Each worker steps total_envs / parallel_envs envs. null gives one process per env.
+parallel_envs: 8
 env_vectorization_mode: async
 max_timesteps: 1000
 replay_size: 256
@@ -100,10 +103,25 @@ world_model_learning_rate: 0.0006
 # Keep the real observation-to-action function near its pre-phase policy.
 preserve_policy_during_world_model_updates: false
 world_model_policy_consistency_loss_weight: 1.0
+# Head re-anchor (reports/9-28-26, item D1). After each world-model phase, fit the policy and value heads back to
+# their outputs before the phase, on real windows of the newest rollout. The transformer does not change.
+reanchor_heads_after_world_model_updates: false
+reanchor_heads_steps: 200
+reanchor_heads_learning_rate: 0.0003
+reanchor_heads_contexts: 64
+reanchor_heads_context_length: 200
 # Normalize world-model losses with running RMS statistics.
 use_dynamics_loss_normalization: false
 # Stop RMS-statistic updates after the initial world-model pretrain phase.
 freeze_dynamics_loss_normalization_after_pretraining: false
+# Normalize the flow loss and the bootstrap loss with one RMS statistic of their sum. The two keep their ratio.
+# The default gives each of the two its own statistic. Requires use_dynamics_loss_normalization.
+group_dynamics_loss_normalization: false
+# Use the plain loss sum (no RMS normalization) before this loop. The RMS statistics update from the start.
+# 0 normalizes from the start. Requires use_dynamics_loss_normalization.
+dynamics_loss_normalization_start_loop: 0
+# Weight of the reward loss in the world-model loss (after the RMS normalization, if it is on).
+world_model_reward_loss_weight: 1.0
 # Use the paper's piecewise dynamics loss and sample shortcut steps per example.
 use_paper_aligned_shortcut_objective: false
 
@@ -130,6 +148,8 @@ cleanrl_updated_ppo: false
 cleanrl_ppo_closer: false
 # Train the closer PPO value head with its HL-Gauss cross-entropy loss instead of scalar MSE.
 cleanrl_ppo_closer_hl_gauss_value_loss: false
+# Keep the updated CleanRL PPO learning rate at agent_learning_rate. The default decays it linearly to 0 over num_loops.
+cleanrl_updated_ppo_constant_learning_rate: false
 # Reuse each PPO dream across trajectory minibatches and update epochs.
 reuse_ppo_dream_batch: false
 ppo_reuse_epochs: 4
@@ -146,11 +166,46 @@ pmpo_pos_to_neg_weight: 0.5
 pmpo_kl_div_loss_weight: 0.3
 use_delight_gating: false
 policy_entropy_weight: 0.01
+# Entropy bonus coefficient (CleanRL ent_coef) for cleanrl_updated_ppo, which ignores policy_entropy_weight.
+# The policy loss subtracts the coefficient times the entropy summed over action dimensions.
+cleanrl_ppo_entropy_weight: 0.0
+# Flip-onset windows (HalfCheetah only). With a value above 0, that share of the world-model training windows holds a
+# real upright-to-flipped transition of the root angle (also in the offline pretrain stage and the loop-0 pretrain steps).
+world_model_flip_onset_window_fraction: 0.0
+# With a value above 0, that share of the imagination prompts ends upright, 1 to imagination_horizon rows before a real
+# flip onset, so the policy and value heads train on the dreams from tipping states.
+imagination_flip_onset_prompt_fraction: 0.0
 # Scale only reward-loss gradients that enter the shared transformer.
 scale_reward_gradient_into_transformer: false
 reward_gradient_into_transformer_scale: 0.01
+# Offline rl stage only: keep the pretrained world model fixed, as in paper phase 3 (imagination training).
+# Only the policy and value heads train. The loop skips the world-model training steps; set offline_rehearsal_fraction to 0.
+freeze_world_model: false
+# Paper phase 2 (behavior cloning) in the online loop: each world-model update also trains the policy head on the
+# replay actions (multi-token prediction). The world-model optimizer updates the transformer and the policy head
+# together, so the policy head follows the change of its input features. Not with rehearsal or the pretrain stage.
+behavior_cloning_in_world_model_updates: false
+# Weight of the BC loss in the world-model loss. The loss is the sum over the 8 prediction distances.
+world_model_behavior_cloning_loss_weight: 1.0
 # Apply full-transformer updates with replay dynamics, reward, and policy-prior preservation losses.
 full_transformer_finetuning: false
+# Full-transformer finetuning as the paper's phase 2 with the RL loss in place of BC (section 3.3 and its footnote).
+# Each step sums the world-model loss on replay windows and the RL loss (PMPO, policy-prior KL, value) on dreams.
+# One optimizer (the world-model optimizer) updates the transformer and the heads. The joint phase replaces the
+# world-model phase and the imagination phase, so world_model_train_steps and imagination_train_steps have no effect.
+# Requires the generation time cache, and objective pmpo or cleanrl_ppo_closer. With closer PPO, each step does one
+# pass over one new dream batch (no epochs, no minibatches, no policy prior), and the heads keep agent_learning_rate.
+# full_transformer_finetuning above is the older version, with two optimizers and two phases.
+fixed_full_transformer_finetuning: false
+# Joint steps for each loop. Each step generates one dream batch.
+fixed_full_transformer_finetuning_steps: 10
+# Weight of the RL loss (policy loss + value loss) in the sum.
+fixed_full_transformer_finetuning_rl_loss_weight: 1.0
+# Dreams for each chunk of the RL transformer forward (gradient accumulation, the same gradient as one pass).
+# null uses one pass, and then each step has one backward. Set 64 on a 16 GB GPU.
+fixed_full_transformer_finetuning_dream_micro_batch_size: null
+# At the first step of each loop, log the transformer gradient norm of each loss term (joint_diag/ graphs).
+fixed_full_transformer_finetuning_grad_diagnostics: true
 agent_predicts_state: false
 agent_state_pred_loss_weight: 0.1
 
@@ -179,6 +234,31 @@ track_compile_performance: false
 return_compile_timings: false
 # Selective activation recomputation: 0 recomputes most; 1 is torch.compile's default.
 activation_memory_budget: 0.825
+# World-model update in chunks of this many windows (gradient accumulation).
+# null uses one pass. Set 32 or 64 on a 16 GB GPU.
+world_model_micro_batch_size: null
+# bf16 autocast for the world-model loss only (imagination and rollouts stay fp32).
+world_model_autocast_bf16: false
+# Depth-wise attention pools in the dynamics transformer (attention residuals).
+use_attn_pool: true
+# Attention pools with plain einsum attention instead of SDPA. Same math, about 2.6 times
+# faster world-model updates, and bf16 works at world-model micro-batches of 64 or more.
+# Rounding differs from the default path.
+attn_pool_einsum_attend: false
+# Attention Residuals (Kimi, arXiv 2603.15031) in the dynamics transformer: null (off), full, or block.
+# They replace the residual sum. Each sublayer input is a learned softmax mix over depth of the
+# token embedding and the earlier sublayer outputs. They require use_attn_pool: false.
+attn_res: null
+# Block AttnRes only: attention and feedforward sublayers in each block (2 = one transformer layer).
+# The outputs in a block add up to one source. Full AttnRes is the same as a block size of 1.
+attn_res_block_size: 2
+# Feedforward expansion of the feedforward layers of the world model (the dynamics transformer, and the
+# agent-state, pre-encoder, actor and critic modules when they are on). null keeps the model default (4).
+dynamics_ff_expansion_factor: null
+# Stop after this many loops; num_loops still sets the schedules. null runs all loops.
+stop_after_loops: null
+# Cap on the GPU memory of this process (fraction of the device memory). null: no cap.
+cuda_memory_fraction: null
 
 # Profiling. Lightweight record_function timings are enabled by default.
 # Full profile mode always exits after 5 warmup + 4 measured model steps.
@@ -194,7 +274,7 @@ profile_with_flops: false
 audit_deeper_dynamics: false
 # A2: train the reward head on the arrival reward, and pair it with the action that caused it.
 audit_arrival_reward_target: false
-# A3: divide num_envs by 4. Multiply replay_size, num_loops, and checkpoint_every by 4.
+# A3: divide total_envs by 4. Multiply replay_size, num_loops, and checkpoint_every by 4.
 audit_quarter_envs_per_loop: false
 # Log real-rollout behavior and world-model quality against env steps.
 audit_diagnostics: false
@@ -220,6 +300,26 @@ offline_data_steps: 1000000
 offline_data_mix: {expert: 0.3, expert_noise: 0.4, random: 0.3}
 # Gaussian noise std in units of half the action range. Each expert_noise episode samples one value.
 offline_expert_noise_stds: [0.1, 0.2, 0.4, 0.8]
+# Replay folders of earlier online runs for the past_runs mode of offline_data_mix. Each folder gives the same
+# number of episodes, drawn uniformly from all its loops. Only read if the past_runs fraction is above 0.
+offline_past_run_replays: []
+# Return buckets [low, high) for the past_runs episodes. Each bucket gets an equal share of the episodes, and the
+# replay folders share each bucket equally. An empty list draws each folder's episodes uniformly from all loops.
+offline_past_run_return_buckets: []
+# Action scales for the expert_scaled mode of offline_data_mix. Each expert_scaled episode samples one value and
+# multiplies the expert actions by it. Only read if the expert_scaled fraction is above 0.
+offline_expert_action_scales: [0.4, 0.5, 0.6, 0.7]
+# expert_scaled only. With a value above 0, the scale is drawn uniformly from [min, max] of offline_expert_action_scales
+# and changes every this many steps (0: one scale from the list for each episode).
+offline_expert_scale_change_steps: 0
+# expert_scaled only: Gaussian noise std (units of half the action range) added after the scale. 0 adds no noise.
+offline_expert_scaled_noise_std: 0.0
+# bang_bang only: the mean hold steps of each episode are drawn from this list. Each step, each action dim draws a new
+# sign (an action at the low or high bound) with probability 1 / hold steps.
+offline_bang_bang_hold_steps: []
+# past_runs with return buckets only. With a value above 0, this share of each return bucket comes from the episodes
+# in which the cheetah flips (an upright-to-flipped transition of the root angle).
+offline_past_run_flip_episode_fraction: 0.0
 offline_data_seed: 10042
 offline_data_num_envs: 64
 # Pretraining. A null offline_pretrain_name uses run_name.
@@ -244,3 +344,8 @@ checkpoint_every: 25
 checkpoint_path: null
 clear_log_dir: false
 unique_log_dir: true
+# Create each new run directory, offline dataset, and offline pretrain directory under this folder.
+# A symlink at the normal path (for example runs/gym_imagination/<run_name>) points to it.
+# If the folder does not exist (for example on the cluster), the directories stay in their normal place.
+# null always keeps them in their normal place. Paths outside the repo (pytest tmp_path) are not moved.
+log_storage_dir: /data/logs/dreamer4lucid

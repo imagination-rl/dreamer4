@@ -28,7 +28,7 @@ def resolve_from(config, **flags):
         time_block_every = config["time_block_every"],
         old_reward_shifting = config["old_reward_shifting"],
         align_generated_dream_transitions = config["align_generated_dream_transitions"],
-        num_envs = config["num_envs"],
+        num_envs = config["total_envs"],
         replay_size = config["replay_size"],
         num_loops = config["num_loops"],
         checkpoint_every = config["checkpoint_every"],
@@ -79,7 +79,7 @@ def test_audit_flags_reject_layouts_they_cannot_extend():
         resolve_from(dict(config, depth = 4), audit_deeper_dynamics = True)
 
     with pytest.raises(ValueError, match = "divisible by 4"):
-        resolve_from(dict(config, num_envs = 30), audit_quarter_envs_per_loop = True)
+        resolve_from(dict(config, total_envs = 30), audit_quarter_envs_per_loop = True)
 
 
 def test_each_audit_arm_differs_from_its_control_by_one_audit_flag():
@@ -181,7 +181,7 @@ def test_main_logs_audit_diagnostics_with_all_audit_flags(tmp_path):
         compile_generate = False,
         compile_learn = False,
         num_loops = 1,
-        num_envs = 8,
+        total_envs = 8,
         env_vectorization_mode = "sync",
         max_timesteps = 48,
         replay_size = 2,

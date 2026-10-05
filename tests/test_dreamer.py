@@ -4133,3 +4133,97 @@ def test_dynamics_model_all_three_tokenizers_sequential_parallel_cache(use_time_
     )
 
     assert exists(generated_outputs)
+
+def test_attention_pool_einsum_attend_matches_the_sdpa_default():
+    from dreamer4.dreamer4 import AttentionPool
+
+    torch.manual_seed(0)
+    pool = AttentionPool(16, heads = 2, dim_head = 8)
+    x = torch.randn(2, 5, 16)
+    hiddens = [torch.randn(2, 5, 16) for _ in range(3)]
+
+    sdpa_out = pool(x, hiddens = hiddens)
+    pool.einsum_attend = True
+    einsum_out = pool(x, hiddens = hiddens)
+
+    assert torch.allclose(einsum_out, sdpa_out, atol = 1e-6)
+
+
+@pytest.mark.parametrize('mode, block_size, expected_sources', [
+    # sublayers 0..5 (attention, feedforward for each of 3 layers), then the final output
+    ('full', 1, [1, 2, 3, 4, 5, 6, 7]),
+    ('block', 2, [1, 2, 2, 3, 3, 4, 4]),
+    ('block', 3, [1, 2, 2, 2, 3, 3, 3]),
+])
+def test_attention_residuals_follow_the_block_source_layout(monkeypatch, mode, block_size, expected_sources):
+    from dreamer4.dreamer4 import AxialSpaceTimeTransformer, AttentionResiduals
+
+    source_counts = []
+    original_mix = AttentionResiduals.mix
+
+    def recording_mix(self, index, sources):
+        source_counts.append(len(sources))
+        return original_mix(self, index, sources)
+
+    monkeypatch.setattr(AttentionResiduals, 'mix', recording_mix)
+
+    torch.manual_seed(0)
+    transformer = AxialSpaceTimeTransformer(
+        dim = 16, depth = 3, attn_heads = 2, attn_dim_head = 8, time_block_every = 2,
+        use_attn_pool = False, attn_res = mode, attn_res_block_size = block_size,
+    )
+    tokens = torch.randn(2, 3, 5, 16)
+    out = transformer(tokens)
+    out.sum().backward()
+
+    assert source_counts == expected_sources
+    assert out.shape == tokens.shape
+    assert transformer.attn_res.queries.grad[1:].abs().sum() > 0
+
+
+def test_attention_residuals_start_as_an_equal_weight_average():
+    from dreamer4.dreamer4 import AttentionResiduals
+
+    attn_res = AttentionResiduals(8, num_sublayers = 2)
+    sources = [torch.randn(2, 4, 8) * scale for scale in (1., 10., 100.)]
+
+    assert torch.allclose(attn_res.mix(1, sources), sum(sources) / 3, atol = 1e-5)
+
+
+def test_attention_residuals_require_the_attention_pools_off():
+    from dreamer4.dreamer4 import AxialSpaceTimeTransformer
+
+    with pytest.raises(ValueError, match = 'use_attn_pool'):
+        AxialSpaceTimeTransformer(dim = 16, depth = 3, attn_heads = 2, attn_dim_head = 8, attn_res = 'full')
+
+
+@pytest.mark.parametrize('mode', ['full', 'block'])
+def test_dynamics_world_model_trains_and_generates_with_attention_residuals(mode):
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    torch.manual_seed(0)
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        max_steps = 64,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 2,
+        depth = 3,
+        time_block_every = 2,
+        attn_heads = 2,
+        attn_dim_head = 8,
+        num_discrete_actions = 0,
+        num_continuous_actions = 3,
+        transformer_kwargs = dict(use_attn_pool = False, attn_res = mode),
+    )
+
+    loss = dynamics(
+        latents = torch.randn(2, 4, 2, 8),
+        continuous_actions = torch.rand(2, 3, 3),
+        rewards = torch.randn(2, 4),
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+
+    generations = dynamics.generate(time_steps = 4, batch_size = 2, use_time_cache = True, return_rewards_per_frame = True)
+    assert generations.latents.shape[:2] == (2, 4)

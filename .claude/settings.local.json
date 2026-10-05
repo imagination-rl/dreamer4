@@ -1,0 +1,13 @@
+{
+  "skillOverrides": {
+    "anthropic-skills:pptx": "off",
+    "anthropic-skills:xlsx": "off",
+    "anthropic-skills:morning": "off",
+    "anthropic-skills:import-memory": "off",
+    "anthropic-skills:docx": "off",
+    "anthropic-skills:docs": "off",
+    "anthropic-skills:chrome-browser": "off",
+    "anthropic-skills:computer-use": "off",
+    "anthropic-skills:skill-creator": "off"
+  }
+}

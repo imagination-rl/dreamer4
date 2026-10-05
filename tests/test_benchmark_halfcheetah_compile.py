@@ -112,7 +112,7 @@ def test_perf_benchmark_keeps_full_config_steps_but_stabilizes_batch_shapes(tmp_
         config,
         benchmark_root = tmp_path / "benchmark",
         benchmark_cases = "eager",
-        train_overrides = {"num_envs": 8},
+        train_overrides = {"total_envs": 8},
     )
     kwargs = runs[0].train_kwargs
 

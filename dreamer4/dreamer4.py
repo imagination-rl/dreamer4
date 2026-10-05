@@ -2512,15 +2512,29 @@ class GRULayer(Module):
 
 # attention pooling
 
+def depth_attend(q, k, v, causal = False, **kwargs):
+    # One query per token attends over the few layer outputs of that token. The
+    # fused SDPA kernels treat each token as a sequence, and their launch grid
+    # fails in bf16 at about 64 windows x 200 frames. Plain einsum attention gives
+    # the same result (scale d^-0.5, softmax over the keys) with no such limit.
+    assert not causal
+    sim = einsum(q, k, '... i d, ... j d -> ... i j') * (q.shape[-1] ** -0.5)
+    attn = sim.softmax(dim = -1)
+    return einsum(attn, v, '... i j, ... j d -> ... i d')
+
 class AttentionPool(Module):
     def __init__(
         self,
         dim,
         heads = 4,
         dim_head = 64,
+        einsum_attend = False,
         **kwargs
     ):
         super().__init__()
+        # einsum_attend: use depth_attend instead of the SDPA default (same math,
+        # different kernels, so the results differ by rounding only)
+        self.einsum_attend = einsum_attend
         self.attn = Attention(
             dim = dim,
             heads = heads,
@@ -2544,9 +2558,60 @@ class AttentionPool(Module):
         context = stack(hiddens, dim = -2)
         queries = rearrange(x, '... d -> ... 1 d')
 
-        out = self.attn(queries, context = context)
+        out = self.attn(queries, context = context, attend_fn = depth_attend if self.einsum_attend else None)
 
         return rearrange(out, '... 1 d -> ... d')
+
+class AttentionResiduals(Module):
+    # Attention Residuals (Kimi, https://arxiv.org/abs/2603.15031). They replace the
+    # residual sum. The input of each sublayer (attention or feedforward) is a softmax
+    # mix over depth of the sources: the token embedding and the earlier sublayer
+    # outputs. For each token, a learned pseudo-query scores RMSNorm(source). The
+    # queries start at zero, so each mix starts as an equal-weight average.
+    # block_size = 1 is Full AttnRes: each sublayer output is one source. With
+    # block_size > 1 (Block AttnRes), the outputs of each group of block_size
+    # sublayers add up to one block source, and the current block's partial sum is
+    # also a source.
+
+    def __init__(
+        self,
+        dim,
+        num_sublayers,
+        block_size = 1
+    ):
+        super().__init__()
+        assert block_size >= 1
+        self.num_sublayers = num_sublayers
+        self.block_size = block_size
+
+        # one query and one key norm for each sublayer, and one for the final output
+        self.queries = nn.Parameter(torch.zeros(num_sublayers + 1, dim))
+        self.norms = ModuleList([nn.RMSNorm(dim) for _ in range(num_sublayers + 1)])
+
+    def mix(self, index, sources: list[Tensor]):
+        if len(sources) == 1:
+            return sources[0]
+
+        values = stack(sources, dim = -2)
+        keys = self.norms[index](values)
+        weights = einsum(keys, self.queries[index], '... n d, d -> ... n').softmax(dim = -1)
+        return einsum(weights, values, '... n, ... n d -> ... d')
+
+    def sublayer_input(self, index, blocks: list[Tensor], partial: Tensor | None):
+        # A new block starts at each multiple of block_size. The finished partial sum
+        # then becomes a completed block source.
+        if index > 0 and divisible_by(index, self.block_size):
+            blocks, partial = [*blocks, partial], None
+
+        sources = blocks if not exists(partial) else [*blocks, partial]
+        return self.mix(index, sources), blocks, partial
+
+    def add_output(self, out, partial: Tensor | None):
+        return out if not exists(partial) else partial + out
+
+    def final_output(self, blocks: list[Tensor], partial: Tensor | None):
+        sources = blocks if not exists(partial) else [*blocks, partial]
+        return self.mix(self.num_sublayers, sources)
 
 class LearnedQueriesAttentionPool(Module):
     def __init__(
@@ -3159,6 +3224,9 @@ class AxialSpaceTimeTransformer(Module):
         time_attention_use_pope = False,
         space_attention_use_pope = False,
         use_attn_pool = True,
+        attn_pool_einsum_attend = False,
+        attn_res: str | None = None,         # None, 'full' or 'block' - Attention Residuals (AttentionResiduals)
+        attn_res_block_size = 2,             # Block AttnRes: sublayers (attention or feedforward) for each block
         mot_temporal = False,
         spatial_flex_attention_backend = 'AUTO',
         h_net_layer: int | None = None,
@@ -3264,7 +3332,7 @@ class AxialSpaceTimeTransformer(Module):
             maybe_attn_pool = None
 
             if use_attn_pool and not is_last:
-                maybe_attn_pool = Residual(AttentionPool(dim, **attn_residual_kwargs))
+                maybe_attn_pool = Residual(AttentionPool(dim, einsum_attend = attn_pool_einsum_attend, **attn_residual_kwargs))
 
             attn_pools.append(maybe_attn_pool)
 
@@ -3275,7 +3343,25 @@ class AxialSpaceTimeTransformer(Module):
         self.is_time = is_time
 
         self.use_attn_pool = use_attn_pool
-        self.final_attn_pool = Residual(AttentionPool(dim, **attn_residual_kwargs)) if use_attn_pool else Identity()
+        self.final_attn_pool = Residual(AttentionPool(dim, einsum_attend = attn_pool_einsum_attend, **attn_residual_kwargs)) if use_attn_pool else Identity()
+
+        # attention residuals (Kimi) replace the residual sum of every attention and feedforward sublayer
+
+        self.attn_res = None
+
+        if exists(attn_res):
+            if attn_res not in ('full', 'block'):
+                raise ValueError(f"attn_res must be None, 'full' or 'block', got {attn_res!r}")
+            if use_attn_pool:
+                raise ValueError('attn_res replaces the residual stream, so it requires use_attn_pool = False')
+            if rnn_time or exists(h_net_layer) or exists(spatial_modules):
+                raise ValueError('attn_res does not support rnn_time, h_net_layer or spatial_modules')
+
+            self.attn_res = AttentionResiduals(
+                dim,
+                num_sublayers = 2 * depth,
+                block_size = 1 if attn_res == 'full' else attn_res_block_size
+            )
 
         self.spatial_modules = spatial_modules
 
@@ -3457,6 +3543,11 @@ class AxialSpaceTimeTransformer(Module):
         layer_hiddens = [tokens]
         hiddens = []
 
+        # attention residuals: completed block sources (the token embedding first) and the current block's partial sum
+
+        attn_res = self.attn_res
+        res_blocks, res_partial = [tokens], None
+
         for layer_index, (
             layer_modules,
             maybe_rnn,
@@ -3470,6 +3561,14 @@ class AxialSpaceTimeTransformer(Module):
             if is_mot_layer:
                 special_attn, special_ff = mot_block
                 mot_packed_shape = [(space_seq_len - self.num_special_tokens,), (self.num_special_tokens,)]
+
+            # with attention residuals the sublayers run without their residual add
+
+            if exists(attn_res):
+                attn, ff = attn.fn, ff.fn
+
+                if is_mot_layer:
+                    special_attn, special_ff = special_attn.fn, special_ff.fn
 
             # rnn block
 
@@ -3490,6 +3589,10 @@ class AxialSpaceTimeTransformer(Module):
                 layer_hiddens.append(tokens)
 
             # attention block
+
+            if exists(attn_res):
+                tokens, res_blocks, res_partial = attn_res.sublayer_input(2 * layer_index, res_blocks, res_partial)
+                attn_res_input = tokens
 
             tokens = pre_attn_rearrange(tokens)
 
@@ -3565,6 +3668,12 @@ class AxialSpaceTimeTransformer(Module):
 
             tokens = post_attn_rearrange(tokens_out)
 
+            # the sublayer output adds to the block sum; tokens keeps input + output for the layer hiddens
+
+            if exists(attn_res):
+                res_partial = attn_res.add_output(tokens, res_partial)
+                tokens = attn_res_input + tokens
+
             # hierarchical temporal transformer
 
             is_h_net_layer = exists(self.h_net) and layer_index == self.h_net_layer
@@ -3601,11 +3710,19 @@ class AxialSpaceTimeTransformer(Module):
 
             # feedforward block
 
+            if exists(attn_res):
+                tokens, res_blocks, res_partial = attn_res.sublayer_input(2 * layer_index + 1, res_blocks, res_partial)
+                attn_res_input = tokens
+
             if not is_mot_layer:
                 tokens = ff(tokens)
             else:
                 main_tokens, special_tokens = unpack(tokens, mot_packed_shape, 'b t * d')
                 tokens, _ = pack((ff(main_tokens), special_ff(special_tokens)), 'b t * d')
+
+            if exists(attn_res):
+                res_partial = attn_res.add_output(tokens, res_partial)
+                tokens = attn_res_input + tokens
 
             # spatial modules (eg. MOSS)
 
@@ -3638,6 +3755,11 @@ class AxialSpaceTimeTransformer(Module):
 
             if exists(maybe_attn_pool):
                 tokens = maybe_attn_pool(tokens, hiddens = layer_hiddens)
+
+        # attention residuals: the transformer output is a mix over all block sources
+
+        if exists(attn_res):
+            tokens = attn_res.final_output(res_blocks, res_partial)
 
         # cross attend one last time from special tokens to spatial tokens, so attention on spatial tokens do not go to waste
 
@@ -5516,6 +5638,7 @@ class DynamicsWorldModel(Module):
         agent_value_gradient_frac = 1.,
         gae_use_accelerated = False,
         use_loss_normalization = False,
+        group_dynamics_loss_normalization = False,
         use_paper_aligned_shortcut_objective = False,
         policy_all_tokens = False,
         old_reward_shifting = False,
@@ -5587,7 +5710,7 @@ class DynamicsWorldModel(Module):
         if use_hl_gauss_actor_critic and not use_symexp_value_head:
             raise ValueError('`use_hl_gauss_actor_critic` requires `use_symexp_value_head`')
 
-        if use_hl_gauss_actor_critic and clip_values:
+        if use_hl_gauss_actor_critic and clip_values and not cleanrl_ppo_closer_hl_gauss_value_loss:
             raise ValueError('`use_hl_gauss_actor_critic` does not support value clipping')
 
         if cleanrl_ppo_closer_hl_gauss_value_loss and not cleanrl_ppo_closer:
@@ -5664,6 +5787,10 @@ class DynamicsWorldModel(Module):
 
         self.use_loss_normalization = use_loss_normalization
         self.use_paper_aligned_shortcut_objective = use_paper_aligned_shortcut_objective
+
+        # false gives the plain loss sum, while the rms statistics still update (a warmup before the normalization)
+
+        self.apply_loss_normalization = True
 
         # spatial
 
@@ -6322,6 +6449,13 @@ class DynamicsWorldModel(Module):
         self.flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
         self.shortcut_flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
         self.paper_dynamics_loss_normalizer = LossNormalizer() if (use_loss_normalization and use_paper_aligned_shortcut_objective) else None
+
+        # one RMS for the flow and bootstrap terms together - eq (7) is one loss term, so the two keep their ratio
+
+        assert not group_dynamics_loss_normalization or use_loss_normalization, 'group_dynamics_loss_normalization requires use_loss_normalization'
+        assert not (group_dynamics_loss_normalization and use_paper_aligned_shortcut_objective), 'the paper aligned shortcut objective already has one dynamics loss normalizer'
+
+        self.dynamics_loss_normalizer = LossNormalizer() if group_dynamics_loss_normalization else None
         self.agent_embed_reward_loss_normalizer = LossNormalizer(multi_token_pred_len) if use_loss_normalization else None
         self.latent_state_reward_loss_normalizer = LossNormalizer() if use_loss_normalization else None
         self.agent_embed_terminal_loss_normalizer = LossNormalizer(multi_token_pred_len) if (use_loss_normalization and self.predict_terminals) else None
@@ -7113,6 +7247,7 @@ class DynamicsWorldModel(Module):
         delight_temperature = None,
         normalize_advantages = None,
         return_diagnostics = False,
+        use_given_agent_embeds = False, # the caller supplies agent embeds (and policy inputs) that carry the transformer gradient
         eps = 1e-6
     ):
         use_delight_gating = default(use_delight_gating, self.use_delight_gating)
@@ -7283,7 +7418,11 @@ class DynamicsWorldModel(Module):
         if exists(continuous_actions) and continuous_actions.ndim == 2:
             continuous_actions = rearrange(continuous_actions, 'b t -> b t 1')
 
-        if (
+        if use_given_agent_embeds:
+            assert not only_learn_policy_value_heads, 'use_given_agent_embeds is for full transformer finetuning, so only_learn_policy_value_heads must be False'
+            assert exists(agent_embeds) and (not self.policy_all_tokens or exists(policy_inputs)), 'use_given_agent_embeds requires the agent embeds (and the policy inputs with policy_all_tokens)'
+
+        if not use_given_agent_embeds and (
             not only_learn_policy_value_heads or
             not exists(agent_embeds) or
             (self.policy_all_tokens and not exists(policy_inputs))
@@ -7801,6 +7940,7 @@ class DynamicsWorldModel(Module):
         continuous_temperature = 1.,
         optimize_generate_compilation: bool | None = None,
         forward_for_generate: Callable | None = None,
+        clamp_generated_latents = True,   # False returns the latents that the rollout itself read as context
     ): # (b t n d) | (b c t h w)
 
         optimize_generate_compilation = default(
@@ -7840,6 +7980,7 @@ class DynamicsWorldModel(Module):
             aug_id = aug_id,
             discrete_temperature = discrete_temperature,
             continuous_temperature = continuous_temperature,
+            clamp_generated_latents = clamp_generated_latents,
         )
 
         if optimize_generate_compilation:
@@ -7894,6 +8035,7 @@ class DynamicsWorldModel(Module):
         aug_id: bool | int | Tensor = False,
         discrete_temperature = 1.,
         continuous_temperature = 1.,
+        clamp_generated_latents = True,
     ):
 
         optimized_generation = not exists(forward_for_generate)
@@ -8435,7 +8577,8 @@ class DynamicsWorldModel(Module):
 
         # clamp latents to range of tanh
 
-        latents.clamp_(-1., 1.)
+        if clamp_generated_latents:
+            latents.clamp_(-1., 1.)
 
         # returning video
 
@@ -9541,12 +9684,15 @@ class DynamicsWorldModel(Module):
             if has_continuous:
                 continuous_action_targets, continuous_mask = make_mtp_targets(continuous_actions)
 
-            discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
-                policy_embed,
-                discrete_targets = discrete_action_targets,
-                continuous_targets = continuous_action_targets,
-                soft_validate_range = True
-            )
+            # The Beta log-prob (lgamma) is not exact in bf16, so it runs in fp32 under a bf16 autocast.
+            # Without autocast this is the same computation.
+            with torch.autocast(device_type = policy_embed.device.type, enabled = False):
+                discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
+                    policy_embed.float(),
+                    discrete_targets = discrete_action_targets,
+                    continuous_targets = continuous_action_targets,
+                    soft_validate_range = True
+                )
 
             if is_var_len:
                 action_loss_mask = loss_mask_without_last if pred_len == (time - 1) else loss_mask
@@ -9617,6 +9763,15 @@ class DynamicsWorldModel(Module):
 
         paper_dynamics_loss = None
 
+        unnormalized_losses = (
+            agent_embed_reward_loss,
+            latent_state_reward_loss,
+            agent_embed_terminal_loss,
+            latent_state_terminal_loss,
+            discrete_action_loss,
+            continuous_action_loss,
+        )
+
         if self.use_paper_aligned_shortcut_objective:
             paper_dynamics_loss = raw_dynamics_loss
 
@@ -9625,6 +9780,14 @@ class DynamicsWorldModel(Module):
                     paper_dynamics_loss,
                     update_ema = update_loss_ema,
                 )
+        elif exists(self.dynamics_loss_normalizer):
+            # the same rms divides both terms, then the ema reads their sum
+
+            dynamics_rms = self.dynamics_loss_normalizer.exp_avg_sq.sqrt().clamp(min = self.dynamics_loss_normalizer.eps)
+            self.dynamics_loss_normalizer(raw_dynamics_loss, update_ema = update_loss_ema)
+
+            flow_loss = flow_loss / dynamics_rms
+            shortcut_flow_loss = shortcut_flow_loss / dynamics_rms
         else:
             if exists(self.flow_loss_normalizer):
                 flow_loss = self.flow_loss_normalizer(flow_loss, update_ema = update_loss_ema)
@@ -9650,6 +9813,23 @@ class DynamicsWorldModel(Module):
 
         if should_compute_action_loss and exists(continuous_actions) and exists(self.continuous_actions_loss_normalizer):
             continuous_action_loss = self.continuous_actions_loss_normalizer(continuous_action_loss, update_ema = update_loss_ema)
+
+        if self.use_loss_normalization and not self.apply_loss_normalization:
+            # plain loss sum - the rms statistics above still updated
+
+            flow_loss, shortcut_flow_loss = raw_flow_loss, raw_shortcut_flow_loss
+
+            if exists(paper_dynamics_loss):
+                paper_dynamics_loss = raw_dynamics_loss
+
+            (
+                agent_embed_reward_loss,
+                latent_state_reward_loss,
+                agent_embed_terminal_loss,
+                latent_state_terminal_loss,
+                discrete_action_loss,
+                continuous_action_loss,
+            ) = unnormalized_losses
 
         # latent autoregressive loss with sigreg
 

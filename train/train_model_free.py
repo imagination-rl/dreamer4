@@ -1501,7 +1501,7 @@ def run_cleanrl_updated_ppo(*, config: Mapping[str, Any]):
     env_name = config["env_name"]
     seed = config["seed"]
     num_loops = config["num_loops"]
-    num_envs = config["num_envs"]
+    num_envs = config["total_envs"]
     num_steps = config["max_timesteps"]
     device = torch.device("cpu" if config["cpu"] or not torch.cuda.is_available() else "cuda")
 
@@ -1810,7 +1810,7 @@ def run_cleanrl_pmpo(*, config: Mapping[str, Any]):
     env_name = config["env_name"]
     seed = config["seed"]
     num_loops = config["num_loops"]
-    num_envs = config["num_envs"]
+    num_envs = config["total_envs"]
     num_steps = config["max_timesteps"]
     device = torch.device("cpu" if config["cpu"] or not torch.cuda.is_available() else "cuda")
 
@@ -2057,7 +2057,7 @@ def run(**config):
     env_name = config["env_name"]
     num_loops = config["num_loops"]
     rollouts_per_loop = config["rollouts_per_loop"]
-    num_envs = config["num_envs"]
+    num_envs = config["total_envs"]
     max_timesteps = config["max_timesteps"]
     seed = config["seed"]
     cpu = config["cpu"]

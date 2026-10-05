@@ -351,7 +351,7 @@ def _apply_pinned_settings(
 
     # Keep compiled batch shapes stable while retaining the configured number
     # of vectorized environments and full training-loop counts.
-    max_static_batch = max(int(benchmark_kwargs["num_envs"]), 1)
+    max_static_batch = max(int(benchmark_kwargs["total_envs"]), 1)
     benchmark_kwargs["world_model_batch_size"] = min(
         int(benchmark_kwargs["world_model_batch_size"]),
         max_static_batch,
