@@ -297,6 +297,7 @@ def install_fake_main_runtime(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(
             timings = [],
             interact_forward = None,
+            interact_policy_step = None,
             world_model_loss = None,
             world_model_loss_timing = None,
             world_model_step_timing = None,

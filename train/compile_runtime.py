@@ -210,6 +210,59 @@ class EagerWithoutTimeCacheCallable:
         return self.fn(*args, **kwargs)
 
 
+class GraphedRolloutPolicyStep:
+    """One CUDA graph of DynamicsWorldModel.rollout_policy_step: value, policy, action sample, and log probs.
+
+    The eager heads launch many small kernels for each env step of a rollout; the graph replays them with one launch.
+    The random numbers come from the Philox state of the default CUDA generator, and a replay advances that state as
+    the eager kernels do, so a replay gives the eager values (report/10-5-26-cpu-perf: bitwise equal rollouts of the
+    entry-163 model). The capture runs without the torch.distributions checks (they copy flags to the host, which a
+    capture does not allow). The graph reads the parameters in place, so the updates of the optimizer reach it. Each new
+    input shape or world_model.training state records its own graph.
+    """
+
+    def __init__(self, world_model: DynamicsWorldModel):
+        self.world_model = world_model
+        self.graphs = {}
+
+    def capture(self, one_policy_input: Tensor, value_embed: Tensor):
+        static_inputs = (one_policy_input.clone(), value_embed.clone())
+        rng_state = torch.cuda.get_rng_state()
+        validate_args = torch.distributions.Distribution._validate_args
+        torch.distributions.Distribution.set_default_validate_args(False)
+
+        try:
+            # A capture needs warm calls on a side stream first (cuBLAS workspaces, lazy inits).
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    self.world_model.rollout_policy_step(*static_inputs)
+            torch.cuda.current_stream().wait_stream(stream)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_outputs = self.world_model.rollout_policy_step(*static_inputs)
+        finally:
+            torch.distributions.Distribution.set_default_validate_args(validate_args)
+            # The warm calls drew random numbers; the first replay starts at the state of the eager call.
+            torch.cuda.set_rng_state(rng_state)
+
+        return graph, static_inputs, static_outputs
+
+    def __call__(self, one_policy_input: Tensor, value_embed: Tensor):
+        key = (one_policy_input.shape, value_embed.shape, one_policy_input.dtype, value_embed.dtype, self.world_model.training)
+        if key not in self.graphs:
+            self.graphs[key] = self.capture(one_policy_input, value_embed)
+
+        graph, static_inputs, static_outputs = self.graphs[key]
+        static_inputs[0].copy_(one_policy_input)
+        static_inputs[1].copy_(value_embed)
+        graph.replay()
+        # The next replay writes over the static outputs, so the rollout gets copies.
+        return tuple(output.clone() if exists(output) else None for output in static_outputs)
+
+
 class InteractWithEnvForward(nn.Module):
     def __init__(self, world_model: DynamicsWorldModel):
         super().__init__()
@@ -473,6 +526,8 @@ class CompileRuntime:
     world_model_step_timing: CallTiming | None
     imagination_step_timing: CallTiming | None
     timings: list[CallTiming]
+    # None: interact_with_env runs DynamicsWorldModel.rollout_policy_step eagerly.
+    interact_policy_step: Callable | None = None
 
 
 def synchronize_if_cuda(device: torch.device):
@@ -618,6 +673,7 @@ def build_compile_runtime(
     full_transformer_finetuning: bool = False,
     clamp_generated_latents: bool = True,
     eager_generate_without_time_cache: bool = False,
+    rollout_policy_cudagraph: bool = False,
 ) -> CompileRuntime:
     timings = []
 
@@ -776,6 +832,11 @@ def build_compile_runtime(
         world_model_step_timing = world_model_step_timing,
         imagination_step_timing = imagination_step_timing,
         timings = timings,
+        interact_policy_step = (
+            GraphedRolloutPolicyStep(world_model)
+            if rollout_policy_cudagraph and device.type == "cuda"
+            else None
+        ),
     )
 
 

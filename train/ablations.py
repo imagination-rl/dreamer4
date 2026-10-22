@@ -1170,6 +1170,327 @@ def grouped_normalization_rw4_depth5_pretrain_queue_ablations():
     return entries
 
 
+# The opt-in model flags of 2026-10-09 on entries 175-177 (symexp + own-runs pretraining + flipwm25). One change in each
+# entry; the flag applies in the pretrain and the rl stage, so each seed trains its own pretrain.
+#   kvlb1000   the KV cache of the dynamics transformer keeps the last 1000 steps. An env rollout reaches 1001 steps
+#              (1000 + the bootstrap step), so only the bootstrap step of each episode loses step 0. Imagination (40
+#              steps) does not change.
+#   smallterm  the terminal ensemble members have width model_dim and one hidden layer (4.75 M -> 0.27 M parameters;
+#              the world model 8.6 M -> 3.6 M).
+OWN_RUNS_FLIP_PRETRAIN_PARTS = (COMBINATION_PRETRAIN_PART, "ownrunspre", "flipwm25")
+MODEL_FLAG_SWEEPS = [
+    ("kvlb1000", "the KV cache keeps the last 1000 time steps", {"limit_kv_cache_lookback": True, "kv_cache_lookback": 1000}),
+    ("smallterm", "terminal ensemble members of width model_dim (dim -> dim -> dim -> 1)", {"small_terminal_head": True}),
+]
+
+
+def grouped_normalization_own_runs_flip_pretrain_model_flag_queue_ablations():
+    """Entries 181-186: MODEL_FLAG_SWEEPS on entries 175-177, seeds 4, 42 and 1, 175 online loops."""
+
+    entries = []
+    for name, change, overrides in MODEL_FLAG_SWEEPS:
+        for entry in grouped_normalization_own_runs_flip_pretrain_queue_ablations():
+            seed = entry["seed"]
+            entries.append({
+                **entry,
+                "run_name": combination_run_name((*OWN_RUNS_FLIP_PRETRAIN_PARTS, name), seed),
+                "run_details": f"prev=[{entry['run_name']}], change=[pretrain and rl stage: {change}]",
+                "offline_pretrain_name": f"a2_grouped_symexp_own_runs_flipwm25_{name}_s{seed}",
+                **overrides,
+            })
+    return entries
+
+
+# Agent-token readout and the RL policy loss in the world-model step (report/10-10-26-rl-gradient-agent-token) on
+# entries 190-192 (175-177 + kvlb200smallterm). All four arms set policy_all_tokens false (the policy reads the agent
+# token only). policy_all_tokens is a key of the pretrain signature, so each seed trains its own pretrain, as in entries
+# 181-192.
+#   agenttok       the agent-token readout alone (the control)
+#   agenttokrl001  + rl_policy_loss_in_world_model_updates, RL trunk gradient norm = 0.01 x world-model gradient norm
+#                  (the share that the reward MTP loss on the agent token gets now)
+#   agenttokrl01   + the same with 0.1
+#   agenttokrl03   + the same with 0.3
+AGENT_TOKEN_RL_SWEEPS = [
+    ("agenttok", "policy reads the agent token only", {"policy_all_tokens": False}),
+    *[
+        (
+            f"agenttokrl{label}",
+            f"policy reads the agent token only; RL policy loss in the world-model step, trunk grad ratio {ratio}",
+            {"policy_all_tokens": False, "rl_policy_loss_in_world_model_updates": True, "rl_policy_loss_trunk_grad_ratio": ratio},
+        )
+        for label, ratio in (("001", 0.01), ("01", 0.1), ("03", 0.3))
+    ],
+]
+
+
+def grouped_normalization_own_runs_flip_pretrain_agent_token_rl_queue_ablations():
+    """Entries 193-204: AGENT_TOKEN_RL_SWEEPS on entries 190-192 (kvlb200smallterm), seeds 4, 42 and 1, 175 online loops."""
+
+    entries = []
+    for name, change, overrides in AGENT_TOKEN_RL_SWEEPS:
+        for entry in grouped_normalization_own_runs_flip_pretrain_kv_lookback_200_queue_ablations():
+            if not entry.get("small_terminal_head"):  # keep the kvlb200smallterm entries (190-192)
+                continue
+            seed = entry["seed"]
+            entries.append({
+                **entry,
+                "run_name": combination_run_name((*OWN_RUNS_FLIP_PRETRAIN_PARTS, "kvlb200smallterm", name), seed),
+                "run_details": f"prev=[{entry['run_name']}], change=[{change}]",
+                "offline_pretrain_name": f"a2_grouped_symexp_own_runs_flipwm25_kvlb200smallterm_{name}_s{seed}",
+                **overrides,
+            })
+    return entries
+
+
+# The joint step (fixed_full_transformer_finetuning) with the agent-token readout on entries 193-195 (agenttok). Each
+# joint step sums the world-model loss on replay and the closer-PPO loss (policy + 0.5 value, one pass over one new
+# batch of 512 dreams) and updates the transformer and the heads with one optimizer. It replaces the 13 world-model
+# steps and the 3 PPO steps of each loop. The RL gradient reaches the transformer only through the agent token (other
+# tokens cannot attend to it). All arms load the pretrain of entries 193-195 of the same seed (offline_stages [rl]),
+# so the seeds of the arms are paired with each other and with entries 193-195.
+#   agenttokshared  the two-phase agent-token readout (entries 193-195) on the shared pretrain (the control)
+#   jointrl<r>      the joint step, RL transformer gradient norm = r x world-model gradient norm
+#                   (fixed_full_transformer_finetuning_trunk_grad_ratio; the rule of rl_policy_loss_trunk_grad_ratio)
+#   jointrl01hlr    jointrl01 with the head learning rate x10 (3e-3): the heads get 10 updates for each loop, not 960
+JOINT_AGENT_TOKEN = {
+    "fixed_full_transformer_finetuning": True,
+    "fixed_full_transformer_finetuning_steps": 10,
+    # Two runs share the 16 GB GPU (as rl_policy_loss_dream_micro_batch_size in entries 196-204).
+    "fixed_full_transformer_finetuning_dream_micro_batch_size": 64,
+}
+JOINT_AGENT_TOKEN_SWEEPS = [
+    ("agenttokshared", "two-phase agent-token readout (entries 193-195) on the shared pretrain", {}),
+    *[
+        (
+            f"jointrl{label}",
+            f"joint step, RL transformer gradient ratio {ratio}",
+            {**JOINT_AGENT_TOKEN, "fixed_full_transformer_finetuning_trunk_grad_ratio": ratio},
+        )
+        for label, ratio in (("001", 0.01), ("01", 0.1), ("04", 0.4), ("1", 1.0))
+    ],
+    (
+        "jointrl01hlr",
+        "joint step, RL transformer gradient ratio 0.1, head learning rate 3e-3",
+        {**JOINT_AGENT_TOKEN, "fixed_full_transformer_finetuning_trunk_grad_ratio": 0.1, "agent_learning_rate": 3e-3},
+    ),
+]
+
+
+def grouped_normalization_own_runs_flip_pretrain_joint_agent_token_queue_ablations():
+    """Entries 205-222: JOINT_AGENT_TOKEN_SWEEPS on entries 193-195 (agenttok), seeds 4, 42 and 1, 175 online loops."""
+
+    entries = []
+    for name, change, overrides in JOINT_AGENT_TOKEN_SWEEPS:
+        for entry in grouped_normalization_own_runs_flip_pretrain_agent_token_rl_queue_ablations():
+            if entry["run_name"] != combination_run_name((*OWN_RUNS_FLIP_PRETRAIN_PARTS, "kvlb200smallterm", "agenttok"), entry["seed"]):
+                continue
+            seed = entry["seed"]
+            pretrain_name = entry.pop("offline_pretrain_name")
+            entries.append({
+                **entry,
+                "run_name": combination_run_name((*OWN_RUNS_FLIP_PRETRAIN_PARTS, "kvlb200smallterm", name), seed),
+                "run_details": f"prev=[{entry['run_name']}], change=[pretrain of {entry['run_name']}; {change}]",
+                "offline_stages": ["rl"],
+                "offline_pretrained_checkpoint": f"runs/offline_pretrain/{pretrain_name}/pretrained.pt",
+                **overrides,
+            })
+    return entries
+
+
+# Fixes of the joint step (report/10-17-26-joint-step-fix) on the pretrains of entries 193-195, seeds paired with entries
+# 205-222. The joint runs 208-222 failed in the heads: one optimizer step for each new dream batch (importance ratio 1,
+# so the PPO clip never acts) moved the policy entropy about 0.25 nats in each step, and the value head got 10
+# updates for each loop (960 in the two-phase loop).
+#   jointrl0       the joint step of 208-219 with trunk grad ratio 0 (the heads only): the control that the 10-16
+#                  report lacks
+#   jointppo0      the fixed joint step, heads only: 12 joint steps for each loop, one batch of 512 dreams for each 4
+#                  steps (4 minibatches of 128 dreams, so the clip acts), target KL stop, value head lr x10
+#   jointppo001    jointppo0 + the RL policy gradient in the transformer, ratio 0.01
+#   jointppo01     jointppo0 + the RL policy gradient in the transformer, ratio 0.1
+#   slotshared001  the RL policy loss in the world-model step (entries 196-198, ratio 0.01) on the shared pretrain:
+#                  the heads train in the two-phase PPO phase
+JOINT_PPO = {
+    **JOINT_AGENT_TOKEN,
+    "fixed_full_transformer_finetuning_steps": 12,
+    "fixed_full_transformer_finetuning_dream_minibatches": 4,
+    "fixed_full_transformer_finetuning_target_kl": 0.03,
+    "fixed_full_transformer_finetuning_value_lr_scale": 10.,
+}
+JOINT_FIX_SWEEPS = [
+    (
+        "jointrl0",
+        "joint step, trunk grad ratio 0 (heads only)",
+        {**JOINT_AGENT_TOKEN, "fixed_full_transformer_finetuning_trunk_grad_ratio": 0.},
+    ),
+    (
+        "jointppo0",
+        "joint step with dream reuse (12 steps, 4 minibatches), target KL 0.03, value lr x10, trunk grad ratio 0",
+        {**JOINT_PPO, "fixed_full_transformer_finetuning_trunk_grad_ratio": 0.},
+    ),
+    (
+        "jointppo001",
+        "joint step with dream reuse (12 steps, 4 minibatches), target KL 0.03, value lr x10, trunk grad ratio 0.01",
+        {**JOINT_PPO, "fixed_full_transformer_finetuning_trunk_grad_ratio": 0.01},
+    ),
+    (
+        "jointppo01",
+        "joint step with dream reuse (12 steps, 4 minibatches), target KL 0.03, value lr x10, trunk grad ratio 0.1",
+        {**JOINT_PPO, "fixed_full_transformer_finetuning_trunk_grad_ratio": 0.1},
+    ),
+    (
+        "slotshared001",
+        "RL policy loss in the world-model step, ratio 0.01 (entries 196-198)",
+        {"rl_policy_loss_in_world_model_updates": True, "rl_policy_loss_trunk_grad_ratio": 0.01},
+    ),
+]
+
+
+def grouped_normalization_own_runs_flip_pretrain_joint_fix_queue_ablations():
+    """Entries 223-237: JOINT_FIX_SWEEPS on the pretrains of entries 193-195, seeds 4, 42 and 1, 175 online loops."""
+
+    entries = []
+    for name, change, overrides in JOINT_FIX_SWEEPS:
+        for entry in grouped_normalization_own_runs_flip_pretrain_joint_agent_token_queue_ablations():
+            if entry["run_name"] != combination_run_name((*OWN_RUNS_FLIP_PRETRAIN_PARTS, "kvlb200smallterm", "agenttokshared"), entry["seed"]):
+                continue
+            seed = entry["seed"]
+            entries.append({
+                **entry,
+                "run_name": combination_run_name((*OWN_RUNS_FLIP_PRETRAIN_PARTS, "kvlb200smallterm", name), seed),
+                "run_details": f"prev=[{entry['run_name']}], change=[{change}]",
+                **overrides,
+            })
+    return entries
+
+
+# Head re-anchor (report/10-17-26-head-reanchor-eval) on the arms of entries 205-237, the pretrains of entries 193-195,
+# seeds paired with them. A world-model update moves the head inputs, so the acting policy changes without a head
+# update (0.71 nats for each world-model phase in agenttokshared, 1.75 in slotshared001, at loop 175).
+#   jointppo0ra        jointppo0 + the per-step head re-anchor (fixed_full_transformer_finetuning_reanchor_steps):
+#                      after each joint step, the heads fit the updated heads on the inputs before the step
+#   jointppo001ra      jointppo001 + the per-step head re-anchor (it also removes the policy change of the RL
+#                      transformer gradient on the dreams of the batch; the gradient still shapes the transformer)
+#   agenttokra         agenttokshared + the head re-anchor after each world-model phase (reports/9-28-26 D1)
+#   slotshared001ra    slotshared001 + the head re-anchor after each world-model phase
+# 50 Adam steps at lr 1e-3 on the 512 dreams of the batch: on the trained jointppo0 s4 model the drift of one joint step
+# (0.04-1.8 nats) falls to 0.004-0.018, in 0.62 s (200 steps at lr 3e-4: 0.001-0.012, in 2.1 s).
+JOINT_REANCHOR_STEPS = 50
+JOINT_REANCHOR_LEARNING_RATE = 1e-3
+REANCHOR_SWEEPS = [
+    (
+        "jointppo0ra",
+        f"jointppo0 + head re-anchor after each joint step ({JOINT_REANCHOR_STEPS} Adam steps, lr {JOINT_REANCHOR_LEARNING_RATE:g})",
+        {**JOINT_PPO, "fixed_full_transformer_finetuning_trunk_grad_ratio": 0., "fixed_full_transformer_finetuning_reanchor_steps": JOINT_REANCHOR_STEPS,
+         "fixed_full_transformer_finetuning_reanchor_learning_rate": JOINT_REANCHOR_LEARNING_RATE},
+    ),
+    (
+        "jointppo001ra",
+        f"jointppo001 + head re-anchor after each joint step ({JOINT_REANCHOR_STEPS} Adam steps, lr {JOINT_REANCHOR_LEARNING_RATE:g})",
+        {**JOINT_PPO, "fixed_full_transformer_finetuning_trunk_grad_ratio": 0.01, "fixed_full_transformer_finetuning_reanchor_steps": JOINT_REANCHOR_STEPS,
+         "fixed_full_transformer_finetuning_reanchor_learning_rate": JOINT_REANCHOR_LEARNING_RATE},
+    ),
+    (
+        "agenttokra",
+        "two-phase agent-token readout + head re-anchor after each world-model phase",
+        {"reanchor_heads_after_world_model_updates": True},
+    ),
+    (
+        "slotshared001ra",
+        "RL policy loss in the world-model step, ratio 0.01 + head re-anchor after each world-model phase",
+        {"rl_policy_loss_in_world_model_updates": True, "rl_policy_loss_trunk_grad_ratio": 0.01, "reanchor_heads_after_world_model_updates": True},
+    ),
+]
+
+
+def grouped_normalization_own_runs_flip_pretrain_reanchor_queue_ablations():
+    """Entries 238-249: REANCHOR_SWEEPS on the pretrains of entries 193-195, seeds 4, 42 and 1, 175 online loops."""
+
+    entries = []
+    for name, change, overrides in REANCHOR_SWEEPS:
+        for entry in grouped_normalization_own_runs_flip_pretrain_joint_agent_token_queue_ablations():
+            if entry["run_name"] != combination_run_name((*OWN_RUNS_FLIP_PRETRAIN_PARTS, "kvlb200smallterm", "agenttokshared"), entry["seed"]):
+                continue
+            seed = entry["seed"]
+            entries.append({
+                **entry,
+                "run_name": combination_run_name((*OWN_RUNS_FLIP_PRETRAIN_PARTS, "kvlb200smallterm", name), seed),
+                "run_details": f"prev=[{entry['run_name']}], change=[{change}]",
+                **overrides,
+            })
+    return entries
+
+
+# The tokenizer fix (report/10-20-26-tokenizer-ablations) on the two best arms of this family: kvlb200smallterm
+# (entries 190-191; the policy reads all tokens) and agenttokrl001 (entries 196-197; the policy reads the agent token
+# only), seeds 4 and 42. The tokenizer trains for 20,000 steps (not 2,000) with a cosine decay of the learning rate, on
+# the balanced data mix (random, past runs, scaled expert, noisy expert, expert, recent policy) in place of the
+# own-runs episodes. The world model still pretrains on the own-runs data. Each run trains its own pretrain.
+TOKENIZER_FIX = {
+    "tokenizer_cosine_lr_schedule": True,
+    "pretrain_tokenizer_steps": 20000,
+    "offline_tokenizer_observations": "runs/offline_data/HalfCheetah-v4/tokenizer_mix_balanced_5p7m/observations.npy",
+}
+TOKENIZER_FIX_SEEDS = (4, 42)
+
+
+def grouped_normalization_own_runs_flip_pretrain_tokenizer_fix_queue_ablations():
+    """Entries 250-253: TOKENIZER_FIX on kvlb200smallterm (190-191) and agenttokrl001 (196-197), seeds 4 and 42."""
+
+    kvlb200smallterm = combination_run_name((*OWN_RUNS_FLIP_PRETRAIN_PARTS, "kvlb200smallterm"), 0).rsplit("_s", 1)[0]
+    bases = [
+        entry for entry in grouped_normalization_own_runs_flip_pretrain_kv_lookback_200_queue_ablations()
+        if entry.get("small_terminal_head") and entry["seed"] in TOKENIZER_FIX_SEEDS
+    ] + [
+        entry for entry in grouped_normalization_own_runs_flip_pretrain_agent_token_rl_queue_ablations()
+        if entry["run_name"].startswith(f"{kvlb200smallterm}_agenttokrl001_") and entry["seed"] in TOKENIZER_FIX_SEEDS
+    ]
+    entries = []
+    for entry in bases:
+        seed = entry["seed"]
+        entries.append({
+            **entry,
+            "run_name": entry["run_name"].removesuffix(f"_s{seed}") + f"_tokfix_s{seed}",
+            "run_details": (
+                f"prev=[{entry['run_name']}], change=[tokenizer: 20,000 steps with cosine decay on the balanced data mix "
+                f"(tokenizer_mix_balanced_5p7m)]"
+            ),
+            "offline_pretrain_name": entry["offline_pretrain_name"].removesuffix(f"_s{seed}") + f"_tokfix_s{seed}",
+            **TOKENIZER_FIX,
+        })
+    return entries
+
+
+# KV cache lookback 200 on entries 175-177, alone and with the small terminal head. The flags apply in the pretrain and
+# the rl stage, so each seed trains its own pretrain, as in entries 181-186.
+#   kvlb200            the KV cache keeps the last 200 time steps (kvlb1000 keeps 1000)
+#   kvlb200smallterm   kvlb200 + small_terminal_head
+KV_LOOKBACK_200_SWEEPS = [
+    ("kvlb200", "the KV cache keeps the last 200 time steps", {"limit_kv_cache_lookback": True, "kv_cache_lookback": 200}),
+    (
+        "kvlb200smallterm",
+        "the KV cache keeps the last 200 time steps; terminal ensemble members of width model_dim",
+        {"limit_kv_cache_lookback": True, "kv_cache_lookback": 200, "small_terminal_head": True},
+    ),
+]
+
+
+def grouped_normalization_own_runs_flip_pretrain_kv_lookback_200_queue_ablations():
+    """Entries 187-192: KV_LOOKBACK_200_SWEEPS on entries 175-177, seeds 4, 42 and 1, 175 online loops."""
+
+    entries = []
+    for name, change, overrides in KV_LOOKBACK_200_SWEEPS:
+        for entry in grouped_normalization_own_runs_flip_pretrain_queue_ablations():
+            seed = entry["seed"]
+            entries.append({
+                **entry,
+                "run_name": combination_run_name((*OWN_RUNS_FLIP_PRETRAIN_PARTS, name), seed),
+                "run_details": f"prev=[{entry['run_name']}], change=[pretrain and rl stage: {change}]",
+                "offline_pretrain_name": f"a2_grouped_symexp_own_runs_flipwm25_{name}_s{seed}",
+                **overrides,
+            })
+    return entries
+
+
 # Full-transformer finetuning with the settings of the A2 runs (closer CleanRL PPO, not PMPO). Each of the 10 steps of a
 # loop sums the world-model loss on replay windows and the closer PPO loss on one new batch of 512 dreams (one pass,
 # value loss weight 0.5, no policy prior). The A2 runs do 960 PPO minibatch updates of the heads for each loop.
@@ -1478,6 +1799,27 @@ ABLATIONS = [
     *grouped_normalization_own_runs_flip_pretrain_queue_ablations(),
     # 178-180: 163-165 with rw4 + depth5 in the pretrain and the rl stage (seeds 4, 42, 1, 175 loops).
     *grouped_normalization_rw4_depth5_pretrain_queue_ablations(),
+    # 181-183 kvlb1000, 184-186 smallterm: the opt-in model flags on 175-177 (seeds 4, 42, 1, 175 loops).
+    *grouped_normalization_own_runs_flip_pretrain_model_flag_queue_ablations(),
+    # 187-189 kvlb200, 190-192 kvlb200smallterm: KV cache lookback 200 alone and with the small terminal head on 175-177
+    # (seeds 4, 42, 1, 175 loops).
+    *grouped_normalization_own_runs_flip_pretrain_kv_lookback_200_queue_ablations(),
+    # 193-195 agenttok, 196-198 agenttokrl001, 199-201 agenttokrl01, 202-204 agenttokrl03: agent-token readout and the
+    # RL policy loss in the world-model step on 190-192, kvlb200smallterm (seeds 4, 42, 1, 175 loops). They were entries
+    # 187-198 (on 175-177) until 2026-10-12; no run of them finished.
+    *grouped_normalization_own_runs_flip_pretrain_agent_token_rl_queue_ablations(),
+    # 205-207 agenttokshared, 208-210 jointrl001, 211-213 jointrl01, 214-216 jointrl04, 217-219 jointrl1, 220-222
+    # jointrl01hlr: the joint step with the agent-token readout, on the pretrains of 193-195 (seeds 4, 42, 1, 175 loops).
+    *grouped_normalization_own_runs_flip_pretrain_joint_agent_token_queue_ablations(),
+    # 223-225 jointrl0, 226-228 jointppo0, 229-231 jointppo001, 232-234 jointppo01, 235-237 slotshared001: fixes of the
+    # joint step and the slot design on the pretrains of 193-195 (seeds 4, 42, 1, 175 loops).
+    *grouped_normalization_own_runs_flip_pretrain_joint_fix_queue_ablations(),
+    # 238-240 jointppo0ra, 241-243 jointppo001ra, 244-246 agenttokra, 247-249 slotshared001ra: the head re-anchor on
+    # the joint step, the two-phase control and the slot, on the pretrains of 193-195 (seeds 4, 42, 1, 175 loops).
+    *grouped_normalization_own_runs_flip_pretrain_reanchor_queue_ablations(),
+    # 250-251 kvlb200smallterm_tokfix (seeds 4, 42), 252-253 agenttokrl001_tokfix (seeds 4, 42): the tokenizer fix
+    # (20,000 steps, cosine decay, balanced data mix); each run trains its own pretrain.
+    *grouped_normalization_own_runs_flip_pretrain_tokenizer_fix_queue_ablations(),
 ]
 
 # Slurm CLI runs require -N and override this programmatic default.

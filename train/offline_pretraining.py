@@ -141,6 +141,7 @@ PRETRAIN_SIGNATURE_KEYS = (
 # so pretrained checkpoints saved before the key existed still agree with default configs.
 OPTIONAL_PRETRAIN_SIGNATURE_KEYS = (
     "terminal_head_mlp_dim",
+    "offline_tokenizer_observations",
 )
 
 # World-model state that only the agent uses. These keys are not part of a
@@ -1785,8 +1786,13 @@ def prepare_offline_tokenizer(
     train_tokenizer_fn: Callable[[nn.Module, Tensor], float | None],
     writer,
     device: torch.device,
+    observations_path: str | Path | None = None,
 ) -> float | None:
-    """Train the tokenizer on the offline training episodes, or load it on a pretrain restart."""
+    """Train the tokenizer on the offline training episodes, or load it on a pretrain restart.
+
+    With observations_path, the tokenizer trains on the observations of that .npy file (shape (frames, obs_dim)) in
+    place of the training episodes, for example a data mix with more speeds than the world-model data. The world model
+    still pretrains on the dataset."""
 
     path = pretrain_dir / TOKENIZER_FILE
 
@@ -1802,8 +1808,16 @@ def prepare_offline_tokenizer(
         return None
 
     write_split(pretrain_dir, split, dataset)
-    observations = torch.from_numpy(dataset.observations(split.train))
-    print(f"offline tokenizer data: {len(observations)} observations from {len(split.train)} episodes")
+
+    if exists(observations_path):
+        observations = torch.from_numpy(np.asarray(np.load(observations_path), dtype = np.float32))
+        obs_dim = dataset.obs.shape[-1]
+        if observations.ndim != 2 or observations.shape[-1] != obs_dim:
+            raise ValueError(f"{observations_path} holds shape {tuple(observations.shape)}, expected (frames, {obs_dim})")
+        print(f"offline tokenizer data: {len(observations)} observations from {observations_path}")
+    else:
+        observations = torch.from_numpy(dataset.observations(split.train))
+        print(f"offline tokenizer data: {len(observations)} observations from {len(split.train)} episodes")
 
     loss = train_tokenizer_fn(tokenizer, observations)
     del observations

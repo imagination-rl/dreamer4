@@ -542,6 +542,31 @@ def test_pretrain_signature_rejects_a_different_reward_target():
         )
 
 
+def test_offline_tokenizer_trains_on_the_observations_file(tmp_path, monkeypatch):
+    episodes = np.random.randn(4, 3, 17).astype(np.float32)
+    dataset = SimpleNamespace(obs = episodes, fingerprint = "fake", observations = lambda index: episodes[index].reshape(-1, 17))
+    split = offline.OfflineSplit(train = np.array([0, 1]), validation = np.array([2, 3]))
+    monkeypatch.setattr(offline, "write_split", lambda *args: None)
+    monkeypatch.setattr(offline, "tokenizer_recon_by_mode", lambda *args: {})
+
+    seen = []
+    kwargs = dict(dataset = dataset, split = split, signature = {}, writer = None, device = torch.device("cpu"),
+                  train_tokenizer_fn = lambda tokenizer, observations: seen.append(observations.clone()))
+
+    # Without a file, the tokenizer trains on the training episodes.
+    offline.prepare_offline_tokenizer(tiny_tokenizer(), pretrain_dir = tmp_path / "a", **kwargs)
+    assert torch.equal(seen[-1], torch.from_numpy(episodes[:2].reshape(-1, 17)))
+
+    mix = np.random.randn(10, 17).astype(np.float32)
+    np.save(tmp_path / "mix.npy", mix)
+    offline.prepare_offline_tokenizer(tiny_tokenizer(), pretrain_dir = tmp_path / "b", observations_path = tmp_path / "mix.npy", **kwargs)
+    assert torch.equal(seen[-1], torch.from_numpy(mix))
+
+    np.save(tmp_path / "bad.npy", mix[:, :5])
+    with pytest.raises(ValueError, match = "expected"):
+        offline.prepare_offline_tokenizer(tiny_tokenizer(), pretrain_dir = tmp_path / "c", observations_path = tmp_path / "bad.npy", **kwargs)
+
+
 def test_rehearsal_replaces_part_of_each_world_model_batch(tmp_path):
     assert offline.rehearsal_batch_sizes(128, 0.25) == (96, 32)
 
@@ -704,6 +729,19 @@ def test_main_runs_the_three_offline_stages_on_cpu(tmp_path, monkeypatch, capsys
     assert "world_model/loss" in pretrain_scalars and "extra/flow_loss_raw" in pretrain_scalars
     assert not any(tag.startswith("offline_pretrain/train/") for tag in pretrain_scalars)
     assert "offline_pretrain/val/world_model/loss" in pretrain_scalars
+
+    # A tokenizer data file replaces the training episodes for the tokenizer only.
+    np.save(tmp_path / "mix.npy", np.random.randn(64, 17).astype(np.float32))
+    capsys.readouterr()
+    train_gym.main(**dict(
+        config,
+        run_name = "tokenizer_mix",
+        offline_stages = ["pretrain"],
+        offline_pretrain_name = "tokenizer_mix",
+        offline_tokenizer_observations = str(tmp_path / "mix.npy"),
+        tokenizer_cosine_lr_schedule = True,
+    ))
+    assert f"offline tokenizer data: 64 observations from {tmp_path / 'mix.npy'}" in capsys.readouterr().out
 
     # A second run loads the checkpoint from disk and does not collect again.
     train_gym.main(**dict(

@@ -49,6 +49,31 @@ def test_old_observation_tokenizer_uses_plain_silu_mlp():
     assert any(isinstance(module, torch.nn.SiLU) for module in tokenizer.tokenizer.encoder)
 
 
+@pytest.mark.parametrize("cosine", [False, True])
+def test_train_tokenizer_cosine_lr_schedule(monkeypatch, cosine):
+    learning_rates = []
+
+    class RecordingAdamW(train_gym.AdamW):
+        def step(self, *args, **kwargs):
+            learning_rates.append(self.param_groups[0]["lr"])
+            return super().step(*args, **kwargs)
+
+    monkeypatch.setattr(train_gym, "AdamW", RecordingAdamW)
+    torch.manual_seed(0)
+    tokenizer = train_gym.ObservationTokenizer(obs_dim = 3, num_latent_tokens = 2, dim_latent = 4, hidden_dim = 8, depth = 1)
+
+    train_gym.train_tokenizer(tokenizer, torch.randn(64, 3), steps = 10, batch_size = 16, learning_rate = 1e-3,
+                              max_grad_norm = 1., device = torch.device("cpu"), writer = None, cosine_lr_schedule = cosine)
+
+    assert len(learning_rates) == 10
+    if cosine:
+        assert learning_rates[0] == pytest.approx(1e-3)
+        assert all(a > b for a, b in zip(learning_rates, learning_rates[1:]))
+        assert learning_rates[-1] < 0.03e-3
+    else:
+        assert learning_rates == [1e-3] * 10
+
+
 def test_resampling_dataloader_iterator_recreates_each_epoch():
     class ChangingLoader:
         def __init__(self):
@@ -549,6 +574,77 @@ def test_closer_ppo_logs_the_graphs_of_the_other_objectives(tmp_path):
         assert len(accumulator.Scalars(tag)) == 2, tag
 
 
+def test_closer_ppo_deferred_metrics_keeps_the_updates_and_the_logged_values(tmp_path):
+    from train.ablations import CLEANRL_PPO_CLOSER, NEXT_STATE_REWARD_TARGET
+
+    def run(name, **flags):
+        config = small_cpu_config(
+            tmp_path, **{**CLEANRL_PPO_CLOSER, **NEXT_STATE_REWARD_TARGET},
+            run_name = name, num_loops = 2, total_envs = 4, imagination_horizon = 9, checkpoint_every = 2, **flags,
+        )
+        train_gym.main(**config)
+        accumulator = EventAccumulator(str(tmp_path / "logs" / name)).Reload()
+        scalars = {
+            tag: [(event.step, event.value) for event in accumulator.Scalars(tag)]
+            for tag in accumulator.Tags()["scalars"]
+            if not tag.startswith("timings/")
+        }
+        checkpoint = torch.load(tmp_path / "logs" / name / "checkpoints" / "loop_2.pt", weights_only = True)
+        return scalars, checkpoint["world_model"]
+
+    scalars, weights = run("eager_metrics")
+    deferred_scalars, deferred_weights = run("deferred_metrics", cleanrl_ppo_closer_deferred_metrics = True)
+
+    assert "cleanrl_updated_ppo/clip_fraction" in scalars
+    assert deferred_scalars == scalars
+    assert all(torch.equal(weights[key], deferred_weights[key]) for key in weights)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA graphs need CUDA")
+def test_graphed_rollout_policy_step_gives_the_eager_values():
+    from train.compile_runtime import GraphedRolloutPolicyStep
+
+    model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 4,
+        max_steps = 8,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        num_discrete_actions = 0,
+        num_continuous_actions = 3,
+        continuous_dist_type = "beta",
+        continuous_target_action_range = (-1., 1.),
+        reward_encoder_kwargs = dict(num_bins = 5),
+        value_encoder_kwargs = dict(num_bins = 5),
+        policy_head_mlp_depth = 1,
+        value_head_mlp_depth = 1,
+    ).cuda().eval()
+    graphed = GraphedRolloutPolicyStep(model)
+    policy_input_dim = next(module for module in model.policy_head.modules() if isinstance(module, torch.nn.Linear)).in_features
+
+    generator = torch.Generator().manual_seed(0)
+    inputs = [
+        (torch.randn(8, 1, policy_input_dim, generator = generator).cuda(), torch.randn(8, 1, 16, generator = generator).cuda())
+        for _ in range(3)
+    ]
+
+    with torch.no_grad():
+        torch.manual_seed(1)
+        eager = [model.rollout_policy_step(*pair) for pair in inputs]
+        torch.manual_seed(1)
+        replayed = [graphed(*pair) for pair in inputs]
+
+    for eager_step, graphed_step in zip(eager, replayed):
+        for eager_value, graphed_value in zip(eager_step, graphed_step):
+            assert (eager_value is None) == (graphed_value is None)
+            if eager_value is not None:
+                assert torch.equal(eager_value, graphed_value)
+
+
 def test_behavior_cloning_in_world_model_updates_steps_the_policy_head_with_the_world_model_optimizer(tmp_path, capsys):
     from train.ablations import CLEANRL_PPO_CLOSER, NEXT_STATE_REWARD_TARGET
 
@@ -797,7 +893,7 @@ def test_head_reanchor_restores_the_heads_after_a_transformer_change():
     assert reanchor.fit() == {}
 
 
-def small_agent_world_model():
+def small_agent_world_model(policy_all_tokens = True):
     torch.manual_seed(0)
     world_model = DynamicsWorldModel(
         dim = 16,
@@ -815,7 +911,7 @@ def small_agent_world_model():
         value_encoder_kwargs = dict(num_bins = 5),
         policy_head_mlp_depth = 1,
         value_head_mlp_depth = 1,
-        policy_all_tokens = True,
+        policy_all_tokens = policy_all_tokens,
         old_reward_head = True,
         old_pmpo = True,
         pmpo_kl_div_loss_weight = 0.3,
@@ -915,6 +1011,303 @@ def test_fixed_full_transformer_finetuning_chunks_give_the_one_pass_gradient(obj
     assert metrics["imagination/prior_kl_mean"] > 1e-4
 
 
+def test_rl_policy_slot_gives_the_policy_gradient_of_the_transformer_only():
+    world_model = small_agent_world_model(policy_all_tokens = False)
+    optimizer = torch.optim.Adam(world_model.world_model_parameters())
+    generate = ImaginationGenerateRollout(
+        world_model, generate_steps = 2, store_old_action_unembeds = False, use_time_cache = True,
+        preallocate_outputs = False, clamp_generated_latents = False,
+    )
+    source = train_gym.JointImaginationLoss(
+        world_model, None, None, objective = "ppo", value_loss_weight = 0., generate_rollout_fn = generate,
+        batch_size = 5, horizon = 6, prompt_length = 0, static_generate_shape = False, loss_weight = 1.,
+        micro_batch_size = None, use_delight_gating = False, grad_diagnostics = False, autocast_bf16 = False,
+        global_step = 0, writer = None, training_profiler = None,
+    )
+
+    def slot(micro_batch_size, ratio = 0.1):
+        slot = train_gym.RLPolicySlot(
+            world_model, optimizer, trunk_grad_ratio = ratio, max_scale = 1e4, norm_ema_decay = 0.9,
+            micro_batch_size = micro_batch_size,
+        )
+        slot.set_dream_source(source)
+        return slot
+
+    torch.manual_seed(1)
+    full_dream, dream = source.generate()
+
+    # The gradient of the loss with the transformer in one graph.
+    params = slot(None).params
+    agent_embeds = train_gym.dream_policy_inputs(world_model, full_dream, 0)[0][:, :dream.rewards.shape[1]]
+    advantages = train_gym.closer_ppo_dream_targets(world_model, dream)["frozen_advantages"]
+    reference = torch.autograd.grad(slot(None).policy_loss(dream, agent_embeds, advantages), params, allow_unused = True)
+
+    world_model.zero_grad(set_to_none = True)
+    for micro_batch_size in (None, 2):
+        _, gradient = slot(micro_batch_size).rl_gradient(full_dream, dream, 0)
+        for ref, grad in zip(reference, gradient):
+            assert (ref is None) == (grad is None)
+            if ref is not None:
+                assert torch.allclose(ref, grad, rtol = 1e-4, atol = 1e-7)
+
+    # The gradient reaches the transformer and the agent token, and no head parameter (nor any .grad) gets one.
+    names = {param: name for name, param in world_model.named_parameters()}
+    reached = {names[param] for param, grad in zip(params, reference) if grad is not None and grad.abs().sum() > 0.}
+    assert any(name.startswith("transformer.") for name in reached)
+    assert "agent_learned_embed" in reached
+    assert not set(world_model.agent_parameters()) & set(params)
+    assert all(param.grad is None for param in world_model.parameters())
+
+    # A call adds the RL gradient, scaled to the ratio times the world-model gradient norm (first call: the EMAs are
+    # the norms of that call), to the gradient of the world-model step.
+    # prepare() leaves .grad unchanged (it runs before the world-model forward).
+    world_model_grads = {param: torch.randn_like(param) for param in params}
+    for param, grad in world_model_grads.items():
+        param.grad = grad.clone()
+    rl_slot = slot(None, ratio = 0.1)
+    rl_slot.prepare(0)
+    for param, grad in world_model_grads.items():
+        assert torch.equal(param.grad, grad)
+    metrics = rl_slot(0)
+    assert metrics["rl_slot/scaled_rl_grad_norm"] == pytest.approx(0.1 * metrics["rl_slot/world_model_grad_norm"], rel = 1e-5)
+    added = [param.grad - world_model_grads[param] for param in params]
+    assert torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(t) for t in added])).item() == pytest.approx(
+        metrics["rl_slot/scaled_rl_grad_norm"], rel = 1e-4)
+    assert all(param.grad is None for param in world_model.agent_parameters())
+
+
+def test_fixed_full_transformer_finetuning_trunk_grad_ratio_scales_only_the_transformer_gradient():
+    world_model = small_agent_world_model(policy_all_tokens = False)
+    generate = ImaginationGenerateRollout(
+        world_model, generate_steps = 2, store_old_action_unembeds = False, use_time_cache = True,
+        preallocate_outputs = False, clamp_generated_latents = False,
+    )
+
+    def gradients(trunk_gradient = None, micro_batch_size = None, value_loss_weight = .5):
+        world_model.zero_grad(set_to_none = True)
+        joint = train_gym.JointImaginationLoss(
+            world_model, None, None, objective = "ppo", value_loss_weight = value_loss_weight, generate_rollout_fn = generate,
+            batch_size = 5, horizon = 6, prompt_length = 0, static_generate_shape = False, loss_weight = 1.,
+            micro_batch_size = micro_batch_size, use_delight_gating = False, grad_diagnostics = False,
+            autocast_bf16 = False, global_step = 0, writer = None, training_profiler = None,
+            trunk_gradient = trunk_gradient,
+        )
+        torch.manual_seed(2)
+        loss = joint(0, None)
+        if loss.requires_grad:
+            loss.backward()
+        return {param: param.grad.clone() for param in world_model.parameters() if param.grad is not None}
+
+    reference = gradients()
+    # The transformer gradient of the policy loss alone.
+    policy_reference = gradients(value_loss_weight = 0.)
+    heads = set(world_model.agent_parameters())
+    assert any(param not in heads for param in reference) and any(param in heads for param in reference)
+    trunk = [param for param in reference if param not in heads]
+    assert any(not torch.allclose(reference[param], policy_reference[param]) for param in trunk)
+
+    for micro_batch_size in (None, 2):
+        ratio = train_gym.JointTrunkGradientRatio(world_model, trunk_grad_ratio = 0.3, max_scale = 1e4, norm_ema_decay = 0.9)
+        assert not heads & set(ratio.params)
+        split = gradients(ratio, micro_batch_size)
+
+        # The heads get the unscaled RL gradient (policy and value loss) in .grad. The transformer gradient of the
+        # policy loss alone goes to the buffer, not to .grad.
+        assert set(split) == {param for param in reference if param in heads}
+        for param, grad in split.items():
+            assert torch.allclose(grad, reference[param], rtol = 1e-4, atol = 1e-6)
+        for param, grad in zip(ratio.params, ratio.pending):
+            if param in policy_reference:
+                assert torch.allclose(grad, policy_reference[param], rtol = 1e-4, atol = 1e-6)
+            else:
+                assert grad is None or grad.abs().sum() == 0.
+
+        # After the world-model backward, the call adds the buffer, scaled to 0.3 x the world-model gradient norm.
+        world_model_grads = {param: torch.randn_like(param) for param in ratio.params}
+        for param, grad in world_model_grads.items():
+            param.grad = grad.clone()
+        metrics = ratio(0)
+        assert ratio.pending is None
+        assert metrics["joint/trunk_ratio_scaled_rl_grad_norm"] == pytest.approx(0.3 * metrics["joint/trunk_ratio_world_model_grad_norm"], rel = 1e-5)
+        for param in ratio.params:
+            if param in policy_reference:
+                expected = world_model_grads[param] + policy_reference[param] * metrics["joint/trunk_ratio_scale"]
+                assert torch.allclose(param.grad, expected, rtol = 1e-4, atol = 1e-6)
+        for param, grad in split.items():
+            assert torch.equal(param.grad, grad)
+
+
+def test_fixed_full_transformer_finetuning_dream_reuse_clips_and_stops_the_policy_update():
+    world_model = small_agent_world_model(policy_all_tokens = False)
+    generate = ImaginationGenerateRollout(
+        world_model, generate_steps = 2, store_old_action_unembeds = False, use_time_cache = True,
+        preallocate_outputs = False, clamp_generated_latents = False,
+    )
+    calls = []
+
+    def counted_generate(*args):
+        calls.append(1)
+        return generate(*args)
+
+    def joint_loss(**kwargs):
+        return train_gym.JointImaginationLoss(
+            world_model, None, None, objective = "ppo", value_loss_weight = .5, generate_rollout_fn = counted_generate,
+            batch_size = 6, horizon = 6, prompt_length = 0, static_generate_shape = False, loss_weight = 1.,
+            micro_batch_size = 2, use_delight_gating = False, grad_diagnostics = False, autocast_bf16 = False,
+            global_step = 0, writer = None, training_profiler = None, **kwargs,
+        )
+
+    policy_params = set(world_model.policy_head_parameters())
+    value_params = set(world_model.value_head_parameters())
+    trunk_params = [param for param in world_model.transformer.parameters() if param.requires_grad]
+
+    def step(joint, index):
+        world_model.zero_grad(set_to_none = True)
+        torch.manual_seed(10 + index)
+        loss = joint(index, None)
+        # One chunk (a minibatch of 2 dreams) keeps the graph for the backward of train_world_model.
+        if loss.requires_grad:
+            loss.backward()
+        return joint.last_metrics
+
+    # Three minibatches of 2 dreams: one dream batch for three steps, read in disjoint rows.
+    joint = joint_loss(dream_minibatches = 3)
+    seen_rows = []
+    for index in range(3):
+        _, _, targets = joint.reused_minibatch(index)
+        full_dream, dream, *_ = joint.reused
+        seen_rows.append(joint.reused[4][0][2 * index:2 * index + 2])
+    assert len(calls) == 1
+    assert sorted(torch.cat(seen_rows).tolist()) == list(range(6))
+    assert joint.reused_minibatch(3)[0] is not None and len(calls) == 2
+
+    # On the new batch the policy is the rollout policy (approx KL 0). A change of the policy head gives a ratio away
+    # from 1 on the next minibatch, so the clip acts there.
+    calls.clear()
+    joint = joint_loss(dream_minibatches = 3)
+    first = step(joint, 0)
+    assert first["joint/approx_kl"] < 1e-6 and first["joint/policy_update"] == 1.
+    assert any(param.grad is not None for param in policy_params)
+    with torch.no_grad():
+        for param in world_model.policy_head.parameters():
+            param.add_(torch.randn_like(param) * 0.5)
+    second = step(joint, 1)
+    assert second["joint/approx_kl"] > 1e-3 and second["joint/clip_fraction"] > 0.
+    assert len(calls) == 1
+
+    # target_kl: above the target, the policy head and the transformer get no gradient for the rest of the batch.
+    # The value head still learns. The next dream batch starts again with the policy update.
+    ratio = train_gym.JointTrunkGradientRatio(world_model, trunk_grad_ratio = 0.1, max_scale = 1e4, norm_ema_decay = 0.9)
+    joint = joint_loss(dream_minibatches = 3, target_kl = second["joint/approx_kl"] / 2, trunk_gradient = ratio)
+    step(joint, 0)
+    assert ratio.pending is not None
+    ratio.pending = None
+    with torch.no_grad():
+        for param in world_model.policy_head.parameters():
+            param.add_(torch.randn_like(param) * 0.5)
+    for index in (1, 2):
+        metrics = step(joint, index)
+        assert metrics["joint/policy_update"] == 0.
+        assert all(param.grad is None for param in policy_params)
+        assert any(param.grad is not None for param in value_params)
+        assert ratio.pending is None and ratio.skip_next
+        assert ratio(index) == {"joint/trunk_ratio_skipped": 1.}
+    assert step(joint, 3)["joint/policy_update"] == 1.
+    assert any(param.grad is not None for param in policy_params)
+
+    # Ratio 0 (detach_trunk): the heads learn, the transformer gets no RL gradient.
+    joint = joint_loss(detach_trunk = True)
+    step(joint, 0)
+    assert any(param.grad is not None for param in policy_params)
+    assert all(param.grad is None for param in trunk_params)
+
+    with pytest.raises(ValueError, match = "target_kl"):
+        joint_loss(target_kl = 0.01)
+    with pytest.raises(ValueError, match = "multiple"):
+        joint_loss(dream_minibatches = 4)
+
+
+def test_joint_head_reanchor_keeps_the_head_update_and_removes_the_transformer_drift():
+    world_model = small_agent_world_model(policy_all_tokens = False)
+    generate = ImaginationGenerateRollout(
+        world_model, generate_steps = 2, store_old_action_unembeds = False, use_time_cache = True,
+        preallocate_outputs = False, clamp_generated_latents = False,
+    )
+    reanchor = train_gym.JointHeadReanchor(world_model, steps = 300, learning_rate = 1e-2, prompt_length = 0, chunk_size = 2)
+    joint = train_gym.JointImaginationLoss(
+        world_model, None, None, objective = "ppo", value_loss_weight = .5, generate_rollout_fn = generate,
+        batch_size = 6, horizon = 6, prompt_length = 0, static_generate_shape = False, loss_weight = 1.,
+        micro_batch_size = 2, use_delight_gating = False, grad_diagnostics = False, autocast_bf16 = False,
+        global_step = 0, writer = None, training_profiler = None, dream_minibatches = 3, detach_trunk = True,
+        reanchor = reanchor,
+    )
+    trunk = [param for param in world_model.transformer.parameters() if param.requires_grad]
+
+    torch.manual_seed(1)
+    joint(0, None)
+    old_policy_inputs, old_value_inputs = reanchor.inputs
+
+    # The "optimizer step": a head update and a transformer update.
+    with torch.no_grad():
+        for param in world_model.policy_head.parameters():
+            param.add_(torch.randn_like(param) * 0.05)
+        for param in trunk:
+            param.add_(torch.randn_like(param) * 0.05)
+        target = reanchor.policy_unembeds(old_policy_inputs)
+        target_values = [head(old_value_inputs).softmax(dim = -1) for head in reanchor.value_heads()]
+    trunk_after_step = [param.detach().clone() for param in trunk]
+
+    metrics = joint.after_optimizer_step(0)
+    assert metrics["joint/reanchor_policy_kl_before"] > 1e-3
+    assert metrics["joint/reanchor_policy_kl_after"] < 0.25 * metrics["joint/reanchor_policy_kl_before"]
+    assert metrics["joint/reanchor_value_kl_after"] < metrics["joint/reanchor_value_kl_before"]
+    # The fit targets are the updated heads on the old inputs; the transformer does not change.
+    policy_kl, _ = reanchor.losses(*reanchor.head_inputs(), Actions(*target), target_values)
+    assert policy_kl.item() == pytest.approx(metrics["joint/reanchor_policy_kl_after"], rel = 1e-4)
+    assert all(torch.equal(param, before) for param, before in zip(trunk, trunk_after_step))
+    assert all(param.grad is None for param in world_model.agent_parameters())
+    assert metrics["joint/reanchor_kept"] == 1.
+
+    # Without drift (the same inputs and heads), a fit cannot lower the loss: the heads stay as they were.
+    heads = [param.detach().clone() for param in world_model.agent_parameters()]
+    reanchor.inputs = reanchor.head_inputs()
+    assert joint.after_optimizer_step(0)["joint/reanchor_kept"] == 0.
+    assert all(torch.equal(param, before) for param, before in zip(world_model.agent_parameters(), heads))
+
+    # The next step of the same dream batch keeps the inputs of the fit; a new batch captures new inputs.
+    fitted_inputs = reanchor.inputs
+    joint(1, None)
+    assert reanchor.inputs is fitted_inputs
+    joint(3, None)
+    assert reanchor.inputs is not fitted_inputs and reanchor.full_dream is joint.reused[0]
+
+
+def test_rl_policy_loss_in_world_model_updates_runs_in_the_loop(tmp_path):
+    from train.ablations import CLEANRL_PPO_CLOSER, NEXT_STATE_REWARD_TARGET
+
+    config = small_cpu_config(
+        tmp_path, **{**CLEANRL_PPO_CLOSER, **NEXT_STATE_REWARD_TARGET},
+        run_name = "rl_slot", num_loops = 2, total_envs = 4, imagination_horizon = 9, checkpoint_every = 0,
+        world_model_train_steps = 2, policy_all_tokens = False, rl_policy_loss_in_world_model_updates = True,
+        rl_policy_loss_trunk_grad_ratio = 0.1, rl_policy_loss_dream_micro_batch_size = 2,
+    )
+    with pytest.raises(ValueError, match = "policy_all_tokens = false"):
+        train_gym.main(**dict(config, policy_all_tokens = True))
+    with pytest.raises(ValueError, match = "exclude each other"):
+        train_gym.main(**dict(config, behavior_cloning_in_world_model_updates = True))
+
+    train_gym.main(**config)
+
+    accumulator = EventAccumulator(str(tmp_path / "logs" / "rl_slot"), size_guidance = {"scalars": 0}).Reload()
+    scalars = {tag: accumulator.Scalars(tag) for tag in accumulator.Tags()["scalars"]}
+    # Each world-model step of the online loop (2 loops x 2 steps) adds the RL gradient; the pretrain steps do not.
+    assert len(scalars["rl_slot/scale"]) == 4
+    first = {tag: scalars[tag][0].value for tag in ("rl_slot/scaled_rl_grad_norm", "rl_slot/world_model_grad_norm")}
+    assert first["rl_slot/scaled_rl_grad_norm"] == pytest.approx(0.1 * first["rl_slot/world_model_grad_norm"], rel = 1e-4)
+    # The imagination phase still trains the heads.
+    assert len(scalars["imagination/policy_loss"]) == 2
+
+
 def test_fixed_full_transformer_finetuning_trains_all_parameters_with_one_optimizer(tmp_path, capsys):
     from train.ablations import NEXT_STATE_REWARD_TARGET
 
@@ -990,3 +1383,122 @@ def test_fixed_full_transformer_finetuning_with_closer_ppo_uses_one_optimizer(tm
     assert groups[0]["lr"] == pytest.approx(config["world_model_learning_rate"])
     stepped = [package["world_optimizer"]["state"][index]["steps"] for index in groups[-1]["params"] if index in package["world_optimizer"]["state"]]
     assert len(stepped) > 0 and min(stepped) == 4
+
+def test_fixed_full_transformer_finetuning_trunk_grad_ratio_runs_in_the_loop(tmp_path):
+    from train.ablations import CLEANRL_PPO_CLOSER, NEXT_STATE_REWARD_TARGET
+
+    config = small_cpu_config(
+        tmp_path, **{**CLEANRL_PPO_CLOSER, **NEXT_STATE_REWARD_TARGET},
+        run_name = "joint_ratio", num_loops = 2, total_envs = 4, imagination_horizon = 9, checkpoint_every = 0,
+        policy_all_tokens = False, fixed_full_transformer_finetuning = True, fixed_full_transformer_finetuning_steps = 2,
+        world_model_micro_batch_size = 2, fixed_full_transformer_finetuning_trunk_grad_ratio = 0.1,
+    )
+    with pytest.raises(ValueError, match = "requires fixed_full_transformer_finetuning"):
+        train_gym.main(**dict(config, fixed_full_transformer_finetuning = False))
+
+    train_gym.main(**config)
+
+    accumulator = EventAccumulator(str(tmp_path / "logs" / "joint_ratio"), size_guidance = {"scalars": 0}).Reload()
+    scalars = {tag: accumulator.Scalars(tag) for tag in accumulator.Tags()["scalars"]}
+    # Each joint step (2 loops x 2 steps) scales the RL transformer gradient; the pretrain steps do not.
+    assert len(scalars["joint/trunk_ratio_scale"]) == 4
+    assert len(scalars["imagination/policy_loss"]) == 4
+    first = {tag: scalars[f"joint/trunk_ratio_{tag}"][0].value for tag in ("scaled_rl_grad_norm", "world_model_grad_norm")}
+    assert first["scaled_rl_grad_norm"] == pytest.approx(0.1 * first["world_model_grad_norm"], rel = 1e-4)
+
+
+def test_fixed_full_transformer_finetuning_dream_reuse_runs_in_the_loop(tmp_path):
+    from train.ablations import CLEANRL_PPO_CLOSER, NEXT_STATE_REWARD_TARGET
+
+    config = small_cpu_config(
+        tmp_path, **{**CLEANRL_PPO_CLOSER, **NEXT_STATE_REWARD_TARGET},
+        run_name = "joint_reuse", num_loops = 2, total_envs = 4, imagination_horizon = 9, checkpoint_every = 1,
+        policy_all_tokens = False, fixed_full_transformer_finetuning = True, fixed_full_transformer_finetuning_steps = 4,
+        world_model_micro_batch_size = 2, fixed_full_transformer_finetuning_trunk_grad_ratio = 0.1,
+        fixed_full_transformer_finetuning_dream_minibatches = 2, fixed_full_transformer_finetuning_target_kl = 0.05,
+        fixed_full_transformer_finetuning_value_lr_scale = 10.,
+    )
+    with pytest.raises(ValueError, match = "multiple of dream_minibatches"):
+        train_gym.main(**dict(config, fixed_full_transformer_finetuning_steps = 3))
+    with pytest.raises(ValueError, match = "requires dream reuse"):
+        train_gym.main(**dict(config, fixed_full_transformer_finetuning_dream_minibatches = 1))
+
+    train_gym.main(**config)
+
+    accumulator = EventAccumulator(str(tmp_path / "logs" / "joint_reuse"), size_guidance = {"scalars": 0}).Reload()
+    scalars = {tag: accumulator.Scalars(tag) for tag in accumulator.Tags()["scalars"]}
+    # 2 loops x 4 joint steps; 2 steps for each dream batch. The first step of each batch has the rollout policy.
+    assert len(scalars["joint/approx_kl"]) == 8
+    assert [event.value < 1e-6 for event in scalars["joint/approx_kl"][::2]] == [True] * 4
+    stopped = [event.value == 0. for event in scalars["joint/policy_update"]]
+    assert len(scalars.get("joint/trunk_ratio_skipped", [])) == sum(stopped)
+    assert len(scalars["joint/trunk_ratio_scale"]) == 8 - sum(stopped)
+
+    # The policy head group and the value head group, with the linear decay (factor 1 - 1 / 2 in the last loop).
+    package = torch.load(tmp_path / "logs" / "joint_reuse" / "checkpoints" / "loop_2.pt", weights_only = True)
+    groups = package["world_optimizer"]["param_groups"]
+    assert groups[-2]["lr"] == pytest.approx(config["agent_learning_rate"] * .5)
+    assert groups[-1]["lr"] == pytest.approx(config["agent_learning_rate"] * .5 * 10.)
+
+    # Ratio 0 with the head re-anchor: the heads train, no trunk-ratio object runs, and each joint step logs one fit.
+    train_gym.main(**dict(config, run_name = "joint_reuse_ratio0", checkpoint_every = 0, fixed_full_transformer_finetuning_trunk_grad_ratio = 0.,
+                          fixed_full_transformer_finetuning_reanchor_steps = 3))
+    accumulator = EventAccumulator(str(tmp_path / "logs" / "joint_reuse_ratio0"), size_guidance = {"scalars": 0}).Reload()
+    tags = set(accumulator.Tags()["scalars"])
+    assert "imagination/policy_loss" in tags and "joint/trunk_ratio_scale" not in tags
+    assert len(accumulator.Scalars("joint/reanchor_policy_kl_before")) == 8
+    with pytest.raises(ValueError, match = "reanchor_steps requires"):
+        train_gym.main(**dict(config, fixed_full_transformer_finetuning = False, fixed_full_transformer_finetuning_trunk_grad_ratio = None,
+                              fixed_full_transformer_finetuning_reanchor_steps = 3))
+
+
+@pytest.mark.parametrize("skip", (False, True))
+def test_value_input_skips_critic_state_makes_rollout_values_match_the_value_head(skip):
+    torch.manual_seed(0)
+    world_model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 4,
+        max_steps = 8,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        num_continuous_actions = 1,
+        continuous_dist_type = "beta",
+        reward_encoder_kwargs = dict(num_bins = 5),
+        value_encoder_kwargs = dict(num_bins = 5),
+        dim_critic_state = 3,
+        value_input_skips_critic_state = skip,
+    )
+    # New value heads are near-constant (zero-initialized outputs). Random heads make the values depend on the input.
+    with torch.no_grad():
+        for param in world_model.value_head_parameters():
+            param.add_(torch.randn_like(param) * 0.5)
+    to_latents = torch.nn.Linear(3, 4)
+
+    def obs_to_latents(_world_model, obs, time_cache):
+        state = torch.as_tensor(obs["state"], dtype = torch.float32)
+        return to_latents(state)[:, None, None], time_cache
+
+    env = train_gym.make_env("Pendulum-v1", 0, num_envs = 2, env_vectorization_mode = "sync")
+    try:
+        experience = world_model.interact_with_env(env, seed = 0, max_timesteps = 6, env_is_vectorized = True,
+                                                   store_agent_embed = True, obs_to_latents_fn = obs_to_latents)
+    finally:
+        env.close()
+
+    head_values = world_model.value_encoder.bins_to_scalar_value(world_model.value_head(experience.agent_embed))
+    steps = head_values.shape[1]
+    rollout_values = experience.values[:, :steps]
+    # Without the flag, the untrained critic_state_embedder output goes into the rollout values.
+    assert torch.allclose(rollout_values, head_values, atol = 1e-5) == skip
+
+    context = train_gym.rollout_context_windows(experience, num_windows = 4, window_length = 4, rng = np.random.default_rng(0))
+    _, value_input = train_gym.agent_head_inputs_from_replay_context(world_model, context, step_size = 2, chunk_size = 4)
+    _, (embeds, _) = world_model(
+        latents = context.latents, signal_levels = world_model.max_steps - 1, step_sizes = 2, rewards = context.rewards,
+        continuous_actions = context.actions.continuous, latent_is_noised = True, return_pred_only = True, return_intermediates = True,
+    )
+    assert torch.allclose(value_input, embeds.agent[..., 0, :], atol = 1e-5) == skip

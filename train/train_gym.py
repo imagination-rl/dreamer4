@@ -34,7 +34,7 @@ from functools import partial, wraps
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Literal, Mapping
-from math import sqrt
+from math import sqrt, cos, pi
 
 import fire
 import gymnasium as gym
@@ -47,6 +47,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam, AdamW, Optimizer
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils._pytree import tree_map
@@ -1503,7 +1504,7 @@ def agent_head_inputs_from_replay_context(
         policy_inputs.append(world_model.select_policy_input(embeds, experience.agent_index))
 
         value_input = default(embeds.critic, embeds.agent)[..., experience.agent_index, :]
-        if exists(world_model.critic_state_embedder) and exists(experience.critic_state):
+        if exists(world_model.critic_state_embedder) and exists(experience.critic_state) and not world_model.value_input_skips_critic_state:
             value_input = value_input + world_model.critic_state_embedder(take(experience.critic_state))
         value_inputs.append(value_input)
 
@@ -1739,6 +1740,7 @@ def train_tokenizer(
     device: torch.device,
     writer: SummaryWriter | None,
     training_profiler: TrainingProfiler | None = None,
+    cosine_lr_schedule: bool = False,
 ):
     tokenizer.to(device)
     observations = observations.to(device)
@@ -1751,6 +1753,10 @@ def train_tokenizer(
     dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = len(dataset) >= batch_size)
     optimizer = AdamW(tokenizer.parameters(), lr = learning_rate, fused = device.type == "cuda")
     iterator = cycle(dataloader) if len(dataloader) > 0 else None
+
+    # Cosine decay of the learning rate from learning_rate to 0 over the steps. With a constant learning rate the
+    # reconstruction loss stops at the optimizer noise level near 2e-4 after about 1,000 steps (report/10-20-26-tokenizer-ablations).
+    scheduler = LambdaLR(optimizer, lambda step: 0.5 * (1. + cos(pi * step / steps))) if cosine_lr_schedule else None
 
     last_loss = None
     pbar = tqdm(range(steps), desc = "tokenizer")
@@ -1772,6 +1778,9 @@ def train_tokenizer(
         with record("tokenizer/optimization/optimizer_step", cuda = True):
             optimizer.step()
             optimizer.zero_grad()
+
+            if exists(scheduler):
+                scheduler.step()
 
         last_loss = loss.item()
         pbar.set_postfix(loss = f"{last_loss:.4f}")
@@ -1934,7 +1943,15 @@ def train_world_model(
     extra_loss_fn: Callable | None = None,
     grad_clip_groups: list[tuple[str, list[nn.Parameter]]] | None = None,
     flip_onset_window_fraction: float = 0.,
+    extra_grad_fn: "RLPolicySlot | JointTrunkGradientRatio | None" = None,
+    post_step_fn: Callable[[int], dict[str, float]] | None = None,
 ):
+    # extra_grad_fn (rl_policy_loss_in_world_model_updates): extra_grad_fn.prepare(step) runs before the world-model
+    # forward (it generates dreams with the compiled generate, as the extra_loss_fn of the joint path does), and
+    # extra_grad_fn(step) runs after the backward and before the clip (it adds to .grad, with no compiled call, so no
+    # CUDA graph replays between the backward and the optimizer step). It gives metrics.
+    # With fixed_full_transformer_finetuning_trunk_grad_ratio, extra_grad_fn is a JointTrunkGradientRatio: its
+    # prepare() does nothing, and the extra_loss_fn gives it the RL transformer gradient.
     if len(replay) == 0 or steps <= 0:
         return global_step, {}
 
@@ -2122,6 +2139,10 @@ def train_world_model(
             # with a graph joins the world-model loss in one backward. In chunks, its gradient is already in place.
             extra_loss = None
 
+            if exists(extra_grad_fn):
+                with record("world_model/rl_slot/prepare", cuda = True):
+                    extra_grad_fn.prepare(step)
+
             def forward_backward():
                 nonlocal extra_loss
                 if exists(extra_loss_fn):
@@ -2171,11 +2192,19 @@ def train_world_model(
                 forward_backward,
             )
 
+            extra_grad_metrics = {}
+            if exists(extra_grad_fn):
+                with record("world_model/rl_slot/apply", cuda = True):
+                    extra_grad_metrics = extra_grad_fn(step)
+
             with record("world_model/optimization/grad_clip", cuda = True):
                 norm, grad_metrics = clip_grad_norm_by_group(grad_clip_groups, max_grad_norm)
             with record("world_model/optimization/optimizer_step", cuda = True):
                 optimizer.step()
                 optimizer.zero_grad()
+
+            # fixed_full_transformer_finetuning_reanchor_steps: the head re-anchor after the optimizer step.
+            post_step_metrics = post_step_fn(step) if exists(post_step_fn) else {}
 
             post_update_policy_kl = None
             if preserve_policy_during_world_model_updates:
@@ -2228,6 +2257,8 @@ def train_world_model(
                     f"world_model/{key}": value
                     for key, value in grad_metrics.items()
                 })
+                last_metrics.update(extra_grad_metrics)
+                last_metrics.update(post_step_metrics)
 
                 log_scalars(writer, last_metrics, global_step)
                 pbar.set_postfix(loss = f"{last_metrics['world_model/loss']:.3f}")
@@ -2293,6 +2324,120 @@ def batch_chunks(batch_size: int, chunk_size: int | None) -> list[slice]:
 
 def experience_rows(experience: Experience, rows: slice) -> Experience:
     return Experience(**tree_map_tensor(lambda t: t[rows] if t.ndim > 0 else t, vars(experience)))
+
+
+class JointHeadReanchor:
+    """Head re-anchor after each fixed_full_transformer_finetuning step (the joint form of HeadReanchor).
+
+    A joint step updates the transformer and the heads with one optimizer step. The transformer update alone moves
+    the head inputs, so the policy and the value change without a head update (drift). capture() records the head
+    inputs of all dreams of the dream batch before the step. After the optimizer step, fit() trains the policy and
+    value heads, on the new head inputs of the same dreams, to the outputs of the updated heads on the inputs before
+    the step: the policy with the exact action KL (on the PPO learn mask), the value logits with the KL to the
+    recorded bin distributions. Thus the head update of the step stays, and the change that the transformer update
+    causes goes. The new inputs are the inputs before the next step of the same dream batch. A new Adam optimizer
+    runs each fit; the transformer and the world-model optimizer state do not change. Adam takes steps of about the
+    learning rate also when the drift is near 0, so a fit that does not lower the loss restores the heads.
+    With a trunk gradient ratio above 0, the fit also removes the policy change that the RL transformer gradient
+    gives on these dreams.
+    """
+
+    def __init__(self, world_model: DynamicsWorldModel, *, steps: int, learning_rate: float, prompt_length: int, chunk_size: int | None):
+        self.world_model = world_model
+        self.steps = steps
+        self.learning_rate = learning_rate
+        self.prompt_length = prompt_length
+        self.chunk_size = chunk_size
+        self.full_dream = None
+        self.dream = None
+        self.inputs = None
+
+    def value_heads(self):
+        heads = [self.world_model.value_head]
+        if exists(self.world_model.actor_critic_value_head):
+            heads.append(self.world_model.actor_critic_value_head)
+        return heads
+
+    @torch.no_grad()
+    def head_inputs(self) -> tuple[Tensor, Tensor]:
+        """The policy head input and the value head input of all dreams, as learn_from_experience reads them."""
+        world_model = self.world_model
+        parts = [
+            dream_policy_inputs(world_model, self.full_dream, self.prompt_length, rows)
+            for rows in batch_chunks(self.full_dream.latents.shape[0], self.chunk_size)
+        ]
+        agent_embeds = torch.cat([agent for agent, _ in parts])
+        policy_inputs = torch.cat([policy for _, policy in parts]) if exists(parts[0][1]) else agent_embeds
+        value_inputs = agent_embeds
+        if exists(world_model.critic_state_embedder) and exists(self.dream.critic_state) and not world_model.value_input_skips_critic_state:
+            critic_embeds = world_model.critic_state_embedder(self.dream.critic_state)
+            if critic_embeds.ndim == 3 and value_inputs.ndim == 4:
+                critic_embeds = rearrange(critic_embeds, 'b t d -> b t 1 d')
+            value_inputs = value_inputs + critic_embeds
+        return policy_inputs, value_inputs
+
+    def capture(self, full_dream: Experience, dream: Experience):
+        """A new dream batch: record its head inputs. The same batch keeps the inputs of the last fit."""
+        if full_dream is self.full_dream:
+            return
+        self.full_dream, self.dream = full_dream, dream
+        self.inputs = self.head_inputs()
+
+    def policy_unembeds(self, policy_inputs: Tensor) -> Actions:
+        return Actions(*self.world_model.action_embedder.unembed(self.world_model.policy_head(policy_inputs), pred_head_index = 0))
+
+    def losses(self, policy_inputs: Tensor, value_inputs: Tensor, target_policy: Actions, target_values: list[Tensor]):
+        policy_kl = mean_action_distribution_kl(
+            self.world_model.action_embedder, target_policy, self.policy_unembeds(policy_inputs),
+            lens = self.dream.lens, is_truncated = self.dream.is_truncated,
+        )
+        value_kl = sum(
+            (target * (target.clamp(min = 1e-12).log() - head(value_inputs).log_softmax(dim = -1))).sum(dim = -1).mean()
+            for head, target in zip(self.value_heads(), target_values)
+        )
+        return policy_kl, value_kl
+
+    def fit(self) -> dict[str, float]:
+        if not exists(self.inputs):
+            return {}
+
+        old_policy_inputs, old_value_inputs = self.inputs
+        with torch.no_grad():
+            target_policy = Actions(*(t.detach() if exists(t) else None for t in self.policy_unembeds(old_policy_inputs)))
+            target_values = [head(old_value_inputs).softmax(dim = -1) for head in self.value_heads()]
+        policy_inputs, value_inputs = self.head_inputs()
+
+        params = [*self.world_model.policy_head_parameters(), *self.world_model.value_head_parameters()]
+        optimizer = torch.optim.Adam(params, lr = self.learning_rate)
+
+        with torch.no_grad():
+            policy_kl_before, value_kl_before = self.losses(policy_inputs, value_inputs, target_policy, target_values)
+            params_before = [param.detach().clone() for param in params]
+
+        for _ in range(self.steps):
+            policy_kl, value_kl = self.losses(policy_inputs, value_inputs, target_policy, target_values)
+            optimizer.zero_grad(set_to_none = True)
+            (policy_kl + value_kl).backward()
+            optimizer.step()
+
+        optimizer.zero_grad(set_to_none = True)
+        with torch.no_grad():
+            policy_kl_after, value_kl_after = self.losses(policy_inputs, value_inputs, target_policy, target_values)
+            kept = (policy_kl_after + value_kl_after) < (policy_kl_before + value_kl_before)
+            if not kept:
+                for param, before in zip(params, params_before):
+                    param.copy_(before)
+                policy_kl_after, value_kl_after = policy_kl_before, value_kl_before
+
+        # The inputs of the next step of this dream batch (the transformer does not change before it).
+        self.inputs = (policy_inputs, value_inputs)
+        return {
+            "joint/reanchor_policy_kl_before": float(policy_kl_before),
+            "joint/reanchor_policy_kl_after": float(policy_kl_after),
+            "joint/reanchor_value_kl_before": float(value_kl_before),
+            "joint/reanchor_value_kl_after": float(value_kl_after),
+            "joint/reanchor_kept": float(kept),
+        }
 
 
 class FrozenModelPolicyPrior(nn.Module):
@@ -2375,6 +2520,18 @@ class JointImaginationLoss:
     RL loss: PMPO with the policy-prior KL, or the closer CleanRL PPO loss (one pass over the batch), plus the value loss. Without chunks, the loss keeps its graph, and train_world_model runs one
     backward for the sum with the world-model loss. With chunks (16 GB GPU), the call accumulates the same gradient:
     one backward through the heads on the full dream batch, then one transformer backward for each chunk.
+    With trunk_gradient (a JointTrunkGradientRatio), the call always uses the chunk path. The transformer gets the
+    gradient of the policy loss only, and it goes to trunk_gradient.pending, not to .grad (the extra_grad_fn call of
+    train_world_model then scales it). The value loss trains the value head only, as in the two-phase loop.
+
+    With dream_minibatches x dream_epochs above 1 (closer PPO only), one dream batch serves that many steps: each step
+    reads one minibatch of dreams (a new permutation for each epoch), with the returns and advantages of the whole
+    batch (advantages normalized in the minibatch, as in CleanRL). The importance ratio is then that of the current
+    policy against the rollout policy, so the PPO clip limits the change of the policy for each dream batch. With
+    target_kl, a step whose minibatch has an approx KL (current policy against the rollout policy, before the update)
+    above target_kl stops the policy loss for the rest of the dream batch (CleanRL target_kl): the policy head and the
+    transformer get no policy gradient (their .grad stays None, so the optimizer does not move them by momentum).
+    The value loss continues. With detach_trunk, the RL loss trains the heads only (trunk gradient ratio 0).
     """
 
     # Rows of the gradient diagnostic: enough for a stable norm, and small enough for a shared 16 GB GPU.
@@ -2402,9 +2559,37 @@ class JointImaginationLoss:
         global_step: int,
         writer: SummaryWriter | None,
         training_profiler: TrainingProfiler | None,
+        trunk_gradient: "JointTrunkGradientRatio | None" = None,
+        dream_minibatches: int = 1,
+        dream_epochs: int = 1,
+        target_kl: float | None = None,
+        detach_trunk: bool = False,
+        reanchor: JointHeadReanchor | None = None,
     ):
+        if dream_minibatches <= 0 or dream_epochs <= 0:
+            raise ValueError("dream_minibatches and dream_epochs must be positive")
+        reuse_steps = dream_minibatches * dream_epochs
+        if reuse_steps > 1 and (objective != "ppo" or exists(policy_prior)):
+            raise ValueError("dream reuse needs the closer PPO objective (the importance ratio and the clip)")
+        if reuse_steps > 1 and batch_size % dream_minibatches != 0:
+            raise ValueError("the dream batch size must be a multiple of dream_minibatches")
+        if exists(target_kl) and (target_kl <= 0. or reuse_steps == 1):
+            raise ValueError("target_kl must be positive, and it needs dream reuse (the KL is 0 on a new dream batch)")
+        if detach_trunk and exists(trunk_gradient):
+            raise ValueError("detach_trunk excludes a trunk gradient")
+
         self.world_model = world_model
         self.policy_prior = policy_prior
+        self.trunk_gradient = trunk_gradient
+        self.dream_minibatches = dream_minibatches
+        self.dream_epochs = dream_epochs
+        self.reuse_steps = reuse_steps
+        self.target_kl = target_kl
+        self.detach_trunk = detach_trunk
+        self.reanchor = reanchor
+        # The dream batch of the current reuse cycle, and whether target_kl stopped its policy loss.
+        self.reused = None
+        self.policy_stopped = False
         self.objective = objective
         self.value_loss_weight = value_loss_weight
         self.generate_rollout_fn = generate_rollout_fn
@@ -2483,10 +2668,57 @@ class JointImaginationLoss:
 
         return full_dream, dream
 
-    def rl_losses(self, dream: Experience, agent_embeds: Tensor, policy_inputs: Tensor | None):
+    @torch.no_grad()
+    def reused_minibatch(self, step: int):
+        """Dream reuse: the dream minibatch of this step, and its frozen returns and normalized advantages.
+
+        The first step of each cycle of reuse_steps generates a new dream batch. The steps of an epoch read disjoint
+        minibatches of dreams in a random order.
+        """
+
+        position = step % self.reuse_steps
+        if position == 0 or not exists(self.reused):
+            full_dream, dream = self.generate()
+            frozen = freeze_ppo_targets(self.world_model, Experience(**vars(dream)), normalize_advantages = False)
+            rows = full_dream.latents.shape[0]
+            permutations = [torch.randperm(rows, device = full_dream.latents.device) for _ in range(self.dream_epochs)]
+            self.reused = (full_dream, dream, frozen.frozen_returns, frozen.frozen_advantages, permutations)
+            self.policy_stopped = False
+
+        full_dream, dream, returns, advantages, permutations = self.reused
+        epoch, index = divmod(position, self.dream_minibatches)
+        size = full_dream.latents.shape[0] // self.dream_minibatches
+        rows = permutations[epoch][index * size:(index + 1) * size]
+
+        minibatch = experience_rows(dream, rows)
+        advantages = advantages[rows]
+        time = advantages.shape[1]
+        lens = default(minibatch.lens, torch.full((size,), time, device = advantages.device, dtype = torch.long))
+        is_truncated = default(minibatch.is_truncated, torch.ones(size, device = advantages.device, dtype = torch.bool))
+        valid = advantages[lens_to_mask((lens - is_truncated.long()).clamp(min = 0), time)]
+        targets = dict(
+            frozen_returns = returns[rows],
+            frozen_advantages = (advantages - valid.mean()) / (valid.std() + 1e-8),
+        )
+        return experience_rows(full_dream, rows), minibatch, targets
+
+    @torch.no_grad()
+    def policy_kl_metrics(self, dream: Experience, agent_embeds: Tensor, policy_inputs: Tensor | None):
+        """Approx KL and clip fraction of the current policy against the rollout policy, on the head inputs of the step."""
+
+        current = Experience(**{
+            **vars(dream),
+            "agent_embed": agent_embeds.detach(),
+            "policy_input": policy_inputs.detach() if exists(policy_inputs) else None,
+        })
+        return agent_approx_kl_metrics(self.world_model, current, include_cleanrl_metrics = True)
+
+    def rl_losses(self, dream: Experience, agent_embeds: Tensor, policy_inputs: Tensor | None, targets: dict | None = None):
         # The values and rewards of the rollout give the returns and advantages. Only the heads run here.
         fields = {**vars(dream), "agent_embed": agent_embeds, "policy_input": policy_inputs}
-        if self.objective == "ppo":
+        if exists(targets):
+            fields.update(targets)
+        elif self.objective == "ppo":
             fields.update(closer_ppo_dream_targets(self.world_model, dream))
 
         return self.world_model.learn_from_experience(
@@ -2500,18 +2732,44 @@ class JointImaginationLoss:
 
     def __call__(self, step: int, replay_experience: Experience) -> Tensor:
         world_model = self.world_model
-        full_dream, dream = self.generate()
+        reuse = self.reuse_steps > 1
+        if reuse:
+            full_dream, dream, targets = self.reused_minibatch(step)
+        else:
+            (full_dream, dream), targets = self.generate(), None
+        if exists(self.reanchor):
+            # The head inputs of the whole dream batch before this step (all minibatches of a reuse cycle).
+            with self.record("imagination/reanchor_capture"):
+                self.reanchor.capture(*(self.reused[:2] if reuse else (full_dream, dream)))
         chunks = batch_chunks(full_dream.latents.shape[0], self.micro_batch_size)
 
         if self.grad_diagnostics and step == 0:
             with self.record("imagination/grad_diagnostics"):
                 log_scalars(self.writer, self.trunk_gradient_metrics(replay_experience, full_dream, dream), self.global_step)
 
+        # The chunk path gives the head gradient and the transformer gradient in separate backward calls.
+        split_backward = len(chunks) > 1 or exists(self.trunk_gradient) or self.detach_trunk
+
+        def policy_update_allowed(agent_embeds: Tensor, policy_inputs: Tensor | None):
+            # Dream reuse: the KL of the current policy against the rollout policy, before the update of this step.
+            if not reuse:
+                return True, {}
+            kl_metrics = self.policy_kl_metrics(dream, agent_embeds, policy_inputs)
+            if exists(self.target_kl) and not self.policy_stopped and kl_metrics["approx_kl_mean"].item() > self.target_kl:
+                self.policy_stopped = True
+            return not self.policy_stopped, kl_metrics
+
+        def total_loss(policy_loss: Tensor, value_loss: Tensor, policy_on: bool):
+            # Without the policy loss in the graph, the policy head gets no .grad (not a zero .grad).
+            rl_loss = self.value_loss_weight * value_loss
+            return ((policy_loss + rl_loss) if policy_on else rl_loss) * self.loss_weight
+
         with self.record("imagination/model/learn_forward"):
-            if len(chunks) == 1:
+            if not split_backward:
                 agent_embeds, policy_inputs = dream_policy_inputs(world_model, full_dream, self.prompt_length)
-                policy_loss, value_loss, diagnostics = self.rl_losses(dream, agent_embeds, policy_inputs)
-                loss = (policy_loss + self.value_loss_weight * value_loss) * self.loss_weight
+                policy_on, kl_metrics = policy_update_allowed(agent_embeds, policy_inputs)
+                policy_loss, value_loss, diagnostics = self.rl_losses(dream, agent_embeds, policy_inputs, targets)
+                loss = total_loss(policy_loss, value_loss, policy_on)
             else:
                 with torch.no_grad():
                     parts = [dream_policy_inputs(world_model, full_dream, self.prompt_length, rows) for rows in chunks]
@@ -2519,22 +2777,53 @@ class JointImaginationLoss:
                 # Leaf copies of the head inputs. The head backward gives the gradient of the loss at each input.
                 agent_embeds = torch.cat([agent for agent, _ in parts]).requires_grad_()
                 policy_inputs = torch.cat([policy for _, policy in parts]).requires_grad_() if exists(parts[0][1]) else None
-                policy_loss, value_loss, diagnostics = self.rl_losses(dream, agent_embeds, policy_inputs)
-                loss = (policy_loss + self.value_loss_weight * value_loss) * self.loss_weight
+                policy_on, kl_metrics = policy_update_allowed(agent_embeds, policy_inputs)
+                policy_loss, value_loss, diagnostics = self.rl_losses(dream, agent_embeds, policy_inputs, targets)
+                loss = total_loss(policy_loss, value_loss, policy_on)
 
-        if len(chunks) > 1:
+        if split_backward:
             with self.record("imagination/model/backward"):
+                trunk_params = self.trunk_gradient.params if exists(self.trunk_gradient) else None
+                skip_trunk = self.detach_trunk or (exists(trunk_params) and not policy_on)
+                input_gradients = None
+                if exists(trunk_params) and not skip_trunk:
+                    # The gradient of the policy loss alone at the head inputs (the value loss stays out of the transformer).
+                    leaves = [leaf for leaf in (agent_embeds, policy_inputs) if exists(leaf)]
+                    input_gradients = dict(zip(
+                        map(id, leaves),
+                        torch.autograd.grad(policy_loss * self.loss_weight, leaves, retain_graph = True, allow_unused = True),
+                    ))
+
                 loss.backward()
 
                 # The transformer gradient: the same forward in chunks, with the input gradients of the full batch.
-                for rows in chunks:
+                trunk_gradient = [None] * len(trunk_params) if exists(trunk_params) else None
+                for rows in ([] if skip_trunk else chunks):
                     chunk_agent, chunk_policy = dream_policy_inputs(world_model, full_dream, self.prompt_length, rows)
                     outputs, gradients = [], []
                     for output, leaf in ((chunk_agent, agent_embeds), (chunk_policy, policy_inputs)):
-                        if exists(leaf) and exists(leaf.grad):
+                        if not exists(leaf):
+                            continue
+                        gradient = input_gradients[id(leaf)] if exists(input_gradients) else leaf.grad
+                        if exists(gradient):
                             outputs.append(output)
-                            gradients.append(leaf.grad[rows])
-                    torch.autograd.backward(outputs, gradients)
+                            gradients.append(gradient[rows])
+                    if not exists(trunk_params):
+                        torch.autograd.backward(outputs, gradients)
+                        continue
+
+                    chunk_gradient = torch.autograd.grad(outputs, trunk_params, grad_outputs = gradients, allow_unused = True)
+                    trunk_gradient = [
+                        new if old is None else (old if new is None else old + new)
+                        for old, new in zip(trunk_gradient, chunk_gradient)
+                    ]
+                    del chunk_gradient
+
+                if exists(trunk_params) and skip_trunk:
+                    # target_kl stopped the policy loss: no RL transformer gradient in this step.
+                    self.trunk_gradient.skip_next = True
+                elif exists(trunk_params):
+                    self.trunk_gradient.pending = trunk_gradient
 
             loss = loss.detach()
 
@@ -2566,11 +2855,24 @@ class JointImaginationLoss:
                 "joint/learner_input_error": (current_inputs - rollout_inputs).abs().max().item(),
                 **{key: value.item() for key, value in diagnostics.items()},
             }
+            if reuse:
+                metrics.update({
+                    "joint/approx_kl": kl_metrics["approx_kl_mean"].item(),
+                    "joint/clip_fraction": kl_metrics["clip_fraction"].item(),
+                    "joint/policy_update": float(policy_on),
+                })
             log_scalars(self.writer, metrics, self.global_step)
 
         self.last_metrics = metrics
         self.global_step += 1
         return loss
+
+    def after_optimizer_step(self, step: int) -> dict[str, float]:
+        """The post_step_fn of train_world_model: the head re-anchor of this step."""
+        if not exists(self.reanchor):
+            return {}
+        with self.record("imagination/reanchor_fit"):
+            return self.reanchor.fit()
 
     def trunk_gradient_metrics(self, replay_experience: Experience, full_dream: Experience, dream: Experience):
         """Transformer gradient norm of each loss term, and the cosine between the RL and world-model gradients.
@@ -2678,6 +2980,214 @@ def call_learn_from_dream(
     )
 
 
+# rl_policy_loss_in_world_model_updates (report/10-10-26-rl-gradient-agent-token). Paper phase 2 trains the policy head
+# with BC on the agent token, in the same updates of the transformer as the dynamics and reward losses. Here the RL
+# policy gradient takes the place of BC: each world-model step adds the gradient of -mean(advantage * log pi(a | agent
+# token)) on new dreams to the transformer. The heads do not change in the world-model step (the imagination phase
+# still trains them on a frozen transformer). The RL gradient is scaled to a fixed fraction of the world-model
+# gradient norm on the same parameters (EMA estimates of both norms), because the policy-gradient terms of a batch
+# mostly cancel and a fixed weight gives a negligible share (report section 5).
+
+class NormMatchedGradient:
+    """Adds an RL gradient to .grad, scaled to a fixed ratio of the .grad norm (the world-model gradient) on the same
+    parameters. EMA estimates of both norms give the scale, and they persist across loops."""
+
+    def __init__(
+        self,
+        params: list[nn.Parameter],
+        *,
+        trunk_grad_ratio: float,
+        max_scale: float,
+        norm_ema_decay: float,
+    ):
+        self.params = params
+        self.trunk_grad_ratio = trunk_grad_ratio
+        self.max_scale = max_scale
+        self.norm_ema_decay = norm_ema_decay
+        self.world_model_norm_ema = None
+        self.rl_norm_ema = None
+
+    def ema(self, previous: float | None, value: float) -> float:
+        return value if previous is None else self.norm_ema_decay * previous + (1. - self.norm_ema_decay) * value
+
+    def add_scaled(self, gradient: list[Tensor | None]) -> dict[str, float]:
+        """Add the scaled gradient (one entry for each of self.params, None off the path) to .grad. Gives metrics."""
+
+        on_path = [(param, grad) for param, grad in zip(self.params, gradient) if exists(grad)]
+        world_model_grads = [param.grad for param, _ in on_path if exists(param.grad)]
+        world_model_norm = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g.float()) for g in world_model_grads])).item() if world_model_grads else 0.
+        rl_norm = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g.float()) for _, g in on_path])).item() if on_path else 0.
+
+        dot = sum(float((param.grad.float() * grad.float()).sum()) for param, grad in on_path if exists(param.grad))
+        cosine = dot / max(world_model_norm * rl_norm, 1e-12)
+
+        self.world_model_norm_ema = self.ema(self.world_model_norm_ema, world_model_norm)
+        self.rl_norm_ema = self.ema(self.rl_norm_ema, rl_norm)
+        scale = min(self.trunk_grad_ratio * self.world_model_norm_ema / max(self.rl_norm_ema, 1e-12), self.max_scale)
+
+        with torch.no_grad():
+            for param, grad in on_path:
+                if exists(param.grad):
+                    param.grad.add_(grad, alpha = scale)
+                else:
+                    param.grad = grad * scale
+
+        return {
+            "world_model_grad_norm": world_model_norm,
+            "rl_grad_norm": rl_norm,
+            "scaled_rl_grad_norm": rl_norm * scale,
+            "scale": scale,
+            "cos_rl_world_model": cosine,
+        }
+
+
+class RLPolicySlot(NormMatchedGradient):
+    """The RL policy gradient of the world-model step (the extra_grad_fn of train_world_model).
+
+    prepare() generates one dream batch and computes the RL gradient into a separate buffer (before the world-model
+    forward). The call then scales it and adds it to .grad (after the world-model backward).
+
+    The EMA norm estimates persist across loops. set_dream_source() gives the dream generator of the current loop
+    (a JointImaginationLoss with the replay of that loop).
+    """
+
+    def __init__(
+        self,
+        world_model: DynamicsWorldModel,
+        optimizer: Optimizer,
+        *,
+        trunk_grad_ratio: float,
+        max_scale: float,
+        norm_ema_decay: float,
+        micro_batch_size: int | None,
+    ):
+        if world_model.policy_all_tokens:
+            raise ValueError("rl_policy_loss_in_world_model_updates requires policy_all_tokens = false")
+
+        # The parameters of the world-model optimizer. The policy and value heads are not in it.
+        head_params = set(world_model.agent_parameters())
+        params = [param for group in optimizer.param_groups for param in group["params"] if param.requires_grad]
+        assert not any(param in head_params for param in params), "the world-model optimizer holds a head parameter"
+
+        super().__init__(params, trunk_grad_ratio = trunk_grad_ratio, max_scale = max_scale, norm_ema_decay = norm_ema_decay)
+        self.world_model = world_model
+        self.micro_batch_size = micro_batch_size
+        self.dream_source = None
+        self.pending = None
+
+    def set_dream_source(self, dream_source: "JointImaginationLoss"):
+        self.dream_source = dream_source
+
+    def policy_loss(self, dream: Experience, agent_embeds: Tensor, frozen_advantages: Tensor) -> Tensor:
+        world_model = self.world_model
+        actions = action_pair_or_empty(dream.actions)
+        time = agent_embeds.shape[1]
+
+        policy_embed = world_model.policy_head(agent_embeds)
+        log_probs = world_model.action_embedder.log_probs(
+            policy_embed,
+            pred_head_index = 0,
+            discrete_targets = actions.discrete[:, :time] if exists(actions.discrete) else None,
+            continuous_targets = actions.continuous[:, :time] if exists(actions.continuous) else None,
+        )
+        log_probs = safe_cat(log_probs, dim = -1).sum(dim = -1)
+
+        batch = log_probs.shape[0]
+        lens = default(dream.lens, torch.full((batch,), time, device = log_probs.device, dtype = torch.long))
+        is_truncated = default(dream.is_truncated, torch.ones(batch, device = log_probs.device, dtype = torch.bool))
+        mask = lens_to_mask((lens - is_truncated.long()).clamp(min = 0), time)
+
+        return -(frozen_advantages[:, :time] * log_probs).masked_fill(~mask, 0.).sum() / mask.sum().clamp(min = 1)
+
+    def rl_gradient(self, full_dream: Experience, dream: Experience, prompt_length: int):
+        """The gradient of the policy loss for self.params, as a list (None for a parameter off the path)."""
+
+        world_model = self.world_model
+        frozen_advantages = closer_ppo_dream_targets(world_model, dream)["frozen_advantages"]
+        horizon = dream.rewards.shape[1]
+        chunks = batch_chunks(full_dream.latents.shape[0], self.micro_batch_size)
+
+        # The loss on leaf copies of the agent embeds gives its gradient at each embed. torch.autograd.grad does not
+        # write .grad, so no head parameter gets a gradient. Then one transformer backward for each chunk.
+        with torch.no_grad():
+            agent_embeds = torch.cat([
+                dream_policy_inputs(world_model, full_dream, prompt_length, rows)[0][:, :horizon]
+                for rows in chunks
+            ])
+        agent_embeds.requires_grad_()
+        loss = self.policy_loss(dream, agent_embeds, frozen_advantages)
+        embed_grad, = torch.autograd.grad(loss, [agent_embeds])
+
+        gradient = [None] * len(self.params)
+        for rows in chunks:
+            chunk_embeds = dream_policy_inputs(world_model, full_dream, prompt_length, rows)[0][:, :horizon]
+            chunk_gradient = torch.autograd.grad(
+                [chunk_embeds], self.params, grad_outputs = [embed_grad[rows]], allow_unused = True,
+            )
+            gradient = [
+                new if old is None else (old if new is None else old + new)
+                for old, new in zip(gradient, chunk_gradient)
+            ]
+            del chunk_embeds, chunk_gradient
+
+        return loss.detach(), gradient
+
+    def prepare(self, step: int):
+        """Generate the dreams and compute the RL gradient (before the world-model forward of the step)."""
+
+        source = self.dream_source
+        assert exists(source), "set_dream_source() before the world-model phase"
+        full_dream, dream = source.generate()
+        loss, gradient = self.rl_gradient(full_dream, dream, source.prompt_length)
+        dream_return = dream.episode_return.mean().item() if exists(dream.episode_return) else 0.
+        self.pending = (loss, gradient, dream_return)
+
+    def __call__(self, step: int) -> dict[str, float]:
+        """Add the scaled RL gradient to .grad (after the world-model backward, before the clip). Gives metrics."""
+
+        assert exists(self.pending), "prepare() before each call"
+        loss, gradient, dream_return = self.pending
+        self.pending = None
+
+        return {
+            "rl_slot/policy_loss": loss.item(),
+            "rl_slot/dream_return": dream_return,
+            **{f"rl_slot/{key}": value for key, value in self.add_scaled(gradient).items()},
+        }
+
+
+class JointTrunkGradientRatio(NormMatchedGradient):
+    """fixed_full_transformer_finetuning_trunk_grad_ratio: the extra_grad_fn of the joint step.
+
+    The RL loss of the joint step (JointImaginationLoss) puts the head gradient in .grad, and its transformer gradient
+    in self.pending. After the world-model backward, the call scales that gradient to the ratio times the world-model
+    gradient norm on the same parameters and adds it to .grad. The heads keep the unscaled RL gradient.
+    """
+
+    def __init__(self, world_model: DynamicsWorldModel, *, trunk_grad_ratio: float, max_scale: float, norm_ema_decay: float):
+        head_params = set(world_model.agent_parameters())
+        params = [param for param in world_model.parameters() if param.requires_grad and param not in head_params]
+        super().__init__(params, trunk_grad_ratio = trunk_grad_ratio, max_scale = max_scale, norm_ema_decay = norm_ema_decay)
+        self.pending = None
+        # Set by the RL loss when target_kl stopped the policy loss: the step adds no RL gradient, and the EMAs keep
+        # their values (a zero norm would raise the later scale).
+        self.skip_next = False
+
+    def prepare(self, step: int):
+        # The RL loss of the step runs in the world-model forward and backward, and it sets self.pending.
+        pass
+
+    def __call__(self, step: int) -> dict[str, float]:
+        if self.skip_next:
+            self.skip_next = False
+            assert self.pending is None
+            return {"joint/trunk_ratio_skipped": 1.}
+        assert exists(self.pending), "the RL loss of the joint step did not give a transformer gradient"
+        gradient = self.pending
+        self.pending = None
+        return {f"joint/trunk_ratio_{key}": value for key, value in self.add_scaled(gradient).items()}
+
+
 CLEANRL_UPDATED_PPO_EPOCHS = 10
 CLEANRL_UPDATED_PPO_NUM_MINIBATCHES = 32
 CLEANRL_UPDATED_PPO_VALUE_LOSS_WEIGHT = .5
@@ -2706,8 +3216,14 @@ def train_cleanrl_updated_ppo_dream(
     num_minibatches: int = CLEANRL_UPDATED_PPO_NUM_MINIBATCHES,
     value_loss_weight: float = CLEANRL_UPDATED_PPO_VALUE_LOSS_WEIGHT,
     max_grad_norm: float = CLEANRL_UPDATED_PPO_MAX_GRAD_NORM,
+    deferred_metrics: bool = False,
 ):
-    """Apply updated CleanRL PPO to one flattened main-model dream batch."""
+    """Apply updated CleanRL PPO to one flattened main-model dream batch.
+
+    deferred_metrics (closer mode only): the closer mode logs only the metrics of the last minibatch and the mean
+    clip fraction. With this flag, the other minibatches do not copy their metrics to the host, so the CPU does not
+    wait for the GPU at each minibatch. The updates and the logged values do not change.
+    """
 
     if epochs <= 0 or num_minibatches <= 0:
         raise ValueError("CleanRL updated PPO epochs and minibatches must be positive")
@@ -2734,6 +3250,8 @@ def train_cleanrl_updated_ppo_dream(
     last_metrics = {}
     last_agent_metrics = {}
     closer_clip_fractions = []
+    deferred_metrics = deferred_metrics and cleanrl_ppo_closer
+    last_minibatch_start = (batch_size - 1) // minibatch_size * minibatch_size
 
     explained_variance = float("nan")
     if cleanrl_ppo_closer:
@@ -2786,7 +3304,9 @@ def train_cleanrl_updated_ppo_dream(
             )
 
             with record("imagination/optimization/grad_clip", cuda = True):
-                grad_norm = float(clip_grad_norm_(params, max_grad_norm))
+                grad_norm = clip_grad_norm_(params, max_grad_norm)
+                if not deferred_metrics:
+                    grad_norm = float(grad_norm)
             optimizer.step()
 
             with torch.no_grad():
@@ -2795,6 +3315,16 @@ def train_cleanrl_updated_ppo_dream(
                     minibatch,
                     include_cleanrl_metrics = cleanrl_ppo_closer,
                 )
+
+            if deferred_metrics and not (epoch == epochs - 1 and start == last_minibatch_start):
+                # The clip fraction stays on the GPU. Only the last minibatch gives the logged metrics.
+                closer_clip_fractions.append(agent_metrics["clip_fraction"])
+                global_step += 1
+                del minibatch, policy_loss, value_loss, value_diagnostics, loss, agent_metrics
+                continue
+
+            if deferred_metrics:
+                grad_norm = float(grad_norm)
 
             imagination_metrics = {
                 "imagination/loss": loss.item(),
@@ -3056,6 +3586,7 @@ def train_agent_in_imagination(
     cleanrl_updated_ppo_constant_learning_rate: bool = False,
     cleanrl_updated_ppo_shuffle_generator: torch.Generator | None = None,
     cleanrl_updated_ppo_metric_step: int | None = None,
+    cleanrl_ppo_closer_deferred_metrics: bool = False,
     reuse_ppo_dream_batch: bool = False,
     ppo_reuse_epochs: int = 4,
     ppo_reuse_num_minibatches: int = 4,
@@ -3333,6 +3864,7 @@ def train_agent_in_imagination(
                 shuffle_generator = cleanrl_updated_ppo_shuffle_generator,
                 metric_step = cleanrl_updated_ppo_metric_step,
                 constant_learning_rate = cleanrl_updated_ppo_constant_learning_rate,
+                deferred_metrics = cleanrl_ppo_closer_deferred_metrics,
             )
             pbar.set_postfix(
                 dream_return = f"{last_metrics['imagination/dream_return']:.1f}",
@@ -3680,6 +4212,25 @@ def resolve_log_dir(
     return log_root / run_name
 
 
+def configure_compile_processes(*, compile_threads: int | None, compile_cache_dir: str | Path | None):
+    """Set the inductor compile threads and cache folder before the first compile.
+
+    compile_threads 1 compiles in the run process, so inductor starts no compile worker processes. The compiled
+    kernels are the same. compile_cache_dir is used only when the folder exists. None keeps the torch default.
+    """
+    if exists(compile_threads):
+        if compile_threads < 1:
+            raise ValueError(f"compile_threads must be >= 1, got {compile_threads}")
+
+        import torch._inductor.config as inductor_config
+        inductor_config.compile_threads = compile_threads
+
+    if exists(compile_cache_dir):
+        cache_dir = Path(compile_cache_dir).expanduser()
+        if cache_dir.is_dir():
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_dir.resolve())
+
+
 def storage_path_for(path: str | Path, log_storage_dir: str | Path) -> Path | None:
     """Return the path under log_storage_dir that repeats path relative to the working directory.
 
@@ -3847,6 +4398,7 @@ def main(
     pretrain_tokenizer_observations: int,
     tokenizer_batch_size: int,
     tokenizer_learning_rate: float,
+    tokenizer_cosine_lr_schedule: bool = False,
     tokenizer_eval_every: int,
     tokenizer_eval_batch_size: int,
     max_grad_norm: float,
@@ -3871,6 +4423,9 @@ def main(
     compile_dynamic: bool | None,
     compile_generate_cudagraphs: bool,
     compile_options: Mapping[str, Any] | None = None,
+    cleanrl_ppo_closer_deferred_metrics: bool = False,
+    disable_distribution_validation: bool = False,
+    rollout_policy_cudagraph: bool = False,
     optimize_generate_compilation: bool,
     compile_generate_with_time_cache: bool,
     track_compile_performance: bool,
@@ -3890,6 +4445,7 @@ def main(
     old_pmpo: bool = False,
     old_reward_head: bool = False,
     old_terminal_head: bool = False,
+    small_terminal_head: bool = False,
     old_state_tokenizer: bool = False,
     old_dynamics_ff: bool = False,
     old_policy_head: bool = False,
@@ -3914,6 +4470,8 @@ def main(
     attn_pool_einsum_attend: bool = False,
     attn_res: str | None = None,
     attn_res_block_size: int = 2,
+    limit_kv_cache_lookback: bool = False,
+    kv_cache_lookback: int = 1000,
     dynamics_ff_expansion_factor: float | None = None,
     stop_after_loops: int | None = None,
     cuda_memory_fraction: float | None = None,
@@ -3927,6 +4485,10 @@ def main(
     reanchor_heads_learning_rate: float = 3e-4,
     reanchor_heads_contexts: int = 64,
     reanchor_heads_context_length: int = 200,
+    value_input_skips_critic_state: bool = False,
+    world_model_clean_context_frame_prob: float = 0.,
+    world_model_clean_context_frame_noise: float = 0.,
+    eager_first_dream_frame: bool = False,
     cleanrl_updated_ppo: bool = False,
     cleanrl_ppo_closer: bool = False,
     cleanrl_ppo_closer_hl_gauss_value_loss: bool = False,
@@ -3947,6 +4509,20 @@ def main(
     fixed_full_transformer_finetuning_rl_loss_weight: float = 1.,
     fixed_full_transformer_finetuning_dream_micro_batch_size: int | None = None,
     fixed_full_transformer_finetuning_grad_diagnostics: bool = True,
+    fixed_full_transformer_finetuning_trunk_grad_ratio: float | None = None,
+    fixed_full_transformer_finetuning_trunk_grad_max_scale: float = 10000.,
+    fixed_full_transformer_finetuning_trunk_grad_norm_ema_decay: float = 0.99,
+    fixed_full_transformer_finetuning_dream_minibatches: int = 1,
+    fixed_full_transformer_finetuning_dream_epochs: int = 1,
+    fixed_full_transformer_finetuning_target_kl: float | None = None,
+    fixed_full_transformer_finetuning_value_lr_scale: float = 1.,
+    fixed_full_transformer_finetuning_reanchor_steps: int = 0,
+    fixed_full_transformer_finetuning_reanchor_learning_rate: float = 3e-4,
+    rl_policy_loss_in_world_model_updates: bool = False,
+    rl_policy_loss_trunk_grad_ratio: float = 0.01,
+    rl_policy_loss_max_scale: float = 10000.,
+    rl_policy_loss_norm_ema_decay: float = 0.99,
+    rl_policy_loss_dream_micro_batch_size: int | None = 64,
     cleanrl_ppo_entropy_weight: float = 0.,
     world_model_flip_onset_window_fraction: float = 0.,
     imagination_flip_onset_prompt_fraction: float = 0.,
@@ -3965,6 +4541,7 @@ def main(
     offline_expert_min_return: float = 8000.,
     offline_data_dir: str = "runs/offline_data",
     offline_dataset_name: str = "halfcheetah_v4_mix_1m",
+    offline_tokenizer_observations: str | None = None,
     offline_data_steps: int = 1_000_000,
     offline_data_mix: Mapping[str, float] | None = None,
     offline_expert_noise_stds: tuple[float, ...] = (0.1, 0.2, 0.4, 0.8),
@@ -3986,8 +4563,12 @@ def main(
     offline_pretrained_checkpoint: str | None = None,
     offline_load_world_optimizer: bool = True,
     offline_rehearsal_fraction: float = 0.25,
+    compile_threads: int | None = None,
+    compile_cache_dir: str | None = None,
 ):
     hyperparameters = dict(locals())
+
+    configure_compile_processes(compile_threads = compile_threads, compile_cache_dir = compile_cache_dir)
 
     if offline_data_mix is None:
         offline_data_mix = offline.DEFAULT_DATA_MIX
@@ -4085,11 +4666,22 @@ def main(
             raise ValueError(f"{name} must be in [0, 1), got {fraction}")
         if fraction > 0. and not env_name.startswith("HalfCheetah"):
             raise ValueError(f"{name} finds flips from the HalfCheetah root angle; {env_name} is not HalfCheetah")
-        if fraction > 0. and (old_replay_sampling or fixed_full_transformer_finetuning):
-            raise ValueError(f"{name} does not support old_replay_sampling or fixed_full_transformer_finetuning")
+        if fraction > 0. and old_replay_sampling:
+            raise ValueError(f"{name} does not support old_replay_sampling")
+
+    # The joint step samples its world-model windows with train_world_model (flip-onset windows work), but its dream
+    # prompts come from JointImaginationLoss, which has no flip-onset prompts.
+    if imagination_flip_onset_prompt_fraction > 0. and fixed_full_transformer_finetuning:
+        raise ValueError("imagination_flip_onset_prompt_fraction does not support fixed_full_transformer_finetuning")
 
     if imagination_flip_onset_prompt_fraction > 0. and imagination_prompt_length <= 0:
         raise ValueError("imagination_flip_onset_prompt_fraction needs imagination_prompt_length > 0")
+
+    if limit_kv_cache_lookback and kv_cache_lookback < 1:
+        raise ValueError(f"kv_cache_lookback must be at least 1, got {kv_cache_lookback}")
+
+    if small_terminal_head and old_terminal_head:
+        raise ValueError("small_terminal_head and old_terminal_head exclude each other")
 
     if reanchor_heads_after_world_model_updates:
         if reanchor_heads_steps <= 0 or reanchor_heads_contexts <= 0 or reanchor_heads_learning_rate <= 0.:
@@ -4195,6 +4787,29 @@ def main(
         if offline_rl_stage and offline_rehearsal_fraction > 0.:
             raise ValueError("behavior_cloning_in_world_model_updates does not support rehearsal; set offline_rehearsal_fraction to 0")
 
+    # The RL policy loss in the world-model step (RLPolicySlot): the BC slot of paper phase 2, filled by the policy
+    # gradient on dreams. The heads stay in the imagination phase, so the flags that put a head into the world-model
+    # optimizer or replace the two phases exclude it.
+    if rl_policy_loss_in_world_model_updates:
+        if policy_all_tokens:
+            raise ValueError("rl_policy_loss_in_world_model_updates requires policy_all_tokens = false (the policy reads the agent token)")
+        if rl_policy_loss_trunk_grad_ratio <= 0. or rl_policy_loss_max_scale <= 0.:
+            raise ValueError("rl_policy_loss_trunk_grad_ratio and rl_policy_loss_max_scale must be positive")
+        if not 0. <= rl_policy_loss_norm_ema_decay < 1.:
+            raise ValueError("rl_policy_loss_norm_ema_decay must be in [0, 1)")
+        if exists(rl_policy_loss_dream_micro_batch_size) and rl_policy_loss_dream_micro_batch_size <= 0:
+            raise ValueError("rl_policy_loss_dream_micro_batch_size must be positive or null")
+        if freeze_world_model:
+            raise ValueError("rl_policy_loss_in_world_model_updates needs world-model updates, so freeze_world_model must be false")
+        for flag, value in (
+            ("behavior_cloning_in_world_model_updates", behavior_cloning_in_world_model_updates),
+            ("fixed_full_transformer_finetuning", fixed_full_transformer_finetuning),
+            ("full_transformer_finetuning", full_transformer_finetuning),
+            ("preserve_policy_during_world_model_updates", preserve_policy_during_world_model_updates),
+        ):
+            if value:
+                raise ValueError(f"rl_policy_loss_in_world_model_updates and {flag} exclude each other")
+
     effective_world_model_train_steps = 0 if freeze_world_model else world_model_train_steps
 
     # Full-transformer finetuning in the RL loop (paper section 3.3 and its footnote), as the paper's phase 2 with the
@@ -4204,6 +4819,11 @@ def main(
     # The paper gives no optimizer, learning rate, or loss weights for this mode. The joint optimizer is the
     # world-model optimizer, with the policy and value heads as one more group (world-model lr and weight decay).
     joint_finetune_steps = 0
+    if exists(fixed_full_transformer_finetuning_trunk_grad_ratio) and not fixed_full_transformer_finetuning:
+        raise ValueError("fixed_full_transformer_finetuning_trunk_grad_ratio requires fixed_full_transformer_finetuning")
+    if fixed_full_transformer_finetuning_reanchor_steps > 0 and not fixed_full_transformer_finetuning:
+        raise ValueError("fixed_full_transformer_finetuning_reanchor_steps requires fixed_full_transformer_finetuning")
+
     if fixed_full_transformer_finetuning:
         if fixed_full_transformer_finetuning_steps <= 0:
             raise ValueError("fixed_full_transformer_finetuning_steps must be positive")
@@ -4238,6 +4858,32 @@ def main(
             raise ValueError("fixed_full_transformer_finetuning requires imagination_use_time_cache=true")
         if imagination_prompt_length > 0 and imagination_prompt_probability != 1.:
             raise ValueError("fixed_full_transformer_finetuning requires imagination_prompt_probability=1.0 when imagination_prompt_length > 0")
+
+        if exists(fixed_full_transformer_finetuning_trunk_grad_ratio):
+            # Ratio 0: the RL loss trains the heads only (no RL gradient reaches the transformer).
+            if fixed_full_transformer_finetuning_trunk_grad_ratio < 0. or fixed_full_transformer_finetuning_trunk_grad_max_scale <= 0.:
+                raise ValueError("fixed_full_transformer_finetuning_trunk_grad_ratio must be >= 0, and fixed_full_transformer_finetuning_trunk_grad_max_scale must be positive")
+            if not 0. <= fixed_full_transformer_finetuning_trunk_grad_norm_ema_decay < 1.:
+                raise ValueError("fixed_full_transformer_finetuning_trunk_grad_norm_ema_decay must be in [0, 1)")
+
+        joint_dream_reuse_steps = fixed_full_transformer_finetuning_dream_minibatches * fixed_full_transformer_finetuning_dream_epochs
+        if fixed_full_transformer_finetuning_dream_minibatches <= 0 or fixed_full_transformer_finetuning_dream_epochs <= 0:
+            raise ValueError("fixed_full_transformer_finetuning_dream_minibatches and _dream_epochs must be positive")
+        if joint_dream_reuse_steps > 1:
+            if not cleanrl_ppo_closer:
+                raise ValueError("fixed_full_transformer_finetuning dream reuse requires cleanrl_ppo_closer=true")
+            if imagination_batch_size % fixed_full_transformer_finetuning_dream_minibatches != 0 or imagination_batch_size // fixed_full_transformer_finetuning_dream_minibatches < 2:
+                raise ValueError("imagination_batch_size must be a multiple of fixed_full_transformer_finetuning_dream_minibatches, with at least 2 dreams in each minibatch")
+            if fixed_full_transformer_finetuning_steps % joint_dream_reuse_steps != 0:
+                raise ValueError("fixed_full_transformer_finetuning_steps must be a multiple of dream_minibatches x dream_epochs")
+        if exists(fixed_full_transformer_finetuning_target_kl) and (fixed_full_transformer_finetuning_target_kl <= 0. or joint_dream_reuse_steps == 1):
+            raise ValueError("fixed_full_transformer_finetuning_target_kl must be positive, and it requires dream reuse (dream_minibatches x dream_epochs > 1)")
+        if fixed_full_transformer_finetuning_value_lr_scale <= 0.:
+            raise ValueError("fixed_full_transformer_finetuning_value_lr_scale must be positive")
+        if fixed_full_transformer_finetuning_value_lr_scale != 1. and not cleanrl_ppo_closer:
+            raise ValueError("fixed_full_transformer_finetuning_value_lr_scale requires cleanrl_ppo_closer=true")
+        if fixed_full_transformer_finetuning_reanchor_steps < 0 or fixed_full_transformer_finetuning_reanchor_learning_rate <= 0.:
+            raise ValueError("fixed_full_transformer_finetuning_reanchor_steps must be >= 0 and its learning rate positive")
 
         joint_finetune_steps = fixed_full_transformer_finetuning_steps
         effective_world_model_train_steps = 0
@@ -4351,8 +4997,9 @@ def main(
                 if exists(storage):
                     print(f"offline pretrain directory {offline_pretrain_path} -> {storage}")
 
-            offline_overrides["pretrain_tokenizer_observations"] = int(
-                (offline_dataset.lens[offline_data_split.train] + 1).sum()
+            offline_overrides["pretrain_tokenizer_observations"] = (
+                len(np.load(offline_tokenizer_observations, mmap_mode = "r")) if exists(offline_tokenizer_observations)
+                else int((offline_dataset.lens[offline_data_split.train] + 1).sum())
             )
         elif offline_rl_stage:
             # Check the signature before any expensive setup. A resumed run
@@ -4388,6 +5035,12 @@ def main(
 
     if compile is None:
         compile = device.type == "cuda"
+
+    # torch.distributions checks the parameters (and the values of log_prob) of each new distribution, and each check
+    # copies a flag from the GPU to the host. The checks do not change a value, so without them the rollout, the
+    # generation, and the PPO loss give the same outputs with fewer waits for the GPU.
+    if disable_distribution_validation and device.type == "cuda":
+        torch.distributions.Distribution.set_default_validate_args(False)
 
     configure_sac(activation_memory_budget)
 
@@ -4493,9 +5146,11 @@ def main(
                 device = device,
                 writer = writer,
                 training_profiler = training_profiler,
+                cosine_lr_schedule = tokenizer_cosine_lr_schedule,
             ),
             writer = writer,
             device = device,
+            observations_path = offline_tokenizer_observations,
         )
     elif offline_rl_stage:
         # The pretrained checkpoint, or the loop checkpoint on resume, holds the tokenizer.
@@ -4522,6 +5177,7 @@ def main(
             device = device,
             writer = writer,
             training_profiler = training_profiler,
+            cosine_lr_schedule = tokenizer_cosine_lr_schedule,
         )
 
     tokenizer.eval()
@@ -4580,6 +5236,7 @@ def main(
         num_spatial_tokens = num_latent_tokens,
         num_register_tokens = 1,
         dim_critic_state = obs_dim,
+        value_input_skips_critic_state = value_input_skips_critic_state,
         depth = depth,
         time_block_every = time_block_every,
         transformer_kwargs = dict(
@@ -4588,6 +5245,7 @@ def main(
             attn_pool_einsum_attend = attn_pool_einsum_attend,
             attn_res = attn_res,
             attn_res_block_size = attn_res_block_size,
+            **(dict(time_cache_max_lookback = kv_cache_lookback) if limit_kv_cache_lookback else dict()),
         ),
         final_special_cross_attn = final_special_cross_attn,
         num_discrete_actions = 0,
@@ -4610,6 +5268,8 @@ def main(
         agent_predicts_state = agent_predicts_state,
         agent_state_pred_loss_weight = agent_state_pred_loss_weight,
         prob_shortcut_train = prob_shortcut_train,
+        clean_context_frame_prob = world_model_clean_context_frame_prob,
+        clean_context_frame_noise = world_model_clean_context_frame_noise,
         policy_all_tokens = policy_all_tokens,
         gae_discount_factor = 0.99,
         reinforce_discount_factor = reinforce_discount_factor,
@@ -4630,6 +5290,7 @@ def main(
         old_pmpo = old_pmpo,
         old_reward_head = old_reward_head,
         old_terminal_head = old_terminal_head,
+        **(dict(small_terminal_head = True) if small_terminal_head else dict()),
         old_dynamics_ff = old_dynamics_ff,
         old_policy_head = old_policy_head,
         old_value_head = old_value_head,
@@ -4683,10 +5344,23 @@ def main(
         # add_policy_head_to_world_optimizer). The heads thus get the world-model lr, weight decay, and update rule.
         # With closer PPO, the group keeps the agent lr of that objective (the loop sets its linear decay).
         agent_param_set = set(world_model.agent_parameters())
-        world_optimizer.add_param_group(dict(
-            params = [param for param in world_model.parameters() if param in agent_param_set],
-            **(dict(lr = agent_learning_rate) if cleanrl_ppo_closer else dict()),
-        ))
+        if fixed_full_transformer_finetuning_value_lr_scale == 1.:
+            world_optimizer.add_param_group(dict(
+                params = [param for param in world_model.parameters() if param in agent_param_set],
+                **(dict(lr = agent_learning_rate) if cleanrl_ppo_closer else dict()),
+            ))
+        else:
+            # fixed_full_transformer_finetuning_value_lr_scale: the policy head group, then the value head group with
+            # the scaled lr (closer PPO only). The loop sets the linear decay of both.
+            value_param_set = set(world_model.value_head_parameters())
+            for in_value_group in (False, True):
+                world_optimizer.add_param_group(dict(
+                    params = [
+                        param for param in world_model.parameters()
+                        if param in agent_param_set and (param in value_param_set) == in_value_group
+                    ],
+                    lr = agent_learning_rate * (fixed_full_transformer_finetuning_value_lr_scale if in_value_group else 1.),
+                ))
 
         owners = [param for group in world_optimizer.param_groups for param in group["params"]]
         assert len(owners) == len(set(owners)) and set(owners) == set(world_model.parameters()), (
@@ -4823,6 +5497,14 @@ def main(
         policy_prior = FrozenModelPolicyPrior(world_model).to(device)
 
     head_reanchor = None
+    rl_policy_slot = None
+    # The EMA norm estimates of the trunk gradient ratio persist across loops.
+    joint_trunk_gradient = JointTrunkGradientRatio(
+        world_model,
+        trunk_grad_ratio = fixed_full_transformer_finetuning_trunk_grad_ratio,
+        max_scale = fixed_full_transformer_finetuning_trunk_grad_max_scale,
+        norm_ema_decay = fixed_full_transformer_finetuning_trunk_grad_norm_ema_decay,
+    ) if exists(fixed_full_transformer_finetuning_trunk_grad_ratio) and fixed_full_transformer_finetuning_trunk_grad_ratio > 0. else None
     if reanchor_heads_after_world_model_updates:
         head_reanchor = HeadReanchor(
             world_model,
@@ -4878,7 +5560,9 @@ def main(
         clamp_generated_latents = not fixed_full_transformer_finetuning,
         # The joint learner uses the eager forward. The compiled forward gives other outputs for the first generated
         # frame (EagerWithoutTimeCacheCallable), so the rollout uses the eager forward for that frame too.
-        eager_generate_without_time_cache = fixed_full_transformer_finetuning,
+        # eager_first_dream_frame applies the same fix to the other runs (report/10-19-26-world-model-weakness).
+        eager_generate_without_time_cache = fixed_full_transformer_finetuning or eager_first_dream_frame,
+        rollout_policy_cudagraph = rollout_policy_cudagraph,
     )
 
     if offline_pretrain_stage:
@@ -5046,6 +5730,7 @@ def main(
                         store_old_action_unembeds = False,
                         obs_to_latents_fn = obs_to_latents_fn(tokenizer),
                         forward_fn = compile_runtime.interact_forward,
+                        policy_step_fn = compile_runtime.interact_policy_step,
                     )
 
                 rollout_seconds = perf_counter() - rollout_start
@@ -5212,6 +5897,39 @@ def main(
                     rng = head_reanchor_rng,
                 ))
 
+        if rl_policy_loss_in_world_model_updates and effective_world_model_train_steps > 0:
+            if not exists(rl_policy_slot):
+                rl_policy_slot = RLPolicySlot(
+                    world_model,
+                    world_optimizer,
+                    trunk_grad_ratio = rl_policy_loss_trunk_grad_ratio,
+                    max_scale = rl_policy_loss_max_scale,
+                    norm_ema_decay = rl_policy_loss_norm_ema_decay,
+                    micro_batch_size = rl_policy_loss_dream_micro_batch_size,
+                )
+            # The dream generator of this loop: the replay of this loop for the prompts, and the batch size and
+            # compiled generate of the imagination phase (one compiled shape). Only its generate() runs.
+            rl_policy_slot.set_dream_source(JointImaginationLoss(
+                world_model,
+                None,
+                replay,
+                objective = objective,
+                value_loss_weight = 0.,
+                generate_rollout_fn = compile_runtime.generate_rollout,
+                batch_size = imagination_batch_size,
+                horizon = imagination_horizon,
+                prompt_length = imagination_prompt_length,
+                static_generate_shape = compile_generate and static_compile_shapes,
+                loss_weight = 1.,
+                micro_batch_size = rl_policy_loss_dream_micro_batch_size,
+                use_delight_gating = False,
+                grad_diagnostics = False,
+                autocast_bf16 = False,
+                global_step = wm_step,
+                writer = writer,
+                training_profiler = training_profiler,
+            ))
+
         wm_step, wm_metrics = train_world_model(
             world_model,
             world_optimizer,
@@ -5239,6 +5957,7 @@ def main(
             rehearsal_replay = offline_rehearsal_replay,
             rehearsal_fraction = offline_rehearsal_fraction,
             flip_onset_window_fraction = world_model_flip_onset_window_fraction,
+            extra_grad_fn = rl_policy_slot if rl_policy_loss_in_world_model_updates else None,
         )
 
         if exists(head_reanchor):
@@ -5285,6 +6004,7 @@ def main(
             cleanrl_updated_ppo_constant_learning_rate = cleanrl_updated_ppo_constant_learning_rate,
             cleanrl_updated_ppo_shuffle_generator = cleanrl_updated_ppo_shuffle_generator,
             cleanrl_updated_ppo_metric_step = env_step if cleanrl_ppo_closer else None,
+            cleanrl_ppo_closer_deferred_metrics = cleanrl_ppo_closer_deferred_metrics,
             reuse_ppo_dream_batch = reuse_ppo_dream_batch,
             ppo_reuse_epochs = ppo_reuse_epochs,
             ppo_reuse_num_minibatches = ppo_reuse_num_minibatches,
@@ -5316,12 +6036,30 @@ def main(
                 global_step = imagination_step,
                 writer = writer,
                 training_profiler = training_profiler,
+                trunk_gradient = joint_trunk_gradient,
+                dream_minibatches = fixed_full_transformer_finetuning_dream_minibatches,
+                dream_epochs = fixed_full_transformer_finetuning_dream_epochs,
+                target_kl = fixed_full_transformer_finetuning_target_kl,
+                detach_trunk = fixed_full_transformer_finetuning_trunk_grad_ratio == 0.,
+                reanchor = JointHeadReanchor(
+                    world_model,
+                    steps = fixed_full_transformer_finetuning_reanchor_steps,
+                    learning_rate = fixed_full_transformer_finetuning_reanchor_learning_rate,
+                    prompt_length = imagination_prompt_length,
+                    chunk_size = default(fixed_full_transformer_finetuning_dream_micro_batch_size, world_model_micro_batch_size),
+                ) if fixed_full_transformer_finetuning_reanchor_steps > 0 else None,
             )
             world_optimizer.zero_grad(set_to_none = True)
 
             if cleanrl_ppo_closer:
                 # The linear lr decay of closer PPO, on the group of the policy and value heads (the last group).
-                world_optimizer.param_groups[-1]["lr"] = (1. if cleanrl_updated_ppo_constant_learning_rate else 1. - loop / num_loops) * agent_learning_rate
+                head_learning_rate = (1. if cleanrl_updated_ppo_constant_learning_rate else 1. - loop / num_loops) * agent_learning_rate
+                if fixed_full_transformer_finetuning_value_lr_scale == 1.:
+                    world_optimizer.param_groups[-1]["lr"] = head_learning_rate
+                else:
+                    # The policy head group, then the value head group (add_agent_heads_to_world_optimizer).
+                    world_optimizer.param_groups[-2]["lr"] = head_learning_rate
+                    world_optimizer.param_groups[-1]["lr"] = head_learning_rate * fixed_full_transformer_finetuning_value_lr_scale
 
             wm_step, wm_metrics = train_world_model(
                 world_model,
@@ -5347,6 +6085,9 @@ def main(
                 rehearsal_fraction = offline_rehearsal_fraction,
                 extra_loss_fn = joint_rl_loss,
                 grad_clip_groups = joint_finetune_clip_groups(world_model, world_optimizer),
+                extra_grad_fn = joint_trunk_gradient,
+                post_step_fn = joint_rl_loss.after_optimizer_step if fixed_full_transformer_finetuning_reanchor_steps > 0 else None,
+                flip_onset_window_fraction = world_model_flip_onset_window_fraction,
             )
             imagination_step, imagination_metrics = joint_rl_loss.global_step, joint_rl_loss.last_metrics
 

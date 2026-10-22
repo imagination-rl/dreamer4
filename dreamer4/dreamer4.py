@@ -3231,10 +3231,14 @@ class AxialSpaceTimeTransformer(Module):
         spatial_flex_attention_backend = 'AUTO',
         h_net_layer: int | None = None,
         h_net_kwargs: dict | None = None,
-        final_special_cross_attn: bool | None = None
+        final_special_cross_attn: bool | None = None,
+        time_cache_max_lookback: int | None = None   # keep only the last N time steps in the KV cache (None keeps all)
     ):
         super().__init__()
         self.full_spatial_attn = full_spatial_attn
+
+        assert not exists(time_cache_max_lookback) or time_cache_max_lookback >= 1
+        self.time_cache_max_lookback = time_cache_max_lookback
         self.spatial_flex_attention_backend = spatial_flex_attention_backend
 
         # attention
@@ -3440,8 +3444,17 @@ class AxialSpaceTimeTransformer(Module):
 
         has_kv_cache = exists(kv_cache)
 
+        # with a lookback limit the cache holds fewer steps than the time steps seen, and the
+        # rotary positions continue from the count of time steps seen (cache.token_count)
+
+        max_lookback = self.time_cache_max_lookback
+        position_offset = None
+
         if has_kv_cache:
             token_count = kv_cache.shape[-2]
+
+            if exists(max_lookback):
+                position_offset = cache.token_count
 
         past_tokens = tokens[:, :0]
 
@@ -3510,7 +3523,7 @@ class AxialSpaceTimeTransformer(Module):
 
         # positional embs
 
-        time_pos_emb = self.time_rotary(time, offset = token_count)
+        time_pos_emb = self.time_rotary(time, offset = default(position_offset, token_count))
 
         space_pos_emb = None
         space_pope_pos_emb_indices = None
@@ -3791,13 +3804,20 @@ class AxialSpaceTimeTransformer(Module):
         if not return_intermediates:
             return inverse_pack(out)
 
+        next_kv_cache = safe_stack(time_attn_kv_caches)
+        next_token_count = token_count + time
+
+        if exists(max_lookback):
+            next_token_count = default(position_offset, token_count) + time
+            next_kv_cache = maybe(lambda kv: kv[..., -max_lookback:, :])(next_kv_cache)
+
         intermediates = TransformerIntermediates(
-            safe_stack(time_attn_kv_caches),
+            next_kv_cache,
             safe_stack(normed_time_attn_inputs),
             safe_stack(normed_space_attn_inputs),
             safe_stack(rnn_hiddens),
             hiddens,
-            token_count + time,
+            next_token_count,
             next_spatial_module_caches,
             h_net_loss,
             next_h_net_cache
@@ -5563,6 +5583,7 @@ class DynamicsWorldModel(Module):
         use_hl_gauss_actor_critic: bool = False,
         use_baseline_symexp_value_head_init: bool = False,
         critic_state_embedder: Module | None = None,
+        value_input_skips_critic_state: bool = False,
         reward_encoder_kwargs: dict = dict(),
         value_encoder_kwargs: dict | None = None,
         hl_gauss_actor_critic_kwargs: dict | None = None,
@@ -5582,6 +5603,8 @@ class DynamicsWorldModel(Module):
         use_time_rnn = False,
         loss_weight_fn: Callable = ramp_weight,
         prob_shortcut_train = None,                  # probability of shortcut training, defaults to 1 - 1 / num_step_sizes
+        clean_context_frame_prob = 0.,               # opt-in: probability that a training frame is clean context (no latent loss)
+        clean_context_frame_noise = 0.,              # opt-in: noise mix of the clean context frames, as context_signal_noise of generate()
         add_reward_embed_to_agent_token = False,
         add_action_embed_to_agent_token = False,
         add_reward_embed_dropout = 0.1,
@@ -5645,6 +5668,7 @@ class DynamicsWorldModel(Module):
         old_pmpo = False,
         old_reward_head = False,
         old_terminal_head = False,
+        small_terminal_head = False,               # terminal MLPs of width dim instead of dim * 4 (the default head holds most of the parameters)
         old_dynamics_ff = False,
         old_policy_head = False,
         old_value_head = False,
@@ -5731,6 +5755,9 @@ class DynamicsWorldModel(Module):
         self.old_pmpo = old_pmpo
         self.old_reward_head = old_reward_head
         self.old_terminal_head = old_terminal_head
+
+        if small_terminal_head and old_terminal_head:
+            raise ValueError('`small_terminal_head` and `old_terminal_head` exclude each other')
         self.old_dynamics_ff = old_dynamics_ff
         self.old_policy_head = old_policy_head
         self.old_value_head = old_value_head
@@ -5856,6 +5883,11 @@ class DynamicsWorldModel(Module):
         else:
             self.critic_state_embedder = None
 
+        # The dreams have no critic state, so the critic state embedder never trains. With this flag the value input
+        # does not add its (random) output, and the values of interact_with_env match the value head of the dreams.
+
+        self.value_input_skips_critic_state = value_input_skips_critic_state
+
         if self.has_proprio:
             self.to_proprio_token = nn.Linear(dim_proprio, dim)
 
@@ -5884,6 +5916,16 @@ class DynamicsWorldModel(Module):
         self.step_size_embed = nn.Embedding(self.num_step_sizes_log2, dim_half) # power of 2, so 1/1, 1/2, 1/4, 1/8 ... 1/Kmax
 
         self.prob_shortcut_train = default(prob_shortcut_train, 1. - self.num_step_sizes_log2 ** -1.)
+
+        # Opt-in (report/10-19-26-world-model-weakness). generate() reads clean context frames (signal level
+        # max_steps - 1), but the default training noises each frame, and shortcut samples put every frame on the coarse
+        # grid of their step size. With this probability, a training frame is clean and only serves as context.
+
+        assert 0. <= clean_context_frame_prob < 1.
+        self.clean_context_frame_prob = clean_context_frame_prob
+
+        assert 0. <= clean_context_frame_noise < 1.
+        self.clean_context_frame_noise = clean_context_frame_noise
 
         # loss related
 
@@ -6189,14 +6231,19 @@ class DynamicsWorldModel(Module):
             else:
                 self.terminal_action_embedder, self.terminal_action_learned_embed, self.to_terminal_action_embed = create_action_embed_modules(self.action_embedder, 'silu')
 
+                # The default ensemble member is dim -> 4 dim -> 4 dim -> 4 dim -> 1 (about 4.7 M parameters for dim 128).
+                # The small member is dim -> dim -> dim -> 1, about the size of the reward head.
+                terminal_mlp_dim = dim if small_terminal_head else dim * 4
+                terminal_mlp_depth = predict_terminal_mlp_kwargs.get('depth', 1) if small_terminal_head else max(2, predict_terminal_mlp_kwargs.get('depth', 2))
+
                 self.to_agent_embed_terminal_pred = Ensemble(
                     Sequential(
                         RMSNorm(dim),
                         create_mlp(
                             dim_in = dim,
-                            dim = dim * 4,
+                            dim = terminal_mlp_dim,
                             dim_out = 1,
-                            depth = max(2, predict_terminal_mlp_kwargs.get('depth', 2)),
+                            depth = terminal_mlp_depth,
                             squeeze_out = True,
                             activation = get_activation(state_terminal_pred_mlp_activation)
                         )
@@ -6772,6 +6819,42 @@ class DynamicsWorldModel(Module):
 
     # interacting with env for experience
 
+    def rollout_policy_step(self, one_policy_input, value_embed):
+        """The heads of one interact_with_env step: value, policy embed, sampled actions, env actions, log probs."""
+
+        value_bins = self.value_head(value_embed)
+        value = self.value_encoder.bins_to_scalar_value(value_bins)
+
+        policy_embed = self.policy_head(one_policy_input)
+
+        sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(policy_embed, pred_head_index = 0, squeeze = True)
+
+        # format actions for the environment, rescaling bounded distributions to target range
+
+        env_continuous_actions = sampled_continuous_actions
+
+        if exists(env_continuous_actions) and exists(self.action_embedder.continuous_target_action_range):
+            env_continuous_actions = self.action_embedder.rescale_for_env(env_continuous_actions)
+            min_val, max_val = self.action_embedder.continuous_target_action_range
+            env_continuous_actions = env_continuous_actions.clamp(min_val, max_val)
+
+        one_discrete_log_probs, one_continuous_log_probs = self.action_embedder.log_probs(
+            policy_embed,
+            pred_head_index = 0,
+            discrete_targets = sampled_discrete_actions,
+            continuous_targets = sampled_continuous_actions
+        )
+
+        return (
+            value,
+            policy_embed,
+            sampled_discrete_actions,
+            sampled_continuous_actions,
+            env_continuous_actions,
+            one_discrete_log_probs,
+            one_continuous_log_probs,
+        )
+
     @torch.no_grad()
     def interact_with_env(
         self,
@@ -6786,9 +6869,12 @@ class DynamicsWorldModel(Module):
         store_old_action_unembeds = True,
         obs_to_latents_fn = None,
         forward_fn = None,
+        policy_step_fn = None,
     ):
         device = self.device
         forward_fn = default(forward_fn, self.forward)
+        # policy_step_fn replaces rollout_policy_step, for example by a CUDA graph of the same heads.
+        policy_step_fn = default(policy_step_fn, self.rollout_policy_step)
 
         def flags_to_host(flags):
             if is_tensor(flags):
@@ -6954,39 +7040,27 @@ class DynamicsWorldModel(Module):
 
             value_embed = one_critic_agent_embed
 
-            if exists(self.critic_state_embedder) and exists(state_frame):
+            if exists(self.critic_state_embedder) and exists(state_frame) and not self.value_input_skips_critic_state:
                 critic_embed = self.critic_state_embedder(state_frame.to(device))
                 value_embed = value_embed + rearrange(critic_embed, 'b d -> b 1 d')
 
-            value_bins = self.value_head(value_embed)
-            value = self.value_encoder.bins_to_scalar_value(value_bins)
-            values = safe_cat((values, value), dim = 1)
+            (
+                value,
+                policy_embed,
+                sampled_discrete_actions,
+                sampled_continuous_actions,
+                env_continuous_actions,
+                one_discrete_log_probs,
+                one_continuous_log_probs,
+            ) = policy_step_fn(one_policy_input, value_embed)
 
-            policy_embed = self.policy_head(one_policy_input)
+            values = safe_cat((values, value), dim = 1)
 
             if store_old_action_unembeds:
                 acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
-            sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(policy_embed, pred_head_index = 0, squeeze = True)
-
-            # format actions for the environment, rescaling bounded distributions to target range
-
-            env_continuous_actions = sampled_continuous_actions
-
-            if exists(env_continuous_actions) and exists(self.action_embedder.continuous_target_action_range):
-                env_continuous_actions = self.action_embedder.rescale_for_env(env_continuous_actions)
-                min_val, max_val = self.action_embedder.continuous_target_action_range
-                env_continuous_actions = env_continuous_actions.clamp(min_val, max_val)
-
             discrete_actions = safe_cat((discrete_actions, sampled_discrete_actions), dim = 1)
             continuous_actions = safe_cat((continuous_actions, sampled_continuous_actions), dim = 1)
-
-            one_discrete_log_probs, one_continuous_log_probs = self.action_embedder.log_probs(
-                policy_embed,
-                pred_head_index = 0,
-                discrete_targets = sampled_discrete_actions,
-                continuous_targets = sampled_continuous_actions
-            )
 
             discrete_log_probs = safe_cat((discrete_log_probs, one_discrete_log_probs), dim = 1)
             continuous_log_probs = safe_cat((continuous_log_probs, one_continuous_log_probs), dim = 1)
@@ -7165,7 +7239,7 @@ class DynamicsWorldModel(Module):
                 one_policy_input = self.select_policy_input(embeds, agent_index)[:, -1:] if self.policy_all_tokens else one_actor_agent_embed
                 value_embed = one_agent_embed
 
-                if exists(self.critic_state_embedder) and exists(state_frame):
+                if exists(self.critic_state_embedder) and exists(state_frame) and not self.value_input_skips_critic_state:
                     critic_embed = self.critic_state_embedder(state_frame.to(device))
                     value_embed = value_embed + rearrange(critic_embed, 'b d -> b 1 d')
 
@@ -7675,7 +7749,7 @@ class DynamicsWorldModel(Module):
 
         # maybe critic asymmetric state
 
-        if exists(self.critic_state_embedder) and exists(critic_state):
+        if exists(self.critic_state_embedder) and exists(critic_state) and not self.value_input_skips_critic_state:
             critic_embeds = self.critic_state_embedder(critic_state)
 
             if critic_embeds.ndim == 3 and value_agent_embeds.ndim == 4:
@@ -8941,6 +9015,12 @@ class DynamicsWorldModel(Module):
                     step_sizes_log2 = zeros((batch,), device = device).long() # zero because zero is equivalent to step size of 1
                     signal_levels = _randint(0, self.max_steps, (batch, time), device = device)
 
+        clean_frame_mask = None
+
+        if not is_inference and self.clean_context_frame_prob > 0.:
+            clean_frame_mask = rand((batch, time), device = device) < self.clean_context_frame_prob
+            signal_levels = signal_levels.masked_fill(clean_frame_mask, self.max_steps - 1)
+
         # times is from 0 to 1
 
         times = self.get_times_from_signal_level(signal_levels)
@@ -8950,6 +9030,11 @@ class DynamicsWorldModel(Module):
 
             # update signal levels for the embeddings so it reflects the modified noise level
             signal_levels = (times * self.max_steps).long().clamp(0, self.max_steps - 1)
+
+        if exists(clean_frame_mask) and self.clean_context_frame_noise > 0.:
+            # Opt-in: a clean frame gets the light noise of the dream context. generate() mixes the context with
+            # context_signal_noise and labels it max_steps - 1, so the clean frames keep that label.
+            times = times.masked_fill(clean_frame_mask, 1. - self.clean_context_frame_noise)
 
         if not latent_is_noised:
             # get the noise
@@ -9370,6 +9455,16 @@ class DynamicsWorldModel(Module):
             # get second prediction for b''
 
             signal_levels_plus_half_step = shortcut_signal_levels + half_step_size[:, None]
+
+            if exists(clean_frame_mask):
+                # The clean frames have no shortcut loss. Keep their second signal level in the embedding range.
+                signal_levels_plus_half_step = signal_levels_plus_half_step.clamp(max = self.max_steps - 1)
+
+                # A clean frame is context and does not move in the half step. Its flow (x - z) / (1 - 63 / 64) is 64 x
+                # the error of x, so a move gives a wrong context to the second prediction.
+                clean_frame_mask_aligned, _ = align_dims_left((clean_frame_mask, denoised))
+                denoised = torch.where(clean_frame_mask_aligned, noised, denoised)
+
             second_noised = denoised
             second_noised_proprio = None
 
@@ -9448,6 +9543,12 @@ class DynamicsWorldModel(Module):
         else:
             flow_loss = flow_losses.mean()
             shortcut_flow_loss = shortcut_flow_losses.mean() if should_compute_shortcut else self.zero
+
+        if exists(clean_frame_mask):
+            # Only the noised frames give latent losses. The clean frames are context.
+            latent_loss_mask = loss_mask & ~clean_frame_mask if is_var_len else ~clean_frame_mask
+            flow_loss = masked_mean(flow_losses, latent_loss_mask)
+            shortcut_flow_loss = masked_mean(shortcut_flow_losses, latent_loss_mask) if should_compute_shortcut else self.zero
 
         # now take care of the agent token losses
 

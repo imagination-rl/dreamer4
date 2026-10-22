@@ -2159,6 +2159,66 @@ def test_cache_token_count():
     _, cache2 = model(x2, cache = cache, return_intermediates = True)
     assert cache2.token_count == 3
 
+def test_time_cache_max_lookback_attends_only_to_recent_steps():
+    from dreamer4 import AxialSpaceTimeTransformer
+
+    # depth 3 with time_block_every 2 has one time layer, so a cached K/V entry depends on its own frame only.
+    # The rotary positions are relative, so a step with a limited cache equals a fresh forward over the last
+    # lookback + 1 frames. A position offset from the cache length (not the true step count) fails this.
+
+    kwargs = dict(dim = 32, depth = 3, attn_heads = 2, attn_dim_head = 16, time_block_every = 2, num_special_tokens = 0)
+    lookback, steps = 3, 7
+
+    torch.manual_seed(0)
+    full = AxialSpaceTimeTransformer(**kwargs).eval()
+    limited = AxialSpaceTimeTransformer(**kwargs, time_cache_max_lookback = lookback).eval()
+    limited.load_state_dict(full.state_dict())
+
+    tokens = torch.randn(2, steps, 5, 32)
+    cache = None
+
+    with torch.no_grad():
+        for t in range(steps):
+            out, cache = limited(tokens[:, t:t + 1], cache = cache, return_intermediates = True)
+
+            assert cache.token_count == t + 1
+            assert cache.next_kv_cache.shape[-2] == min(t + 1, lookback)
+
+            expected = full(tokens[:, max(0, t - lookback):t + 1])[:, -1:]
+            assert torch.allclose(out, expected, atol = 1e-5)
+
+def test_small_terminal_head_changes_only_the_terminal_ensemble():
+    torch.manual_seed(0)
+    default = _small_flag_dynamics(num_continuous_actions = 2)
+    small = _small_flag_dynamics(num_continuous_actions = 2, small_terminal_head = True)
+
+    default_shapes = {name: param.shape for name, param in default.named_parameters()}
+    small_shapes = {name: param.shape for name, param in small.named_parameters()}
+
+    changed = {name for name in default_shapes if default_shapes[name] != small_shapes.get(name)}
+    assert changed and all(name.startswith('to_agent_embed_terminal_pred.') for name in changed)
+
+    def num_params(module):
+        return sum(param.numel() for param in module.parameters())
+
+    assert num_params(small.to_agent_embed_terminal_pred) * 10 < num_params(default.to_agent_embed_terminal_pred)
+
+    latents = torch.randn(2, 4, 2, 8)
+    loss = small(
+        latents = latents,
+        continuous_actions = torch.rand(2, 4, 2) * 2 - 1,
+        rewards = torch.randn(2, 4),
+        terminals = torch.tensor([True, False]),
+        signal_levels = torch.randint(0, 8, (2, 4)),
+        step_sizes_log2 = torch.randint(1, 3, (2,)),
+    )
+    loss.backward()
+
+    assert all(param.grad is not None for param in small.to_agent_embed_terminal_pred.parameters())
+
+    with pytest.raises(ValueError, match = 'exclude each other'):
+        _small_flag_dynamics(small_terminal_head = True, old_terminal_head = True)
+
 def test_images_to_video_tokenizer():
     import torch
     from dreamer4 import VideoTokenizer, DynamicsWorldModel, AxialSpaceTimeTransformer
@@ -4227,3 +4287,94 @@ def test_dynamics_world_model_trains_and_generates_with_attention_residuals(mode
 
     generations = dynamics.generate(time_steps = 4, batch_size = 2, use_time_cache = True, return_rewards_per_frame = True)
     assert generations.latents.shape[:2] == (2, 4)
+
+@param('shortcut', (False, True))
+def test_clean_context_frames_have_no_latent_loss(shortcut):
+    import torch
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    torch.manual_seed(0)
+    world_model = DynamicsWorldModel(
+        dim = 16, dim_latent = 4, max_steps = 8, num_latent_tokens = 1, num_spatial_tokens = 1,
+        depth = 1, time_block_every = 1, attn_heads = 1, attn_dim_head = 8, num_continuous_actions = 2,
+        prob_shortcut_train = float(shortcut), clean_context_frame_prob = 0.5,
+    )
+    latents = torch.randn(3, 6, 1, 1, 4)
+    actions = torch.rand(3, 6, 2)
+    lens = torch.tensor((6, 6, 4))
+
+    seen_levels = []
+    get_times = world_model.get_times_from_signal_level
+
+    def record_levels(signal_levels, *args, **kwargs):
+        seen_levels.append(signal_levels.clone())
+        return get_times(signal_levels, *args, **kwargs)
+
+    world_model.get_times_from_signal_level = record_levels
+    loss, losses = world_model(latents = latents, continuous_actions = actions, lens = lens, latent_has_view_dim = True, return_all_losses = True)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    levels = seen_levels[0]
+    # Clean frames are at the top signal level, which shortcut samples never reach on their grid.
+    assert (levels == world_model.max_steps - 1).any()
+    assert all(torch.isfinite(p.grad).all() for p in world_model.parameters() if p.grad is not None)
+
+    if shortcut:
+        # The three predictions of a shortcut step: the main one, then the two half steps. The clean frames keep their
+        # input latents in the second half step (they are context, not targets).
+        world_model.get_times_from_signal_level = get_times
+        inputs = []
+        hook = world_model.latents_to_spatial_tokens.register_forward_pre_hook(lambda module, args: inputs.append(args[0].detach().clone()))
+        torch.manual_seed(1)
+        world_model(latents = latents, continuous_actions = actions, lens = lens, latent_has_view_dim = True, return_all_losses = True)
+        hook.remove()
+        main, first, second = inputs
+        assert torch.equal(main, first)
+        clean = (first - second).flatten(2).abs().amax(-1) == 0
+        assert clean.any() and not clean.all()
+
+    # A model where every frame is clean context has no latent loss to learn from: the flow loss is 0.
+    world_model.clean_context_frame_prob = 0.999999
+    _, losses = world_model(latents = latents, continuous_actions = actions, lens = lens, latent_has_view_dim = True, return_all_losses = True)
+    assert losses.flow.abs().item() < 1e-6
+
+def test_clean_context_frame_noise_matches_dream_context():
+    import torch
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    torch.manual_seed(0)
+    world_model = DynamicsWorldModel(
+        dim = 16, dim_latent = 4, max_steps = 8, num_latent_tokens = 1, num_spatial_tokens = 1,
+        depth = 1, time_block_every = 1, attn_heads = 1, attn_dim_head = 8, num_continuous_actions = 2,
+        prob_shortcut_train = 0., clean_context_frame_prob = 0.5,
+    )
+    latents = torch.randn(4, 6, 1, 1, 4)
+    actions = torch.rand(4, 6, 2)
+
+    def inputs_and_levels(noise):
+        # the same seed gives the same levels, clean frames and noise; only the noise mix of the clean frames changes
+        world_model.clean_context_frame_noise = noise
+        inputs, levels = [], []
+        get_times = world_model.get_times_from_signal_level
+        world_model.get_times_from_signal_level = lambda signal_levels, *args, **kwargs: levels.append(signal_levels.clone()) or get_times(signal_levels, *args, **kwargs)
+        hook = world_model.latents_to_spatial_tokens.register_forward_pre_hook(lambda module, args: inputs.append(args[0].detach().clone()))
+        torch.manual_seed(1)
+        world_model(latents = latents, continuous_actions = actions, latent_has_view_dim = True, return_all_losses = True)
+        hook.remove()
+        del world_model.get_times_from_signal_level
+        return inputs[0].reshape(latents.shape), levels[0]
+
+    clean_input, levels = inputs_and_levels(0.)
+    dream_input, dream_levels = inputs_and_levels(0.3)
+    assert torch.equal(levels, dream_levels)
+
+    # A clean frame keeps the label max_steps - 1 and gets the dream mix 0.7 x + 0.3 noise in place of 7 / 8 x + 1 / 8 noise.
+    noise = (clean_input - latents * 7 / 8) * 8
+    expected = latents * 0.7 + noise * 0.3
+    top = levels == world_model.max_steps - 1
+    same = (dream_input - clean_input).flatten(2).abs().amax(-1) == 0
+    moved = (dream_input - expected).flatten(2).abs().amax(-1) < 1e-5
+    assert torch.all(same | (top & moved))
+    assert (top & moved & ~same).any()
+    assert same[~top].all()
