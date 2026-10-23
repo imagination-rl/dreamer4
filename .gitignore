@@ -4,6 +4,8 @@ data/
 logs_*/
 scripts/queue_*
 report/
+reports/
+notes/
 
 node_modules/
 package.json
