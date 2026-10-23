@@ -1,9 +1,21 @@
 *.sh
+!scripts/**
 data/
 logs_*/
+scripts/queue_*
+report/
+reports/
+notes/
+
+node_modules/
+package.json
+pnpm.yaml
+pnpm-lock.yaml
 
 logs/
 runs/
+
+AGENTS.md
 
 # slurm
 *.out

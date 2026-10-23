@@ -1,45 +1,93 @@
 import pytest
 param = pytest.mark.parametrize
 import torch
+from contextlib import nullcontext
 from einops import rearrange
 
 def exists(v):
     return v is not None
 
-@param('pred_orig_latent', (False, True))
-@param('grouped_query_attn', (False, True))
-@param('dynamics_with_video_input', (False, True))
-@param('prob_shortcut_train', (None, 1., 0.))
-@param('add_task_embeds', (False, True))
-@param('num_spatial_tokens', (2, 8))
-@param('signal_and_step_passed_in', (False, True))
-@param('condition_on_actions', (False, True))
-@param('add_reward_embed_to_agent_token', (False, True))
-@param('add_state_pred_head', (False, True))
-@param('use_time_cache', (False, True))
-@param('var_len', (False, True))
-@param('time_attention_use_pope', (False, True))
-@param('with_latent_ar_in_dynamics', (False, True))
-@param('with_latent_ar_action_conditioned', (False, True))
-@param('predict_terminals', (False, True))
-def test_e2e(
-    pred_orig_latent,
-    grouped_query_attn,
-    dynamics_with_video_input,
-    prob_shortcut_train,
-    add_task_embeds,
-    num_spatial_tokens,
-    signal_and_step_passed_in,
-    condition_on_actions,
-    add_reward_embed_to_agent_token,
-    add_state_pred_head,
-    use_time_cache,
-    var_len,
-    time_attention_use_pope,
-    with_latent_ar_in_dynamics,
-    with_latent_ar_action_conditioned,
-    predict_terminals
-):
+E2E_CASES = (
+    pytest.param({}, id = 'default'),
+    pytest.param(
+        dict(
+            pred_orig_latent = True,
+            grouped_query_attn = True,
+            num_spatial_tokens = 8,
+            dynamics_with_video_input = True,
+            add_task_embeds = True,
+        ),
+        id = 'video-task-grouped',
+    ),
+    pytest.param(
+        dict(
+            prob_shortcut_train = 1.,
+            signal_and_step_passed_in = True,
+            use_time_cache = True,
+            var_len = True,
+        ),
+        id = 'shortcut-cache-variable-length',
+    ),
+    pytest.param(
+        dict(
+            prob_shortcut_train = 0.,
+            with_latent_ar_in_dynamics = True,
+            with_latent_ar_action_conditioned = True,
+            condition_on_actions = True,
+        ),
+        id = 'latent-ar-action-conditioned',
+    ),
+    pytest.param(
+        dict(
+            add_reward_embed_to_agent_token = True,
+            add_state_pred_head = True,
+            predict_terminals = True,
+            time_attention_use_pope = True,
+        ),
+        id = 'agent-heads-and-pope',
+    ),
+)
+
+
+@param('case', E2E_CASES)
+def test_e2e(case):
+    settings = dict(
+        pred_orig_latent = False,
+        grouped_query_attn = False,
+        dynamics_with_video_input = False,
+        prob_shortcut_train = None,
+        add_task_embeds = False,
+        num_spatial_tokens = 2,
+        signal_and_step_passed_in = False,
+        condition_on_actions = False,
+        add_reward_embed_to_agent_token = False,
+        add_state_pred_head = False,
+        use_time_cache = False,
+        var_len = False,
+        time_attention_use_pope = False,
+        with_latent_ar_in_dynamics = False,
+        with_latent_ar_action_conditioned = False,
+        predict_terminals = False,
+    )
+    settings.update(case)
+    (
+        pred_orig_latent,
+        grouped_query_attn,
+        dynamics_with_video_input,
+        prob_shortcut_train,
+        add_task_embeds,
+        num_spatial_tokens,
+        signal_and_step_passed_in,
+        condition_on_actions,
+        add_reward_embed_to_agent_token,
+        add_state_pred_head,
+        use_time_cache,
+        var_len,
+        time_attention_use_pope,
+        with_latent_ar_in_dynamics,
+        with_latent_ar_action_conditioned,
+        predict_terminals,
+    ) = (settings[key] for key in settings)
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
     tokenizer = VideoTokenizer(
@@ -219,8 +267,50 @@ def test_hl_gauss_reward_encoder():
     reward_embeds = encoder.embed(probs)
     assert reward_embeds.shape == (10, 512)
 
+
+def test_world_model_reward_mae_combines_reward_heads_and_masks_invalid_targets():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    model = DynamicsWorldModel(
+        dim = 8,
+        dim_latent = 4,
+        max_steps = 8,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        num_discrete_actions = 0,
+        num_continuous_actions = 1,
+        continuous_dist_type = 'beta',
+        continuous_target_action_range = (-1., 1.),
+        multi_token_pred_len = 2,
+        reward_encoder_kwargs = dict(num_bins = 5),
+        value_encoder_kwargs = dict(num_bins = 5),
+        policy_head_mlp_depth = 1,
+        value_head_mlp_depth = 1,
+    )
+
+    model.reward_encoder.bins_to_scalar_value = lambda logits, normalize = True: logits.new_zeros(logits.shape[:-1])
+
+    _, losses = model(
+        latents = torch.randn(2, 4, 1, 4),
+        rewards = torch.tensor(((0., 1., 2., 3.), (0., 4., 5., 100.))),
+        continuous_actions = torch.zeros(2, 4, 1),
+        lens = torch.tensor((4, 2)),
+        return_all_losses = True,
+    )
+
+    latent_reward_mae = torch.tensor((1., 2., 3., 4., 5.)).mean()
+    agent_reward_mae = torch.tensor((1., 2., 2., 3., 3., 4., 5., 5.)).mean()
+    expected_reward_mae = (latent_reward_mae + agent_reward_mae) * 0.5
+
+    assert torch.allclose(losses.reward_mae, expected_reward_mae)
+    assert not losses.reward_mae.requires_grad
+
 def test_dynamics_world_model_defaults_to_hl_gauss_reward_encoder():
-    from dreamer4.dreamer4 import DynamicsWorldModel, HLGaussRewardEncoder, SymExpTwoHot
+    from dreamer4.dreamer4 import DynamicsWorldModel, HLGaussRewardEncoder, SymExpTwoHot, SymExpValueTwoHot, TDMPC2ValueTwoHot
 
     dynamics = DynamicsWorldModel(
         dim = 16,
@@ -245,6 +335,545 @@ def test_dynamics_world_model_defaults_to_hl_gauss_reward_encoder():
     )
 
     assert isinstance(dynamics.reward_encoder, SymExpTwoHot)
+    assert type(dynamics.value_encoder) is SymExpTwoHot
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        num_latent_tokens = 4,
+        depth = 1,
+        reward_encoder_type = 'hl_gauss',
+        use_symexp_value_head = True,
+        reward_encoder_kwargs = dict(num_bins = 20),
+        value_encoder_kwargs = dict(reward_range = (-10., 10.), num_bins = 255),
+    )
+
+    assert isinstance(dynamics.reward_encoder, HLGaussRewardEncoder)
+    assert isinstance(dynamics.value_encoder, SymExpValueTwoHot)
+    assert dynamics.value_encoder.bin_values[0].item() < -22000.
+    assert dynamics.value_encoder.bin_values[-1].item() > 22000.
+
+    value_logits = dynamics.value_head(torch.randn(3, 16))
+    values = dynamics.value_encoder.bins_to_scalar_value(value_logits)
+
+    assert torch.equal(values, torch.zeros_like(values))
+
+    with pytest.raises(ValueError, match = 'non-finite bins'):
+        SymExpValueTwoHot((-1200., 1200.))
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        num_latent_tokens = 4,
+        depth = 1,
+        reward_encoder_type = 'hl_gauss',
+        use_tdmpc2_value_head = True,
+        reward_encoder_kwargs = dict(num_bins = 20),
+        value_encoder_kwargs = dict(reward_range = (-10., 10.), num_bins = 101),
+    )
+
+    assert isinstance(dynamics.reward_encoder, HLGaussRewardEncoder)
+    assert isinstance(dynamics.value_encoder, TDMPC2ValueTwoHot)
+    assert dynamics.value_encoder.bin_values[0].item() < -22000.
+    assert dynamics.value_encoder.bin_values[-1].item() > 22000.
+
+    value_logits = dynamics.value_head(torch.randn(3, 16))
+    values = dynamics.value_encoder.bins_to_scalar_value(value_logits)
+
+    assert torch.equal(values, torch.zeros_like(values))
+
+
+def test_tdmpc2_value_two_hot_uses_symlog_targets_and_inverse_expected_symlog():
+    from dreamer4.dreamer4 import TDMPC2ValueTwoHot, symexp
+
+    encoder = TDMPC2ValueTwoHot(reward_range = (-10., 10.), num_bins = 101)
+    targets = torch.tensor([-1200., 0., 1200.])
+    probs = encoder(targets)
+    decoded = encoder.bins_to_scalar_value(probs, normalize = False)
+
+    torch.testing.assert_close(decoded, targets, rtol = 1e-5, atol = 1e-4)
+
+    probs = torch.zeros(1, 101)
+    probs[0, 50] = 0.99
+    probs[0, -1] = 0.01
+    decoded = encoder.bins_to_scalar_value(probs, normalize = False)
+
+    torch.testing.assert_close(decoded, symexp(torch.tensor([0.1])))
+
+    with pytest.raises(ValueError, match = 'non-finite bins'):
+        TDMPC2ValueTwoHot(reward_range = (-1200., 1200.), num_bins = 101)
+
+
+def test_special_value_head_encoders_are_mutually_exclusive():
+    with pytest.raises(ValueError, match = 'mutually exclusive'):
+        _small_flag_dynamics(
+            use_symexp_value_head = True,
+            use_tdmpc2_value_head = True,
+        )
+
+    with pytest.raises(ValueError, match = 'mutually exclusive'):
+        _small_flag_dynamics(
+            use_symexp_value_head = True,
+            use_symlog_hl_gauss_value_head = True,
+        )
+
+
+def test_symlog_hl_gauss_value_head_is_smooth_raw_decoded_and_zero_initialized():
+    from dreamer4.dreamer4 import HLGaussRewardEncoder
+
+    dynamics = _small_flag_dynamics(
+        use_symlog_hl_gauss_value_head = True,
+        value_encoder_kwargs = dict(
+            reward_range = (-10., 10.),
+            num_bins = 7,
+            sigma_to_bin_ratio = 0.75,
+            min_max_value_on_bin_center = False,
+            use_symlog = True,
+            decode_symlog_expected_raw = True,
+        ),
+    )
+
+    assert isinstance(dynamics.value_encoder, HLGaussRewardEncoder)
+    assert dynamics.value_encoder.use_symlog is True
+    assert dynamics.value_encoder.decode_symlog_expected_raw is True
+
+    logits = dynamics.value_head(torch.randn(3, 16))
+    values = dynamics.value_encoder.bins_to_scalar_value(logits)
+
+    assert torch.equal(logits, torch.zeros_like(logits))
+    assert torch.equal(values, torch.zeros_like(values))
+
+
+def test_hl_gauss_actor_critic_is_opt_in_and_owned_by_agent_optimizer():
+    from dreamer4.dreamer4 import Actions, Experience, HLGaussRewardEncoder, SymExpValueTwoHot
+
+    dynamics = _small_flag_dynamics(
+        use_symexp_value_head = True,
+        use_hl_gauss_actor_critic = True,
+        value_encoder_kwargs = dict(reward_range = (-10., 10.), num_bins = 7),
+        hl_gauss_actor_critic_kwargs = dict(
+            reward_range = (-1200., 1200.),
+            num_bins = 7,
+            sigma_to_bin_ratio = 0.75,
+            min_max_value_on_bin_center = False,
+        ),
+        num_continuous_actions = 2,
+        pmpo_kl_div_loss_weight = 0.,
+    )
+
+    assert isinstance(dynamics.value_encoder, SymExpValueTwoHot)
+    assert isinstance(dynamics.actor_critic_value_encoder, HLGaussRewardEncoder)
+    assert dynamics.actor_critic_value_head is not None
+    assert set(dynamics.actor_critic_value_head.parameters()) <= set(dynamics.agent_parameters())
+
+    batch, time = 2, 4
+    agent_embed = torch.randn(batch, time, 16)
+    with torch.no_grad():
+        actor_critic_logits = dynamics.actor_critic_value_head(agent_embed)
+        old_values = dynamics.actor_critic_value_encoder.bins_to_scalar_value(actor_critic_logits)
+
+    experience = Experience(
+        latents = torch.randn(batch, time, 2, 8),
+        agent_embed = agent_embed,
+        rewards = torch.randn(batch, time),
+        actions = Actions(None, torch.rand(batch, time, 2)),
+        log_probs = Actions(None, torch.zeros(batch, time, 2)),
+        values = old_values,
+        step_size = 1,
+        lens = torch.full((batch,), time, dtype = torch.long),
+        is_truncated = torch.ones(batch, dtype = torch.bool),
+        terminals = torch.zeros(batch, dtype = torch.bool),
+        is_from_world_model = True,
+    )
+    _, value_loss, diagnostics = dynamics.learn_from_experience(
+        experience,
+        objective = 'pmpo',
+        return_diagnostics = True,
+    )
+
+    assert {
+        'extra/actor_critic_value_abs_error',
+        'extra/critic_advantage_sign_disagreement',
+    } <= diagnostics.keys()
+
+    value_loss.backward()
+    assert any(param.grad is not None for param in dynamics.value_head.parameters())
+    assert any(param.grad is not None for param in dynamics.actor_critic_value_head.parameters())
+
+    with pytest.raises(ValueError, match = 'requires `use_symexp_value_head`'):
+        _small_flag_dynamics(use_hl_gauss_actor_critic = True)
+
+
+def _small_flag_dynamics(**kwargs):
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    value_encoder_kwargs = kwargs.pop('value_encoder_kwargs', dict(num_bins = 7))
+
+    return DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 4,
+        num_register_tokens = 2,
+        depth = 1,
+        time_block_every = 1,
+        max_steps = 8,
+        reward_encoder_kwargs = dict(num_bins = 7),
+        value_encoder_kwargs = value_encoder_kwargs,
+        **kwargs
+    )
+
+
+def test_opt_in_policy_all_tokens_uses_ordered_flattened_context_and_false_is_unchanged():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    current = _small_flag_dynamics(policy_all_tokens = False)
+    old = _small_flag_dynamics(policy_all_tokens = True)
+
+    assert current.policy_head.layers[0][0].in_features == 16
+    assert old.policy_num_tokens == 7
+    assert old.policy_head.layers[0][0].in_features == 7 * 16
+
+    latents = torch.randn(1, 3, 2, 8)
+    signal_levels = torch.zeros(1, 3, dtype = torch.long)
+    step_sizes_log2 = torch.zeros(1, dtype = torch.long)
+    _, (embeds, _) = old(
+        latents = latents,
+        signal_levels = signal_levels,
+        step_sizes_log2 = step_sizes_log2,
+        return_pred_only = True,
+        return_intermediates = True
+    )
+    assert embeds.actor.shape == (1, 3, 7 * 16)
+
+
+def test_old_behavior_flags_leave_model_default_state_unchanged_when_disabled():
+    torch.manual_seed(123)
+    implicit = _small_flag_dynamics()
+
+    torch.manual_seed(123)
+    explicit = _small_flag_dynamics(
+        add_action_embed_to_agent_token = False,
+        old_reward_shifting = False,
+        old_pmpo = False,
+        old_reward_head = False,
+        old_terminal_head = False,
+        old_dynamics_ff = False,
+        old_policy_head = False,
+        old_value_head = False,
+        old_embedding_init = False,
+        use_symexp_value_head = False,
+        use_tdmpc2_value_head = False,
+        use_symlog_hl_gauss_value_head = False,
+        use_hl_gauss_actor_critic = False,
+        use_baseline_symexp_value_head_init = False,
+        value_head_init_value = None,
+        final_special_cross_attn = None,
+    )
+
+    implicit_state = implicit.state_dict()
+    explicit_state = explicit.state_dict()
+    assert implicit_state.keys() == explicit_state.keys()
+    assert all(torch.equal(implicit_state[key], explicit_state[key]) for key in implicit_state)
+
+
+def test_cleanrl_ppo_closer_keeps_model_parameters_and_uses_scalar_value_loss():
+    from dreamer4.dreamer4 import Actions, Experience
+
+    torch.manual_seed(123)
+    baseline = _small_flag_dynamics(
+        num_continuous_actions = 2,
+        continuous_dist_type = 'beta',
+    )
+    torch.manual_seed(123)
+    closer = _small_flag_dynamics(
+        num_continuous_actions = 2,
+        continuous_dist_type = 'beta',
+        cleanrl_ppo_closer = True,
+        clip_values = True,
+        value_clip = .2,
+        policy_entropy_weight = 0.,
+    )
+
+    baseline_parameters = dict(baseline.named_parameters())
+    closer_parameters = dict(closer.named_parameters())
+    assert baseline_parameters.keys() == closer_parameters.keys()
+    assert {
+        name: parameter.shape
+        for name, parameter in baseline_parameters.items()
+    } == {
+        name: parameter.shape
+        for name, parameter in closer_parameters.items()
+    }
+    assert sum(parameter.numel() for parameter in baseline_parameters.values()) == sum(
+        parameter.numel() for parameter in closer_parameters.values()
+    )
+
+    batch = 4
+    agent_embed = torch.randn(batch, 1, 16)
+    with torch.no_grad():
+        predicted_values = closer.value_encoder.bins_to_scalar_value(
+            closer.value_head(agent_embed)
+        )
+
+    old_values = predicted_values.detach() + torch.tensor((-.5, -.1, .3, .6)).reshape(batch, 1)
+    returns = torch.tensor((1., -1., 2., -2.)).reshape(batch, 1)
+    clipped_values = old_values + (predicted_values - old_values).clamp(-.2, .2)
+    expected_value_loss = .5 * torch.maximum(
+        (predicted_values - returns).square(),
+        (clipped_values - returns).square(),
+    ).mean()
+    experience = Experience(
+        latents = torch.randn(batch, 1, 2, 8),
+        agent_embed = agent_embed,
+        rewards = torch.zeros(batch, 1),
+        actions = Actions(None, torch.rand(batch, 1, 2)),
+        log_probs = Actions(None, torch.zeros(batch, 1, 2)),
+        values = old_values,
+        frozen_returns = returns,
+        frozen_advantages = torch.zeros(batch, 1),
+        step_size = 1,
+        lens = torch.ones(batch, dtype = torch.long),
+        is_truncated = torch.zeros(batch, dtype = torch.bool),
+        terminals = torch.zeros(batch, dtype = torch.bool),
+        is_from_world_model = True,
+    )
+
+    _, value_loss, diagnostics = closer.learn_from_experience(
+        experience,
+        objective = 'ppo',
+        return_diagnostics = True,
+    )
+
+    assert value_loss.item() == pytest.approx(expected_value_loss.item())
+    assert diagnostics['extra/value_mse'] == pytest.approx(
+        (predicted_values - returns).square().mean().item()
+    )
+    assert 'extra/value_target_entropy' not in diagnostics
+
+
+def test_cleanrl_ppo_closer_hl_gauss_value_loss_uses_unclipped_cross_entropy():
+    from dreamer4.dreamer4 import Actions, Experience
+
+    closer = _small_flag_dynamics(
+        num_continuous_actions = 2,
+        continuous_dist_type = 'beta',
+        cleanrl_ppo_closer = True,
+        cleanrl_ppo_closer_hl_gauss_value_loss = True,
+        clip_values = True,
+        value_clip = .2,
+        policy_entropy_weight = 0.,
+        use_symlog_hl_gauss_value_head = True,
+        value_encoder_kwargs = dict(
+            reward_range = (-10., 10.),
+            num_bins = 7,
+            use_symlog = True,
+            decode_symlog_expected_raw = True,
+        ),
+    )
+
+    batch = 4
+    agent_embed = torch.randn(batch, 1, 16)
+    returns = torch.tensor((1., -1., 20., -20.)).reshape(batch, 1)
+
+    with torch.no_grad():
+        value_logits = closer.value_head(agent_embed)
+        predicted_values = closer.value_encoder.bins_to_scalar_value(value_logits)
+        expected_value_loss = -(closer.value_encoder(returns) * value_logits.log_softmax(dim = -1)).sum(dim = -1).mean()
+
+    # old_values far from the prediction would change a clipped loss.
+    experience = Experience(
+        latents = torch.randn(batch, 1, 2, 8),
+        agent_embed = agent_embed,
+        rewards = torch.zeros(batch, 1),
+        actions = Actions(None, torch.rand(batch, 1, 2)),
+        log_probs = Actions(None, torch.zeros(batch, 1, 2)),
+        values = predicted_values + 5.,
+        frozen_returns = returns,
+        frozen_advantages = torch.zeros(batch, 1),
+        step_size = 1,
+        lens = torch.ones(batch, dtype = torch.long),
+        is_truncated = torch.zeros(batch, dtype = torch.bool),
+        terminals = torch.zeros(batch, dtype = torch.bool),
+        is_from_world_model = True,
+    )
+
+    _, value_loss, diagnostics = closer.learn_from_experience(
+        experience,
+        objective = 'ppo',
+        return_diagnostics = True,
+    )
+
+    assert value_loss.item() == pytest.approx(expected_value_loss.item(), rel = 1e-5)
+    assert diagnostics['extra/value_mse'] == pytest.approx((predicted_values - returns).square().mean().item(), rel = 1e-5)
+    assert 'extra/value_target_entropy' in diagnostics
+
+    with pytest.raises(ValueError, match = 'requires `cleanrl_ppo_closer`'):
+        _small_flag_dynamics(cleanrl_ppo_closer_hl_gauss_value_loss = True)
+
+
+def _paper_shortcut_dynamics(**kwargs):
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    return DynamicsWorldModel(
+        dim = 8,
+        dim_latent = 4,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        num_register_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        max_steps = 8,
+        reward_encoder_kwargs = dict(num_bins = 5),
+        value_encoder_kwargs = dict(num_bins = 5),
+        **kwargs,
+    )
+
+
+def test_paper_shortcut_flag_uses_piecewise_per_example_objective():
+    torch.manual_seed(123)
+    model = _paper_shortcut_dynamics(
+        use_paper_aligned_shortcut_objective = True,
+    )
+    latents = torch.randn(16, 3, 1, 4)
+
+    loss, losses = model(
+        latents = latents,
+        shortcut_train_mode = 'combined',
+        return_all_losses = True,
+        seed = 42,
+    )
+
+    diagnostics = losses.diagnostics
+
+    assert diagnostics.raw_flow > 0.
+    assert diagnostics.raw_shortcut > 0.
+    assert torch.equal(
+        diagnostics.raw_dynamics,
+        diagnostics.raw_flow + diagnostics.raw_shortcut,
+    )
+    assert torch.equal(diagnostics.raw_dynamics, diagnostics.normalized_dynamics)
+
+    _, finetune_losses = model(
+        latents = latents,
+        shortcut_train_mode = 'finetune',
+        return_all_losses = True,
+        seed = 42,
+    )
+    _, bootstrap_losses = model(
+        latents = latents,
+        shortcut_train_mode = 'bootstrap_only',
+        return_all_losses = True,
+        seed = 42,
+    )
+
+    assert finetune_losses.diagnostics.raw_flow > 0.
+    assert finetune_losses.diagnostics.raw_shortcut == 0.
+    assert bootstrap_losses.diagnostics.raw_flow == 0.
+    assert bootstrap_losses.diagnostics.raw_shortcut > 0.
+
+    loss.backward()
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
+
+
+def test_paper_shortcut_flag_normalizes_one_piecewise_dynamics_loss():
+    torch.manual_seed(123)
+    model = _paper_shortcut_dynamics(
+        use_loss_normalization = True,
+        use_paper_aligned_shortcut_objective = True,
+    )
+
+    _, losses = model(
+        latents = torch.randn(16, 3, 1, 4),
+        shortcut_train_mode = 'combined',
+        return_all_losses = True,
+        seed = 42,
+    )
+
+    assert losses.diagnostics.raw_flow > 0.
+    assert losses.diagnostics.raw_shortcut > 0.
+    assert model.paper_dynamics_loss_normalizer.exp_avg_sq.item() != 1.
+    assert model.flow_loss_normalizer.exp_avg_sq.item() == 1.
+    assert model.shortcut_flow_loss_normalizer.exp_avg_sq.item() == 1.
+
+
+def test_paper_shortcut_flag_accepts_explicit_inference_step():
+    model = _paper_shortcut_dynamics(
+        use_paper_aligned_shortcut_objective = True,
+    )
+
+    loss = model(
+        latents = torch.randn(2, 3, 1, 4),
+        signal_levels = torch.zeros(2, 3, dtype = torch.long),
+        step_sizes_log2 = torch.zeros(2, dtype = torch.long),
+    )
+
+    assert torch.isfinite(loss)
+
+
+def test_opt_in_old_heads_shift_and_embedding_initializers():
+    old = _small_flag_dynamics(
+        old_reward_head = True,
+        old_reward_shifting = True,
+        old_terminal_head = True,
+        old_policy_head = True,
+        old_value_head = True,
+        old_dynamics_ff = True,
+        old_embedding_init = True,
+        value_head_init_value = 0.,
+        predict_terminals = True,
+    )
+
+    assert old.to_agent_embed_reward_pred.net[1].bias is None
+    assert old.to_agent_embed_terminal_pred is None
+    assert old.to_latent_state_terminal_pred.layers[0][-1].__class__.__name__ == 'ReluSquared'
+    assert old.embedding_init_eps == 1e-2
+    assert old.transformer.layers[0][3].fn.use_glu is False
+    assert old.transformer.layers[0][3].fn.activation.__class__.__name__ == 'ReluSquared'
+    assert old.policy_head.layers[0][-1].__class__.__name__ == 'ReluSquared'
+    assert old.value_head.layers[0][-1].__class__.__name__ == 'ReluSquared'
+
+    # The configured run initializes the old value head at zero.
+    values = old.value_encoder.bins_to_scalar_value(old.value_head(torch.randn(2, 16)))
+    assert torch.allclose(values, torch.zeros_like(values), atol = 1e-5)
+
+    # The final reward is bootstrap padding in the old alignment and must not
+    # influence the post-transition reward objective.
+    latents = torch.randn(1, 4, 2, 8)
+    reward_prefix = torch.tensor([[1., 2., 3.]])
+
+    def reward_loss_with_padding(padding):
+        torch.manual_seed(0)
+        _, losses = old(
+            latents = latents,
+            rewards = torch.cat((reward_prefix, torch.tensor([[padding]])), dim = 1),
+            lens = torch.tensor([4]),
+            return_all_losses = True,
+        )
+        return losses.agent_embed_reward
+
+    assert torch.allclose(reward_loss_with_padding(-100.), reward_loss_with_padding(100.))
+
+
+def test_opt_in_action_conditioning_and_final_special_cross_attention():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    no_action = _small_flag_dynamics(num_discrete_actions = 4)
+    with_action = _small_flag_dynamics(num_discrete_actions = 4, add_action_embed_to_agent_token = True)
+    assert with_action.action_embed_to_agent_token_scale.requires_grad
+    assert torch.equal(with_action.action_embed_to_agent_token_scale.detach(), torch.ones(()))
+    assert no_action.action_embed_to_agent_token_scale is None
+
+    disabled = _small_flag_dynamics(final_special_cross_attn = False)
+    default = _small_flag_dynamics()
+    assert disabled.transformer.should_special_cross_attend is False
+    assert default.transformer.should_special_cross_attend is True
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = 'no cuda')
 @param('causal', (False, True))
@@ -275,7 +904,7 @@ def test_attend_factory(
         causal_block_size = causal_block_size,
         softclamp_value = softclamp_value,
         device = q.device,
-        num_agent_tokens = num_agent_tokens,
+        num_special_tokens = num_agent_tokens,
         block_size_per_special = block_size_per_special,
         special_attend_only_itself = special_attend_only_itself
     )
@@ -287,6 +916,113 @@ def test_attend_factory(
     out = attend(q, k, v)
 
     assert torch.allclose(flex_out, out, atol = 1e-6)
+
+
+def test_flex_attention_backend_is_forwarded_in_kernel_options(monkeypatch):
+    from dreamer4 import dreamer4 as dreamer_module
+
+    captured_kwargs = {}
+
+    def recording_flex_attention(q, k, v, **kwargs):
+        captured_kwargs.update(kwargs)
+        return q
+
+    monkeypatch.setattr(dreamer_module, 'flex_attention', recording_flex_attention)
+    q = torch.randn(1, 1, 4, 8)
+    attend = dreamer_module.get_attend_fn(
+        use_flex = True,
+        seq_len = 4,
+        k_seq_len = 4,
+        flex_attention_backend = 'TRITON',
+        device = q.device,
+    )
+
+    assert torch.equal(attend(q, q, q), q)
+    assert captured_kwargs['kernel_options'] == {'BACKEND': 'TRITON'}
+
+
+def test_flex_attention_auto_avoids_invalid_flex_decode_cuda_grid(monkeypatch):
+    from dreamer4 import dreamer4 as dreamer_module
+
+    selected_backends = []
+
+    def recording_flex_attention(q, k, v, **kwargs):
+        selected_backends.append(kwargs['kernel_options']['BACKEND'])
+        return q
+
+    monkeypatch.setattr(dreamer_module, 'flex_attention', recording_flex_attention)
+    attend = dreamer_module.get_attend_fn(
+        use_flex = True,
+        seq_len = 1,
+        k_seq_len = 1,
+        flex_attention_backend = 'AUTO',
+        device = torch.device('cpu'),
+    )
+
+    # FlexDecode uses grid.y = flattened_batch * kv_heads. The largest valid
+    # CUDA Y grid stays AUTO, while one more batch-head pair must use regular
+    # Triton attention.
+    safe_qkv = torch.empty(16383, 4, 1, 1)
+    unsafe_qkv = torch.empty(16384, 4, 1, 1)
+    attend(safe_qkv, safe_qkv, safe_qkv)
+    attend(unsafe_qkv, unsafe_qkv, unsafe_qkv)
+
+    assert selected_backends == ['AUTO', 'TRITON']
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'no cuda')
+def test_flex_attention_triton_backend_matches_auto():
+    from dreamer4.dreamer4 import get_attend_fn
+
+    device = torch.device('cuda')
+    q = torch.randn(2, 4, 64, 32, device = device)
+    k = torch.randn(2, 4, 64, 32, device = device)
+    v = torch.randn(2, 4, 64, 32, device = device)
+
+    attend_kwargs = dict(
+        use_flex = True,
+        seq_len = 64,
+        k_seq_len = 64,
+        causal = False,
+        num_special_tokens = 1,
+        device = device,
+    )
+
+    auto_out = get_attend_fn(**attend_kwargs)(q, k, v)
+    triton_out = get_attend_fn(
+        **attend_kwargs,
+        flex_attention_backend = 'TRITON'
+    )(q, k, v)
+
+    assert torch.allclose(triton_out, auto_out, atol = 1e-5, rtol = 1e-5)
+
+
+def test_axial_transformer_uses_configured_flex_backend_for_space_only(monkeypatch):
+    from dreamer4 import dreamer4 as dreamer_module
+
+    attend_calls = []
+    original_get_attend_fn = dreamer_module.get_attend_fn
+
+    def recording_get_attend_fn(*args, **kwargs):
+        attend_calls.append((kwargs['causal'], kwargs['flex_attention_backend']))
+        return original_get_attend_fn(*args, **kwargs)
+
+    monkeypatch.setattr(dreamer_module, 'get_attend_fn', recording_get_attend_fn)
+    transformer = dreamer_module.AxialSpaceTimeTransformer(
+        dim = 8,
+        depth = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        time_block_every = 2,
+        num_special_tokens = 1,
+        use_attn_pool = False,
+        value_residual = False,
+        spatial_flex_attention_backend = 'TRITON',
+    )
+
+    transformer(torch.randn(1, 2, 3, 8))
+
+    assert attend_calls == [(False, 'TRITON'), (True, 'AUTO')]
 
 def test_action_with_world_model():
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
@@ -355,11 +1091,146 @@ def test_action_with_world_model():
         'critic/value_min',
         'critic/value_max',
         'critic/value_abs_error',
-        'critic/value_target_saturation_frac'
+        'critic/value_target_saturation_frac',
+        'extra/positive_advantage_frac',
+        'extra/negative_advantage_frac',
+        'extra/advantage_mean',
+        'extra/advantage_abs_mean',
+        'extra/policy_entropy',
+        'extra/importance_ratio_clip_frac',
+        'extra/value_target_entropy',
+        'extra/value_excess_cross_entropy'
     } <= diagnostics.keys()
+
+    assert torch.isfinite(diagnostics['extra/advantage_mean'])
+    assert torch.isfinite(diagnostics['extra/advantage_abs_mean'])
+    assert torch.isfinite(diagnostics['extra/policy_entropy'])
+    assert torch.isfinite(diagnostics['extra/value_target_entropy'])
+    assert torch.isfinite(diagnostics['extra/value_excess_cross_entropy'])
+    assert diagnostics['extra/importance_ratio_clip_frac'].item() == 0.
 
     actor_loss.backward(retain_graph = True)
     critic_loss.backward()
+
+
+@param('action_kind, has_proprio, use_time_cache, autocast_dtype, policy_all_tokens', (
+    ('continuous', False, False, None, False),
+    ('discrete', True, True, torch.bfloat16, True),
+))
+def test_generate_preallocated_outputs_match_eager_contract(
+    action_kind,
+    has_proprio,
+    use_time_cache,
+    autocast_dtype,
+    policy_all_tokens,
+):
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    use_continuous_actions = action_kind == 'continuous'
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        max_steps = 8,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 2,
+        depth = 1,
+        time_block_every = 1,
+        dim_proprio = 3 if has_proprio else None,
+        num_discrete_actions = 4 if not use_continuous_actions else 0,
+        num_continuous_actions = 2 if use_continuous_actions else 0,
+        continuous_dist_type = "beta",
+        policy_all_tokens = policy_all_tokens,
+        reward_encoder_kwargs = dict(num_bins = 11),
+        value_encoder_kwargs = dict(num_bins = 11),
+    )
+
+    prompt_latents = torch.randn(2, 2, 2, 8).clamp(-1., 1.)
+    prompt_proprio = torch.randn(2, 2, 3) if has_proprio else None
+    prompt_discrete_actions = torch.randint(0, 4, (2, 1, 1)) if not use_continuous_actions else None
+    prompt_continuous_actions = torch.randn(2, 1, 2).sigmoid() if use_continuous_actions else None
+    prompt_rewards = torch.randn(2, 1)
+
+    generate_kwargs = dict(
+        time_steps = 5,
+        num_steps = 2,
+        batch_size = 2,
+        return_decoded_video = False,
+        return_rewards_per_frame = True,
+        return_agent_actions = True,
+        return_log_probs_and_values = True,
+        return_terminals = False,
+        use_time_cache = use_time_cache,
+        prompt_latents = prompt_latents,
+        prompt_proprio = prompt_proprio,
+        prompt_discrete_actions = prompt_discrete_actions,
+        prompt_continuous_actions = prompt_continuous_actions,
+        prompt_rewards = prompt_rewards,
+    )
+    generate_kwargs = {key: value for key, value in generate_kwargs.items() if value is not None}
+
+    def assert_matching_tensor(preallocated_tensor, eager_tensor):
+        assert exists(preallocated_tensor) == exists(eager_tensor)
+
+        if not exists(preallocated_tensor):
+            return
+
+        assert preallocated_tensor.dtype == eager_tensor.dtype
+
+        if preallocated_tensor.is_floating_point():
+            assert torch.allclose(preallocated_tensor, eager_tensor)
+        else:
+            assert torch.equal(preallocated_tensor, eager_tensor)
+
+    def assert_preallocated_matches_eager(**kwargs):
+        autocast = torch.autocast('cpu', dtype = autocast_dtype) if exists(autocast_dtype) else nullcontext()
+
+        with torch.no_grad(), autocast:
+            torch.manual_seed(123)
+            eager = dynamics.generate(**kwargs)
+
+            torch.manual_seed(123)
+            preallocated = dynamics.generate(**kwargs, preallocate_outputs = True)
+
+        for preallocated_tensor, eager_tensor in (
+            (preallocated.latents, eager.latents),
+            (preallocated.proprio, eager.proprio),
+            (preallocated.rewards, eager.rewards),
+            (preallocated.agent_embed, eager.agent_embed),
+            (preallocated.policy_input, eager.policy_input),
+            (preallocated.actions.discrete, eager.actions.discrete),
+            (preallocated.actions.continuous, eager.actions.continuous),
+            (preallocated.log_probs.discrete, eager.log_probs.discrete),
+            (preallocated.log_probs.continuous, eager.log_probs.continuous),
+            (preallocated.values, eager.values),
+        ):
+            assert_matching_tensor(preallocated_tensor, eager_tensor)
+
+    assert_preallocated_matches_eager(**generate_kwargs)
+
+    no_prompt_generate_kwargs = dict(generate_kwargs)
+    for key in (
+        'prompt_latents',
+        'prompt_proprio',
+        'prompt_discrete_actions',
+        'prompt_continuous_actions',
+        'prompt_rewards',
+    ):
+        no_prompt_generate_kwargs.pop(key, None)
+
+    assert_preallocated_matches_eager(**no_prompt_generate_kwargs)
+
+    no_generate_kwargs = dict(generate_kwargs, time_steps = prompt_latents.shape[1])
+
+    with torch.no_grad():
+        eager = dynamics.generate(**no_generate_kwargs)
+        preallocated = dynamics.generate(**no_generate_kwargs, preallocate_outputs = True)
+
+    assert preallocated.agent_embed is eager.agent_embed is None
+    assert preallocated.policy_input is eager.policy_input is None
+    assert preallocated.values is eager.values is None
+    assert_matching_tensor(preallocated.actions.discrete, eager.actions.discrete)
+    assert_matching_tensor(preallocated.actions.continuous, eager.actions.continuous)
 
 def test_action_embedder():
     from dreamer4.dreamer4 import ActionEmbedder
@@ -569,6 +1440,133 @@ def test_action_embedder():
     assert sampled_discrete is None
     assert sampled_continuous.shape == (2, 3, 2)
 
+
+def test_opt_in_legacy_continuous_action_encoder_matches_historical_projection():
+    from dreamer4.dreamer4 import ActionEmbedder
+
+    dim = 4
+    num_actions = 3
+    embedder = ActionEmbedder(
+        dim,
+        num_continuous_actions = num_actions,
+        continuous_dist_type = 'beta',
+        continuous_target_action_range = (-1., 1.),
+        old_continuous_action_encoder = True,
+    )
+
+    assert isinstance(embedder.continuous_action_embed, torch.nn.Linear)
+    assert embedder.continuous_action_embed.bias is None
+    assert embedder.continuous_action_embed.weight.shape == (dim, num_actions)
+    assert embedder.continuous_action_embed_scale.requires_grad
+    assert torch.equal(embedder.continuous_action_embed_scale.detach(), torch.ones(()))
+
+    # The old projection used a fan-in/fan-out normal initialization.  Use a
+    # moderately wide layer so the sample standard deviation is stable.
+    wide = ActionEmbedder(
+        64,
+        num_continuous_actions = 16,
+        old_continuous_action_encoder = True,
+    )
+    expected_std = (64 * 16) ** -0.5
+    observed_std = wide.continuous_action_embed.weight.detach().std().item()
+    assert observed_std == pytest.approx(expected_std, rel = 0.15)
+
+    with torch.no_grad():
+        embedder.continuous_action_embed.weight.copy_(torch.arange(dim * num_actions, dtype = torch.float).reshape(dim, num_actions))
+        embedder.continuous_action_embed_scale.fill_(1.5)
+
+    native_actions = torch.tensor(
+        (
+            ((0.25, 0.5, 0.75), (0.1, 0.4, 0.9)),
+            ((0.2, 0.6, 0.8), (0.3, 0.5, 0.7)),
+        ),
+        requires_grad = True,
+    )
+    expected_actions = native_actions * 2. - 1.
+    expected = torch.nn.functional.linear(
+        expected_actions,
+        embedder.continuous_action_embed.weight,
+    ) * embedder.continuous_action_embed_scale
+    actual = embedder(continuous_actions = native_actions)
+    assert actual.shape == (2, 2, dim)
+    assert torch.allclose(actual, expected)
+
+    loss = actual.square().sum()
+    loss.backward()
+    assert native_actions.grad is not None
+    assert embedder.continuous_action_embed.weight.grad is not None
+    assert embedder.continuous_action_embed_scale.grad is not None
+    assert embedder.continuous_action_embed_scale in embedder.embed_parameters()
+    assert embedder.continuous_action_embed.weight in embedder.embed_parameters()
+
+
+def test_legacy_continuous_action_encoder_world_model_grouping_and_state_dict_migration():
+    from dreamer4.dreamer4 import ActionEmbedder, DynamicsWorldModel
+
+    # The modern mode has exactly the historical state-dict keys for its
+    # embedding; opting in adds only the legacy scalar and changes the linear
+    # weight orientation.
+    modern = ActionEmbedder(8, num_continuous_actions = 2)
+    legacy = ActionEmbedder(8, num_continuous_actions = 2, old_continuous_action_encoder = True)
+    assert 'continuous_action_embed_scale' not in modern.state_dict()
+    assert 'continuous_action_embed_scale' in legacy.state_dict()
+
+    modern_state = modern.state_dict()
+    legacy.load_state_dict(modern_state, strict = True)
+    assert torch.equal(legacy.continuous_action_embed.weight, modern_state['continuous_action_embed.weight'].T)
+    assert torch.equal(legacy.continuous_action_embed_scale.detach(), torch.ones(()))
+
+    # A legacy checkpoint already contains the scale key, so square weights
+    # must not be mistaken for a modern embedding and transposed on load.
+    square_legacy = ActionEmbedder(2, num_continuous_actions = 2, old_continuous_action_encoder = True)
+    with torch.no_grad():
+        square_legacy.continuous_action_embed.weight.copy_(torch.tensor(((1., 2.), (3., 4.))))
+    square_state = square_legacy.state_dict()
+    square_reloaded = ActionEmbedder(2, num_continuous_actions = 2, old_continuous_action_encoder = True)
+    square_reloaded.load_state_dict(square_state, strict = True)
+    assert torch.equal(square_reloaded.continuous_action_embed.weight, square_state['continuous_action_embed.weight'])
+
+    model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 2,
+        num_register_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        max_steps = 8,
+        num_continuous_actions = 2,
+        old_continuous_action_encoder = True,
+        reward_encoder_kwargs = dict(num_bins = 7),
+        value_encoder_kwargs = dict(num_bins = 7),
+    )
+    scale = model.action_embedder.continuous_action_embed_scale
+    world_params = model.world_model_parameters()
+    agent_params = model.agent_parameters()
+    assert any(parameter is scale for parameter in world_params)
+    assert all(parameter is not scale for parameter in agent_params)
+
+
+def test_modern_continuous_action_encoder_remains_embedding_by_default():
+    from dreamer4.dreamer4 import ActionEmbedder
+
+    embedder = ActionEmbedder(3, num_continuous_actions = 2)
+    assert embedder.old_continuous_action_encoder is False
+    assert isinstance(embedder.continuous_action_embed, torch.nn.Embedding)
+    assert embedder.continuous_action_embed_scale is None
+
+    # Even zero-action models retain the empty modern embedding parameter, as
+    # they did before the legacy mode was introduced.
+    zero_actions = ActionEmbedder(3, num_continuous_actions = 0)
+    assert 'continuous_action_embed.weight' in zero_actions.state_dict()
+
+    with torch.no_grad():
+        embedder.continuous_action_embed.weight.copy_(torch.tensor(((1., 2., 3.), (4., 5., 6.))))
+
+    actions = torch.tensor([[[2., 3.]]])
+    expected = torch.tensor([[[14., 19., 24.]]])
+    assert torch.allclose(embedder(continuous_actions = actions), expected)
+
 def test_mtp():
     from dreamer4.dreamer4 import create_multi_token_prediction_targets
 
@@ -619,6 +1617,119 @@ def test_loss_normalizer():
     normed_losses = loss_normalizer(losses)
 
     assert (normed_losses == 1.).all()
+
+
+def test_loss_normalizer_preserves_scalar_shape_and_validates_before_update():
+    from dreamer4.dreamer4 import LossNormalizer
+
+    scalar_normalizer = LossNormalizer()
+    scalar_loss = torch.tensor(2.)
+
+    normalized = scalar_normalizer(scalar_loss)
+
+    assert normalized.shape == scalar_loss.shape
+
+    vector_normalizer = LossNormalizer(2)
+    initial_stats = vector_normalizer.exp_avg_sq.clone()
+
+    with pytest.raises(ValueError, match = "expected 2 loss values"):
+        vector_normalizer(torch.tensor(1.))
+
+    assert torch.equal(vector_normalizer.exp_avg_sq, initial_stats)
+
+
+def test_world_model_loss_normalization_skips_inactive_losses():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    model = DynamicsWorldModel(
+        dim = 8,
+        dim_latent = 4,
+        max_steps = 8,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        num_discrete_actions = 0,
+        num_continuous_actions = 1,
+        continuous_dist_type = "beta",
+        continuous_target_action_range = (-1., 1.),
+        continuous_action_loss_weight = 0.,
+        discrete_action_loss_weight = 0.,
+        multi_token_pred_len = 2,
+        reward_encoder_kwargs = dict(num_bins = 5),
+        value_encoder_kwargs = dict(num_bins = 5),
+        policy_head_mlp_depth = 1,
+        value_head_mlp_depth = 1,
+        old_reward_head = True,
+        old_reward_shifting = True,
+        use_loss_normalization = True,
+    )
+
+    shortcut_stats = model.shortcut_flow_loss_normalizer.exp_avg_sq.clone()
+    latent_reward_stats = model.latent_state_reward_loss_normalizer.exp_avg_sq.clone()
+    action_stats = model.continuous_actions_loss_normalizer.exp_avg_sq.clone()
+
+    total_loss, losses = model(
+        latents = torch.randn(2, 4, 1, 4),
+        rewards = torch.randn(2, 4),
+        terminals = torch.zeros(2, dtype = torch.bool),
+        continuous_actions = torch.rand(2, 4, 1),
+        lens = torch.tensor((4, 3)),
+        return_all_losses = True,
+        shortcut_train_mode = "finetune",
+    )
+
+    assert total_loss.ndim == 0
+    assert losses.continuous_actions.ndim == 0
+    assert torch.equal(model.shortcut_flow_loss_normalizer.exp_avg_sq, shortcut_stats)
+    assert torch.equal(model.latent_state_reward_loss_normalizer.exp_avg_sq, latent_reward_stats)
+    assert torch.equal(model.continuous_actions_loss_normalizer.exp_avg_sq, action_stats)
+
+
+def test_world_model_loss_normalization_skips_inactive_legacy_terminal_head():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    model = DynamicsWorldModel(
+        dim = 8,
+        dim_latent = 4,
+        max_steps = 8,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        num_discrete_actions = 0,
+        num_continuous_actions = 1,
+        continuous_dist_type = "beta",
+        continuous_action_loss_weight = 0.,
+        discrete_action_loss_weight = 0.,
+        multi_token_pred_len = 2,
+        reward_encoder_kwargs = dict(num_bins = 5),
+        value_encoder_kwargs = dict(num_bins = 5),
+        policy_head_mlp_depth = 1,
+        value_head_mlp_depth = 1,
+        old_terminal_head = True,
+        use_loss_normalization = True,
+    )
+
+    terminal_stats = model.agent_embed_terminal_loss_normalizer.exp_avg_sq.clone()
+
+    total_loss, losses = model(
+        latents = torch.randn(2, 4, 1, 4),
+        rewards = torch.randn(2, 4),
+        terminals = torch.zeros(2, dtype = torch.bool),
+        continuous_actions = torch.rand(2, 4, 1),
+        lens = torch.tensor((4, 3)),
+        return_all_losses = True,
+        shortcut_train_mode = "finetune",
+    )
+
+    assert total_loss.ndim == 0
+    assert losses.agent_embed_terminal.ndim == 0
+    assert torch.equal(model.agent_embed_terminal_loss_normalizer.exp_avg_sq, terminal_stats)
 
 def test_tokenizer_trainer():
     from dreamer4.trainers import VideoTokenizerTrainer
@@ -1047,6 +2158,66 @@ def test_cache_token_count():
     x2 = torch.randn(1,3,3,32)
     _, cache2 = model(x2, cache = cache, return_intermediates = True)
     assert cache2.token_count == 3
+
+def test_time_cache_max_lookback_attends_only_to_recent_steps():
+    from dreamer4 import AxialSpaceTimeTransformer
+
+    # depth 3 with time_block_every 2 has one time layer, so a cached K/V entry depends on its own frame only.
+    # The rotary positions are relative, so a step with a limited cache equals a fresh forward over the last
+    # lookback + 1 frames. A position offset from the cache length (not the true step count) fails this.
+
+    kwargs = dict(dim = 32, depth = 3, attn_heads = 2, attn_dim_head = 16, time_block_every = 2, num_special_tokens = 0)
+    lookback, steps = 3, 7
+
+    torch.manual_seed(0)
+    full = AxialSpaceTimeTransformer(**kwargs).eval()
+    limited = AxialSpaceTimeTransformer(**kwargs, time_cache_max_lookback = lookback).eval()
+    limited.load_state_dict(full.state_dict())
+
+    tokens = torch.randn(2, steps, 5, 32)
+    cache = None
+
+    with torch.no_grad():
+        for t in range(steps):
+            out, cache = limited(tokens[:, t:t + 1], cache = cache, return_intermediates = True)
+
+            assert cache.token_count == t + 1
+            assert cache.next_kv_cache.shape[-2] == min(t + 1, lookback)
+
+            expected = full(tokens[:, max(0, t - lookback):t + 1])[:, -1:]
+            assert torch.allclose(out, expected, atol = 1e-5)
+
+def test_small_terminal_head_changes_only_the_terminal_ensemble():
+    torch.manual_seed(0)
+    default = _small_flag_dynamics(num_continuous_actions = 2)
+    small = _small_flag_dynamics(num_continuous_actions = 2, small_terminal_head = True)
+
+    default_shapes = {name: param.shape for name, param in default.named_parameters()}
+    small_shapes = {name: param.shape for name, param in small.named_parameters()}
+
+    changed = {name for name in default_shapes if default_shapes[name] != small_shapes.get(name)}
+    assert changed and all(name.startswith('to_agent_embed_terminal_pred.') for name in changed)
+
+    def num_params(module):
+        return sum(param.numel() for param in module.parameters())
+
+    assert num_params(small.to_agent_embed_terminal_pred) * 10 < num_params(default.to_agent_embed_terminal_pred)
+
+    latents = torch.randn(2, 4, 2, 8)
+    loss = small(
+        latents = latents,
+        continuous_actions = torch.rand(2, 4, 2) * 2 - 1,
+        rewards = torch.randn(2, 4),
+        terminals = torch.tensor([True, False]),
+        signal_levels = torch.randint(0, 8, (2, 4)),
+        step_sizes_log2 = torch.randint(1, 3, (2,)),
+    )
+    loss.backward()
+
+    assert all(param.grad is not None for param in small.to_agent_embed_terminal_pred.parameters())
+
+    with pytest.raises(ValueError, match = 'exclude each other'):
+        _small_flag_dynamics(small_terminal_head = True, old_terminal_head = True)
 
 def test_images_to_video_tokenizer():
     import torch
@@ -3022,3 +4193,188 @@ def test_dynamics_model_all_three_tokenizers_sequential_parallel_cache(use_time_
     )
 
     assert exists(generated_outputs)
+
+def test_attention_pool_einsum_attend_matches_the_sdpa_default():
+    from dreamer4.dreamer4 import AttentionPool
+
+    torch.manual_seed(0)
+    pool = AttentionPool(16, heads = 2, dim_head = 8)
+    x = torch.randn(2, 5, 16)
+    hiddens = [torch.randn(2, 5, 16) for _ in range(3)]
+
+    sdpa_out = pool(x, hiddens = hiddens)
+    pool.einsum_attend = True
+    einsum_out = pool(x, hiddens = hiddens)
+
+    assert torch.allclose(einsum_out, sdpa_out, atol = 1e-6)
+
+
+@pytest.mark.parametrize('mode, block_size, expected_sources', [
+    # sublayers 0..5 (attention, feedforward for each of 3 layers), then the final output
+    ('full', 1, [1, 2, 3, 4, 5, 6, 7]),
+    ('block', 2, [1, 2, 2, 3, 3, 4, 4]),
+    ('block', 3, [1, 2, 2, 2, 3, 3, 3]),
+])
+def test_attention_residuals_follow_the_block_source_layout(monkeypatch, mode, block_size, expected_sources):
+    from dreamer4.dreamer4 import AxialSpaceTimeTransformer, AttentionResiduals
+
+    source_counts = []
+    original_mix = AttentionResiduals.mix
+
+    def recording_mix(self, index, sources):
+        source_counts.append(len(sources))
+        return original_mix(self, index, sources)
+
+    monkeypatch.setattr(AttentionResiduals, 'mix', recording_mix)
+
+    torch.manual_seed(0)
+    transformer = AxialSpaceTimeTransformer(
+        dim = 16, depth = 3, attn_heads = 2, attn_dim_head = 8, time_block_every = 2,
+        use_attn_pool = False, attn_res = mode, attn_res_block_size = block_size,
+    )
+    tokens = torch.randn(2, 3, 5, 16)
+    out = transformer(tokens)
+    out.sum().backward()
+
+    assert source_counts == expected_sources
+    assert out.shape == tokens.shape
+    assert transformer.attn_res.queries.grad[1:].abs().sum() > 0
+
+
+def test_attention_residuals_start_as_an_equal_weight_average():
+    from dreamer4.dreamer4 import AttentionResiduals
+
+    attn_res = AttentionResiduals(8, num_sublayers = 2)
+    sources = [torch.randn(2, 4, 8) * scale for scale in (1., 10., 100.)]
+
+    assert torch.allclose(attn_res.mix(1, sources), sum(sources) / 3, atol = 1e-5)
+
+
+def test_attention_residuals_require_the_attention_pools_off():
+    from dreamer4.dreamer4 import AxialSpaceTimeTransformer
+
+    with pytest.raises(ValueError, match = 'use_attn_pool'):
+        AxialSpaceTimeTransformer(dim = 16, depth = 3, attn_heads = 2, attn_dim_head = 8, attn_res = 'full')
+
+
+@pytest.mark.parametrize('mode', ['full', 'block'])
+def test_dynamics_world_model_trains_and_generates_with_attention_residuals(mode):
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    torch.manual_seed(0)
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        max_steps = 64,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 2,
+        depth = 3,
+        time_block_every = 2,
+        attn_heads = 2,
+        attn_dim_head = 8,
+        num_discrete_actions = 0,
+        num_continuous_actions = 3,
+        transformer_kwargs = dict(use_attn_pool = False, attn_res = mode),
+    )
+
+    loss = dynamics(
+        latents = torch.randn(2, 4, 2, 8),
+        continuous_actions = torch.rand(2, 3, 3),
+        rewards = torch.randn(2, 4),
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+
+    generations = dynamics.generate(time_steps = 4, batch_size = 2, use_time_cache = True, return_rewards_per_frame = True)
+    assert generations.latents.shape[:2] == (2, 4)
+
+@param('shortcut', (False, True))
+def test_clean_context_frames_have_no_latent_loss(shortcut):
+    import torch
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    torch.manual_seed(0)
+    world_model = DynamicsWorldModel(
+        dim = 16, dim_latent = 4, max_steps = 8, num_latent_tokens = 1, num_spatial_tokens = 1,
+        depth = 1, time_block_every = 1, attn_heads = 1, attn_dim_head = 8, num_continuous_actions = 2,
+        prob_shortcut_train = float(shortcut), clean_context_frame_prob = 0.5,
+    )
+    latents = torch.randn(3, 6, 1, 1, 4)
+    actions = torch.rand(3, 6, 2)
+    lens = torch.tensor((6, 6, 4))
+
+    seen_levels = []
+    get_times = world_model.get_times_from_signal_level
+
+    def record_levels(signal_levels, *args, **kwargs):
+        seen_levels.append(signal_levels.clone())
+        return get_times(signal_levels, *args, **kwargs)
+
+    world_model.get_times_from_signal_level = record_levels
+    loss, losses = world_model(latents = latents, continuous_actions = actions, lens = lens, latent_has_view_dim = True, return_all_losses = True)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    levels = seen_levels[0]
+    # Clean frames are at the top signal level, which shortcut samples never reach on their grid.
+    assert (levels == world_model.max_steps - 1).any()
+    assert all(torch.isfinite(p.grad).all() for p in world_model.parameters() if p.grad is not None)
+
+    if shortcut:
+        # The three predictions of a shortcut step: the main one, then the two half steps. The clean frames keep their
+        # input latents in the second half step (they are context, not targets).
+        world_model.get_times_from_signal_level = get_times
+        inputs = []
+        hook = world_model.latents_to_spatial_tokens.register_forward_pre_hook(lambda module, args: inputs.append(args[0].detach().clone()))
+        torch.manual_seed(1)
+        world_model(latents = latents, continuous_actions = actions, lens = lens, latent_has_view_dim = True, return_all_losses = True)
+        hook.remove()
+        main, first, second = inputs
+        assert torch.equal(main, first)
+        clean = (first - second).flatten(2).abs().amax(-1) == 0
+        assert clean.any() and not clean.all()
+
+    # A model where every frame is clean context has no latent loss to learn from: the flow loss is 0.
+    world_model.clean_context_frame_prob = 0.999999
+    _, losses = world_model(latents = latents, continuous_actions = actions, lens = lens, latent_has_view_dim = True, return_all_losses = True)
+    assert losses.flow.abs().item() < 1e-6
+
+def test_clean_context_frame_noise_matches_dream_context():
+    import torch
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    torch.manual_seed(0)
+    world_model = DynamicsWorldModel(
+        dim = 16, dim_latent = 4, max_steps = 8, num_latent_tokens = 1, num_spatial_tokens = 1,
+        depth = 1, time_block_every = 1, attn_heads = 1, attn_dim_head = 8, num_continuous_actions = 2,
+        prob_shortcut_train = 0., clean_context_frame_prob = 0.5,
+    )
+    latents = torch.randn(4, 6, 1, 1, 4)
+    actions = torch.rand(4, 6, 2)
+
+    def inputs_and_levels(noise):
+        # the same seed gives the same levels, clean frames and noise; only the noise mix of the clean frames changes
+        world_model.clean_context_frame_noise = noise
+        inputs, levels = [], []
+        get_times = world_model.get_times_from_signal_level
+        world_model.get_times_from_signal_level = lambda signal_levels, *args, **kwargs: levels.append(signal_levels.clone()) or get_times(signal_levels, *args, **kwargs)
+        hook = world_model.latents_to_spatial_tokens.register_forward_pre_hook(lambda module, args: inputs.append(args[0].detach().clone()))
+        torch.manual_seed(1)
+        world_model(latents = latents, continuous_actions = actions, latent_has_view_dim = True, return_all_losses = True)
+        hook.remove()
+        del world_model.get_times_from_signal_level
+        return inputs[0].reshape(latents.shape), levels[0]
+
+    clean_input, levels = inputs_and_levels(0.)
+    dream_input, dream_levels = inputs_and_levels(0.3)
+    assert torch.equal(levels, dream_levels)
+
+    # A clean frame keeps the label max_steps - 1 and gets the dream mix 0.7 x + 0.3 noise in place of 7 / 8 x + 1 / 8 noise.
+    noise = (clean_input - latents * 7 / 8) * 8
+    expected = latents * 0.7 + noise * 0.3
+    top = levels == world_model.max_steps - 1
+    same = (dream_input - clean_input).flatten(2).abs().amax(-1) == 0
+    moved = (dream_input - expected).flatten(2).abs().amax(-1) < 1e-5
+    assert torch.all(same | (top & moved))
+    assert (top & moved & ~same).any()
+    assert same[~top].all()
